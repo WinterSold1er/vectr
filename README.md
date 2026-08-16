@@ -161,7 +161,7 @@ Exposes port 8765. Docker does not auto-write IDE config files, so use the local
 | Cline | Manual, see below | Experimental |
 | Continue | Manual, see below | Experimental |
 | Codex CLI | Auto: `.codex/config.toml`, `AGENTS.md` guidance, and `.codex/hooks.json` (`vectr init --hooks`) | Experimental |
-| DeepSeek Harness | Auto: `~/.dsh/profiles/<profile>/cordis.patch.yml` (`mcp-client.vectr` insert row) + `AGENTS.md` guidance | Experimental |
+| DeepSeek Harness | Auto: `~/.dsh/profiles/<profile>/cordis.patch.yml` (`mcp-client.vectr` insert row) + `AGENTS.md` guidance; session hooks via `vectr init --hooks` (`hooks-claude-code` bridge row, 4 of 6 events) | Experimental |
 
 "Verified" means the full integration (config, guidance, and hooks) has been exercised end to end. "Experimental" means the MCP config is written and works, but the integration has not been run through the same verification pass.
 
@@ -213,6 +213,16 @@ On its first run in the workspace, Codex shows a one-time interactive prompt to 
         url: http://localhost:8765/mcp
 ```
 Restart the dsh server (or reload its profile) once to pick up the new plugin row. The `AGENTS.md` vectr block written into the workspace doubles as dsh guidance, since dsh auto-loads `AGENTS.md`/`CLAUDE.md` from the workspace.
+
+**dsh session hooks** — `vectr init --hooks` also writes a `hooks-claude-code` bridge row into the same `cordis.patch.yml`, pointing dsh's Claude Code hook bridge at this workspace's `.claude/settings.json`:
+```yaml
+- insert:
+    - id: hooks-claude-code
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: /absolute/path/to/workspace/.claude/settings.json
+```
+dsh runs vectr's `vectr hook <event>` commands on its own interception points (session start, per prompt, before read/edit, after tool use), so memory auto-injection and episode capture work as on Claude Code. **4 of 6 events** carry over: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` fire; `PreCompact` and `PostToolUseFailure` are not yet supported by dsh's bridge and are skipped. `configPath` is read once at dsh server load (process-level, not per-session), so restart the dsh server after `vectr init --hooks`.
 
 </details>
 

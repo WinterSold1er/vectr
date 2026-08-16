@@ -1,0 +1,12 @@
+# vectr-hooks-start
+# vectr-managed Claude Code hook bridge for DeepSeek Harness (dsh) — re-run
+# `vectr init --hooks` to update; do not hand-edit inside this block (it is
+# rewritten in place). Bridges vectr's `.claude/settings.json` hooks onto
+# dsh's interception points (SessionStart / UserPromptSubmit / PreToolUse /
+# PostToolUse; PreCompact and PostToolUseFailure are not supported by dsh).
+- insert:
+    - id: hooks-claude-code
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: {config_path}
+# vectr-hooks-end

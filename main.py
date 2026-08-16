@@ -253,6 +253,25 @@ _DSH_EMPTY_ARRAY_RE = re.compile(r"^(\s*(?:#.*\n)*)\s*\[\s*\]\s*$", re.MULTILINE
 # (vectr-specific override), then `web`.
 _DSH_DEFAULT_PROFILE = "web"
 
+# dsh hook bridge (UPG-DSH-PARITY): dsh has its own Claude Code hook bridge
+# (`@deepseek-ai/dsh-hooks-claude-code`) that runs a user's `.claude/
+# settings.json` `hooks` key on dsh's interception points. vectr's hook rows
+# (`vectr hook <event>`) speak the same Claude Code stdin/exit contract, so
+# the bridge consumes them unchanged. This is a SEPARATE comment-delimited
+# region from the MCP block above (`# vectr-hooks-start`…`# vectr-hooks-end`,
+# distinct markers so each block is managed independently): it points the
+# bridge at this workspace's `.claude/settings.json`. dsh's bridge does not
+# support `PreCompact` or `PostToolUseFailure` (ignored at parse), so those
+# two vectr hook groups simply never fire on dsh — every other event works.
+_DSH_HOOKS_PATCH_TEMPLATE = load_template("dsh_hooks.patch.yml.template")
+_DSH_HOOKS_BLOCK_START = "# vectr-hooks-start"
+_DSH_HOOKS_BLOCK_END = "# vectr-hooks-end"
+# Matches vectr's dsh hooks block plus any blank lines immediately before it.
+_DSH_HOOKS_BLOCK_RE = re.compile(
+    r"\n*" + re.escape(_DSH_HOOKS_BLOCK_START) + r"\b.*?" + re.escape(_DSH_HOOKS_BLOCK_END) + r"\n?",
+    re.DOTALL,
+)
+
 
 _VECTR_BLOCK_START = "<!-- vectr-start -->"
 _VECTR_BLOCK_END = "<!-- vectr-end -->"
@@ -827,6 +846,39 @@ def _render_dsh_mcp_block(port: int, headers: dict[str, str]) -> str:
     return _DSH_PATCH_TEMPLATE.format(port=port).replace("__HEADERS__", hdr)
 
 
+def _render_dsh_hooks_block(config_path: str) -> str:
+    """Render vectr's `- insert:` hook-bridge row for a dsh `cordis.patch.yml`.
+    `config_path` is the ABSOLUTE path to the workspace's `.claude/settings.
+    json` (dsh resolves `configPath` once at load against the server's launch
+    cwd, so a relative path would point at the wrong tree)."""
+    return _DSH_HOOKS_PATCH_TEMPLATE.format(config_path=json.dumps(config_path))
+
+
+def _merge_dsh_patch_block(
+    existing: str, block: str, block_start: str, block_re: "re.Pattern[str]",
+) -> str | None:
+    """Merge one vectr comment-delimited block into the text of a dsh
+    `cordis.patch.yml`, returning the new content or `None` when the result
+    would be byte-identical to the input (a no-op caller skips the write).
+
+    Shared by the MCP-row and hook-bridge writers. When the block's own marker
+    region is already present it is replaced IN PLACE (so a file holding both
+    the MCP and hooks blocks keeps each block where it is, no matter which
+    writer runs last); otherwise a fresh `[]` empty array is replaced by the
+    block, and a file with real content gets the block appended as a new
+    top-level item. In every case any other patch entries survive verbatim."""
+    if block_start in existing:
+        new_content = block_re.sub(block, existing)
+        return None if new_content == existing else new_content
+    match = _DSH_EMPTY_ARRAY_RE.search(existing)
+    if match:
+        # Fresh `[]` (optionally under header comments): replace the empty
+        # array with vectr's block, keeping the comments.
+        return f"{match.group(1).rstrip()}\n{block}" if match.group(1).strip() else block
+    # Real content: append the block as a new top-level item.
+    return f"{existing.rstrip()}\n\n{block}"
+
+
 def _write_dsh_mcp_config(path: Path, port: int, headers: dict[str, str]) -> None:
     """Write/refresh vectr's `mcp-client.vectr` insert row in a dsh profile's
     `cordis.patch.yml`.
@@ -845,39 +897,58 @@ def _write_dsh_mcp_config(path: Path, port: int, headers: dict[str, str]) -> Non
     """
     block = _render_dsh_mcp_block(port, headers)
     existed = path.exists()
-
     if not existed:
         new_content = block
     else:
-        existing = path.read_text(encoding="utf-8")
-        if _DSH_BLOCK_START in existing:
-            stripped = _DSH_BLOCK_RE.sub("", existing).rstrip()
-            new_content = f"{stripped}\n\n{block}" if stripped else block
-            if new_content == existing:
-                return
-        else:
-            match = _DSH_EMPTY_ARRAY_RE.search(existing)
-            if match:
-                # Fresh `[]` (optionally under header comments): replace the
-                # empty array with vectr's block, keeping the comments.
-                new_content = f"{match.group(1).rstrip()}\n{block}" if match.group(1).strip() else block
-            else:
-                # Real content: append the block as a new top-level item.
-                new_content = f"{existing.rstrip()}\n\n{block}"
+        merged = _merge_dsh_patch_block(
+            path.read_text(encoding="utf-8"), block, _DSH_BLOCK_START, _DSH_BLOCK_RE,
+        )
+        if merged is None:
+            return
+        new_content = merged
+    _write_dsh_patch_validated(path, new_content, existed, "mcp-client.vectr insert row")
 
+
+def _write_dsh_hooks_config(path: Path, config_path: str) -> None:
+    """Write/refresh vectr's `hooks-claude-code` hook-bridge row in a dsh
+    profile's `cordis.patch.yml`, pointing the bridge at the workspace's
+    `.claude/settings.json`.
+
+    Same merge-safe contract as `_write_dsh_mcp_config`, under its own
+    `# vectr-hooks-start`…`# vectr-hooks-end` markers so the two blocks are
+    managed independently (hooks are installed by `vectr init --hooks`, MCP by
+    every `vectr start`/`init`)."""
+    block = _render_dsh_hooks_block(config_path)
+    existed = path.exists()
+    if not existed:
+        new_content = block
+    else:
+        merged = _merge_dsh_patch_block(
+            path.read_text(encoding="utf-8"), block, _DSH_HOOKS_BLOCK_START, _DSH_HOOKS_BLOCK_RE,
+        )
+        if merged is None:
+            return
+        new_content = merged
+    _write_dsh_patch_validated(path, new_content, existed, "hooks-claude-code row")
+
+
+def _write_dsh_patch_validated(path: Path, new_content: str, existed: bool, what: str) -> None:
+    """Validate `new_content` parses as a top-level YAML array, then write it.
+    A merged file that would not parse is left untouched with a README pointer
+    rather than compounding a malformed pre-existing patch."""
     try:
         _validate_dsh_patch_yaml(new_content)
     except Exception as exc:
         print(
             f"  Skipped {path}: merged content is not valid YAML ({exc}) — "
-            f"add the mcp-client.vectr insert row by hand (see README).",
+            f"add the {what} by hand (see README).",
             file=sys.stderr,
         )
         return
-
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_content, encoding="utf-8")
     print(f"  {'Updated vectr block in' if existed else 'Created'} {path}", file=sys.stderr)
+
 
 
 def _validate_dsh_patch_yaml(content: str) -> None:
@@ -3708,6 +3779,14 @@ def cmd_init(args: argparse.Namespace) -> None:
             # search-only gate (it writes a note, so it needs the same
             # working-memory layer the two hooks above inject from).
             _write_git_post_commit_hook(workspace)
+            # DeepSeek Harness (UPG-DSH-PARITY): point dsh's Claude Code hook
+            # bridge at this workspace's .claude/settings.json (written just
+            # above). Skipped silently when dsh is not installed. The path is
+            # ABSOLUTE because dsh resolves configPath once at load against
+            # the server's launch cwd, not per-session.
+            if _dsh_home().exists():
+                settings_path = Path(workspace) / ".claude" / "settings.json"
+                _write_dsh_hooks_config(_dsh_patch_path(), str(settings_path.resolve()))
 
     _maybe_write_workspace_config(workspace, port, args, search_only=search_only)
 

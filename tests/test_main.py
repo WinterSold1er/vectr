@@ -5056,6 +5056,105 @@ class TestDshMcpConfig:
         assert not (tmp_path / "no-such-dsh-home").exists()
 
 
+class TestDshHooksConfig:
+    """DeepSeek Harness hook bridge — `vectr init --hooks` also registers a
+    `hooks-claude-code` row in the dsh profile's cordis.patch.yml, pointing
+    dsh's Claude Code hook bridge at the workspace's .claude/settings.json.
+    Managed as its own comment-delimited block (`# vectr-hooks-start`…`#
+    vectr-hooks-end`), independent of the MCP block above."""
+
+    def test_creates_hooks_bridge_row(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_hooks_config(cfg, "/ws/.claude/settings.json")
+        parsed = yaml.safe_load(cfg.read_text())
+        row = parsed[0]["insert"][0]
+        assert row["id"] == "hooks-claude-code"
+        assert row["name"] == "@deepseek-ai/dsh-hooks-claude-code"
+        assert row["config"]["configPath"] == "/ws/.claude/settings.json"
+
+    def test_config_path_is_quoted_absolute(self, tmp_path):
+        # json.dumps quoting keeps a path with spaces/colons valid YAML.
+        cfg = tmp_path / "cordis.patch.yml"
+        path = "/home/user/My Workspace/.claude/settings.json"
+        m._write_dsh_hooks_config(cfg, path)
+        text = cfg.read_text()
+        assert '"' + path + '"' in text
+        parsed = yaml.safe_load(text)
+        assert parsed[0]["insert"][0]["config"]["configPath"] == path
+
+    def test_idempotent_single_block(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
+        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
+        assert cfg.read_text().count("# vectr-hooks-start") == 1
+
+    def test_path_change_rewrites_in_place(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_hooks_config(cfg, "/a/.claude/settings.json")
+        m._write_dsh_hooks_config(cfg, "/b/.claude/settings.json")
+        text = cfg.read_text()
+        assert '"/b/.claude/settings.json"' in text
+        assert '"/a/.claude/settings.json"' not in text
+        assert text.count("# vectr-hooks-start") == 1
+
+    def test_merge_safe_preserves_user_entries(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("- insert:\n    - id: mcp-client.github\n      name: x\n")
+        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
+        parsed = yaml.safe_load(cfg.read_text())
+        ids = [entry["insert"][0]["id"] for entry in parsed]
+        assert ids == ["mcp-client.github", "hooks-claude-code"]
+
+    def test_mcp_and_hooks_blocks_coexist_in_place(self, tmp_path):
+        # Both dsh rows live in one patch file as independent blocks; a re-run
+        # of either writer replaces its own block in place without duplicating
+        # or reordering the other.
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
+        parsed = yaml.safe_load(cfg.read_text())
+        ids = [entry["insert"][0]["id"] for entry in parsed]
+        assert ids == ["mcp-client.vectr", "hooks-claude-code"]
+        # re-run both with new values: order stable, both updated, no dupes
+        m._write_dsh_mcp_config(cfg, 8999, {})
+        m._write_dsh_hooks_config(cfg, "/y/.claude/settings.json")
+        text = cfg.read_text()
+        assert text.count("# vectr-start") == 1
+        assert text.count("# vectr-hooks-start") == 1
+        assert "localhost:8999" in text
+        assert '"/y/.claude/settings.json"' in text
+        parsed2 = yaml.safe_load(text)
+        ids2 = [entry["insert"][0]["id"] for entry in parsed2]
+        assert ids2 == ["mcp-client.vectr", "hooks-claude-code"]
+
+    def test_invalid_existing_yaml_is_left_untouched(self, tmp_path, capsys):
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        broken = "this is: [not: valid\n  - yaml: :\n"
+        cfg.write_text(broken)
+        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
+        assert cfg.read_text() == broken
+        assert "not valid YAML" in capsys.readouterr().err
+
+    def test_written_by_cmd_init_hooks(self, tmp_path, monkeypatch):
+        pytest.importorskip("chromadb")
+        dsh_home = tmp_path / "dshhome"
+        dsh_home.mkdir()
+        monkeypatch.setenv("DSH_HOME", str(dsh_home))
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        m._write_claude_hooks(str(ws))
+        m._write_dsh_hooks_config(
+            m._dsh_patch_path(), str((ws / ".claude" / "settings.json").resolve()),
+        )
+        cfg = dsh_home / "profiles" / "web" / "cordis.patch.yml"
+        parsed = yaml.safe_load(cfg.read_text())
+        row = parsed[0]["insert"][0]
+        assert row["id"] == "hooks-claude-code"
+        assert row["config"]["configPath"] == str((ws / ".claude" / "settings.json").resolve())
+
+
 class TestCodexHooks:
     """Part C — `.codex/hooks.json` writer reuses the `vectr hook <event>`
     commands unchanged; Codex's hook schema/events/envelope match Claude
