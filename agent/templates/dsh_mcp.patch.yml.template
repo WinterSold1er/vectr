@@ -1,0 +1,13 @@
+# vectr-start
+# vectr-managed MCP registration for DeepSeek Harness (dsh) — re-run
+# `vectr start` / `vectr init` to update the port; do not hand-edit inside this
+# block (it is rewritten in place). Loads `@deepseek-ai/dsh-mcp-client` and
+# connects to the vectr daemon over Streamable HTTP.
+- insert:
+    - id: mcp-client.vectr
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: vectr
+        transport: streamable-http
+        url: http://localhost:{port}/mcp__HEADERS__
+# vectr-end

@@ -161,6 +161,7 @@ Exposes port 8765. Docker does not auto-write IDE config files, so use the local
 | Cline | Manual, see below | Experimental |
 | Continue | Manual, see below | Experimental |
 | Codex CLI | Auto: `.codex/config.toml`, `AGENTS.md` guidance, and `.codex/hooks.json` (`vectr init --hooks`) | Experimental |
+| DeepSeek Harness | Auto: `~/.dsh/profiles/<profile>/cordis.patch.yml` (`mcp-client.vectr` insert row) + `AGENTS.md` guidance | Experimental |
 
 "Verified" means the full integration (config, guidance, and hooks) has been exercised end to end. "Experimental" means the MCP config is written and works, but the integration has not been run through the same verification pass.
 
@@ -200,6 +201,18 @@ Automatic delivery of memory depends on the host exposing session hooks. Where i
 url = "http://localhost:8765/mcp"
 ```
 On its first run in the workspace, Codex shows a one-time interactive prompt to trust the project before it loads a project-scoped config. If you also ran `vectr init --hooks`, Codex shows a second one-time prompt to trust the hook commands. Both persist after you accept them once, and a config writer cannot clear them for you without weakening your security posture.
+
+**DeepSeek Harness (dsh)**, the active profile's `~/.dsh/profiles/<profile>/cordis.patch.yml` (written automatically by `vectr start` when `~/.dsh` exists; profile from `$DSH_PROFILE` / `$VECTR_DSH_PROFILE`, default `web`):
+```yaml
+- insert:
+    - id: mcp-client.vectr
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: vectr
+        transport: streamable-http
+        url: http://localhost:8765/mcp
+```
+Restart the dsh server (or reload its profile) once to pick up the new plugin row. The `AGENTS.md` vectr block written into the workspace doubles as dsh guidance, since dsh auto-loads `AGENTS.md`/`CLAUDE.md` from the workspace.
 
 </details>
 

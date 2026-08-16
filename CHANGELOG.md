@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Integrations
+- DeepSeek Harness (dsh) is now a supported host. `vectr start` / `vectr init` register vectr in the active dsh profile's `cordis.patch.yml` as an `@deepseek-ai/dsh-mcp-client` insert row over Streamable HTTP (`mcp-client.vectr`, `http://localhost:<port>/mcp`), merge-safe by a comment-delimited region that preserves any other patch entries the user has. The write is skipped when no dsh home (`~/.dsh` / `$DSH_HOME`) exists; the profile comes from `$DSH_PROFILE` / `$VECTR_DSH_PROFILE`, defaulting to `web`. dsh guidance rides the existing `AGENTS.md` vectr block, which dsh auto-loads from the workspace. Honoring `--no-ide-config` and the durable `.vectr/ide_config` opt-out as every other editor config does. Authenticated daemons get the `headers` block in the row. A malformed existing patch is left untouched with a pointer to the README.
+
 ## 1.9.0 - 2026-08-07
 
 A trace answer stops hiding real callers behind a same-named one and becomes

@@ -227,6 +227,33 @@ _CODEX_TOML_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# DeepSeek Harness (dsh) integration (UPG-DSH-PARITY): dsh loads MCP servers
+# as `@deepseek-ai/dsh-mcp-client` plugin rows in a profile's
+# `cordis.patch.yml` — a top-level YAML array of patch entries, NOT a
+# per-workspace file like the editors above. vectr registers itself by
+# managing one comment-delimited `- insert:` item in the ACTIVE profile's
+# patch file (default `web` — the GUI profile — overridable via
+# `$VECTR_DSH_PROFILE` or `$DSH_PROFILE`). Same strip-then-append idiom as
+# the Codex TOML block and the markdown vectr block: only vectr's own
+# `# vectr-start`…`# vectr-end` region is touched, anything else the user
+# has in the patch (their own inserts, disables) survives verbatim.
+_DSH_PATCH_TEMPLATE = load_template("dsh_mcp.patch.yml.template")
+_DSH_BLOCK_START = "# vectr-start"
+_DSH_BLOCK_END = "# vectr-end"
+# Matches vectr's dsh patch block plus any blank lines immediately before it.
+_DSH_BLOCK_RE = re.compile(
+    r"\n*" + re.escape(_DSH_BLOCK_START) + r"\b.*?" + re.escape(_DSH_BLOCK_END) + r"\n?",
+    re.DOTALL,
+)
+# Matches a lone `[]` empty top-level YAML array (optionally surrounded by
+# comment lines), which a fresh `cordis.patch.yml` ships as.
+_DSH_EMPTY_ARRAY_RE = re.compile(r"^(\s*(?:#.*\n)*)\s*\[\s*\]\s*$", re.MULTILINE)
+# Default profile: the browser GUI profile ships as `web`; `headless` is the
+# one-shot runner. `$DSH_PROFILE` is honored first, then `$VECTR_DSH_PROFILE`
+# (vectr-specific override), then `web`.
+_DSH_DEFAULT_PROFILE = "web"
+
+
 _VECTR_BLOCK_START = "<!-- vectr-start -->"
 _VECTR_BLOCK_END = "<!-- vectr-end -->"
 # Matches the vectr block plus any blank lines immediately before it.
@@ -763,6 +790,120 @@ def _write_codex_mcp_config(path: Path, port: int, headers: dict[str, str]) -> N
     print(f"  {'Updated vectr block in' if existed else 'Created'} {path}", file=sys.stderr)
 
 
+def _dsh_home() -> Path:
+    """Locate the DeepSeek Harness home directory: `$DSH_HOME` if set, else
+    `~/.dsh` (the default the harness itself uses)."""
+    env_home = os.getenv("DSH_HOME")
+    if env_home:
+        return Path(env_home)
+    return Path.home() / ".dsh"
+
+
+def _dsh_profile() -> str:
+    """Resolve the dsh profile vectr should register itself in: `$DSH_PROFILE`
+    first (the harness's own selector), then `$VECTR_DSH_PROFILE` (a
+    vectr-specific override for hosts that pin a different profile), then the
+    `web` default (the browser GUI profile, the most common local setup)."""
+    return os.getenv("DSH_PROFILE") or os.getenv("VECTR_DSH_PROFILE") or _DSH_DEFAULT_PROFILE
+
+
+def _dsh_patch_path() -> Path:
+    """Path to the active dsh profile's `cordis.patch.yml`, the file vectr's
+    `mcp-client.vectr` insert row is merged into."""
+    return _dsh_home() / "profiles" / _dsh_profile() / "cordis.patch.yml"
+
+
+def _render_dsh_mcp_block(port: int, headers: dict[str, str]) -> str:
+    """Render vectr's `- insert:` MCP row for a dsh `cordis.patch.yml`,
+    splicing a `headers` block when the daemon is authenticated (keyless
+    daemons — the default — get the header-free block, byte-identical to the
+    template). dsh's Streamable HTTP config names the field `headers`, the
+    same key the editor JSON MCP configs use."""
+    hdr = ""
+    if headers:
+        hdr = "\n        headers:"
+        for key, value in headers.items():
+            hdr += f"\n          {key}: {value}"
+    return _DSH_PATCH_TEMPLATE.format(port=port).replace("__HEADERS__", hdr)
+
+
+def _write_dsh_mcp_config(path: Path, port: int, headers: dict[str, str]) -> None:
+    """Write/refresh vectr's `mcp-client.vectr` insert row in a dsh profile's
+    `cordis.patch.yml`.
+
+    Merge-safe by comment-delimited region (mirrors `_write_codex_mcp_config`
+    for TOML): only vectr's own `# vectr-start`…`# vectr-end` block is
+    touched; any other patch entries the user has (their own inserts,
+    disables) are preserved verbatim. Idempotent — a port change rewrites the
+    block in place; an unchanged block is a no-op.
+
+    The file is a top-level YAML array. A fresh `cordis.patch.yml` ships as
+    `[]` (possibly under a header comment), so appending a bare `- insert:`
+    item after it would be invalid YAML — the empty array is replaced by the
+    block instead. A file with real content gets the block appended as a new
+    top-level item.
+    """
+    block = _render_dsh_mcp_block(port, headers)
+    existed = path.exists()
+
+    if not existed:
+        new_content = block
+    else:
+        existing = path.read_text(encoding="utf-8")
+        if _DSH_BLOCK_START in existing:
+            stripped = _DSH_BLOCK_RE.sub("", existing).rstrip()
+            new_content = f"{stripped}\n\n{block}" if stripped else block
+            if new_content == existing:
+                return
+        else:
+            match = _DSH_EMPTY_ARRAY_RE.search(existing)
+            if match:
+                # Fresh `[]` (optionally under header comments): replace the
+                # empty array with vectr's block, keeping the comments.
+                new_content = f"{match.group(1).rstrip()}\n{block}" if match.group(1).strip() else block
+            else:
+                # Real content: append the block as a new top-level item.
+                new_content = f"{existing.rstrip()}\n\n{block}"
+
+    try:
+        _validate_dsh_patch_yaml(new_content)
+    except Exception as exc:
+        print(
+            f"  Skipped {path}: merged content is not valid YAML ({exc}) — "
+            f"add the mcp-client.vectr insert row by hand (see README).",
+            file=sys.stderr,
+        )
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new_content, encoding="utf-8")
+    print(f"  {'Updated vectr block in' if existed else 'Created'} {path}", file=sys.stderr)
+
+
+def _validate_dsh_patch_yaml(content: str) -> None:
+    """Parse `content` as a top-level YAML array of patch entries to prove the
+    merged `cordis.patch.yml` is loadable before it is written. A pre-existing
+    malformed patch is left untouched rather than compounded.
+
+    `!!js` tags (which dsh's loader evaluates) are unknown to PyYAML, so the
+    check registers the `!!js` tag on a `SafeLoader` subclass as a passthrough
+    that returns the raw scalar: any OTHER unknown tag or a structurally
+    invalid document still raises, while a user's `!!js` expressions (rare in
+    a patch file, but legal) don't false-positive the guard."""
+    import yaml
+
+    def _js_constructor(loader: yaml.Loader, node: yaml.Node):
+        return loader.construct_scalar(node)
+
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    _Loader.add_constructor("tag:yaml.org,2002:js", _js_constructor)
+    parsed = yaml.load(content, Loader=_Loader)
+    if not isinstance(parsed, list):
+        raise ValueError("top-level value is not a YAML array")
+
+
 def _write_workspace_config(workspace: str, port: int, *, search_only: bool = False) -> None:
     """Write per-IDE MCP config files and IDE guidance into the workspace root.
 
@@ -819,6 +960,13 @@ def _write_workspace_config(workspace: str, port: int, *, search_only: bool = Fa
     # interactive trust prompt (research §Q1) — an expected first-run step, not
     # something an auto-writer can (or should) clear on the user's behalf.
     _write_codex_mcp_config(root / ".codex" / "config.toml", port, headers)
+
+    # DeepSeek Harness (UPG-DSH-PARITY): register vectr in the ACTIVE dsh
+    # profile's cordis.patch.yml (profile-global, unlike the per-workspace
+    # editor files above). Skipped silently when dsh is not installed
+    # (`~/.dsh` absent) — the harness is not the target host for every user.
+    if _dsh_home().exists():
+        _write_dsh_mcp_config(_dsh_patch_path(), port, headers)
 
     # Merge-safe (not create-only): UPG-11.5 reordered `vectr init --hooks` to
     # write hooks before workspace config in the same run, so settings.json can

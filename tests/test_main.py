@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+import yaml
 
 from agent.instance_registry import InstanceRegistry, workspace_hash
 import main as m
@@ -4905,6 +4906,154 @@ class TestCodexMcpConfig:
         assert cfg.exists()
         parsed = tomllib.loads(cfg.read_text())
         assert parsed["mcp_servers"]["vectr"]["url"] == "http://localhost:8765/mcp"
+
+
+class TestDshMcpConfig:
+    """DeepSeek Harness (dsh) support — vectr registers itself as an MCP
+    server in the ACTIVE dsh profile's `cordis.patch.yml` via a merge-safe,
+    comment-delimited `- insert:` row (mirrors the Codex TOML writer). dsh
+    loads MCP servers as `@deepseek-ai/dsh-mcp-client` plugin rows, so vectr
+    manages one `mcp-client.vectr` item over Streamable HTTP."""
+
+    def test_creates_patch_with_vectr_insert_row(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        parsed = yaml.safe_load(cfg.read_text())
+        row = parsed[0]["insert"][0]
+        assert row["id"] == "mcp-client.vectr"
+        assert row["name"] == "@deepseek-ai/dsh-mcp-client"
+        assert row["config"]["serverName"] == "vectr"
+        assert row["config"]["transport"] == "streamable-http"
+        assert row["config"]["url"] == "http://localhost:8765/mcp"
+
+    def test_keyless_daemon_has_no_headers(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        parsed = yaml.safe_load(cfg.read_text())
+        assert "headers" not in parsed[0]["insert"][0]["config"]
+
+    def test_authenticated_daemon_gets_headers(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_mcp_config(cfg, 8765, {"X-Api-Key": "secret123"})
+        parsed = yaml.safe_load(cfg.read_text())
+        # dsh's streamable-http config names the field `headers` (the JSON key).
+        assert parsed[0]["insert"][0]["config"]["headers"]["X-Api-Key"] == "secret123"
+
+    def test_idempotent_single_block(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        assert cfg.read_text().count("# vectr-start") == 1
+
+    def test_port_change_rewrites_in_place(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        m._write_dsh_mcp_config(cfg, 8999, {})
+        text = cfg.read_text()
+        assert "localhost:8999" in text
+        assert "localhost:8765" not in text
+        assert text.count("# vectr-start") == 1
+
+    def test_merge_safe_preserves_user_entries(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(
+            "- insert:\n"
+            "    - id: mcp-client.github\n"
+            "      name: '@deepseek-ai/dsh-mcp-client'\n"
+            "      config:\n"
+            "        serverName: github\n"
+        )
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        parsed = yaml.safe_load(cfg.read_text())
+        ids = [entry["insert"][0]["id"] for entry in parsed]
+        assert ids == ["mcp-client.github", "mcp-client.vectr"]
+
+    def test_replaces_only_vectr_block_on_rerun(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(
+            "- insert:\n"
+            "    - id: mcp-client.other\n"
+            "      name: '@deepseek-ai/dsh-mcp-client'\n"
+            "      config:\n"
+            "        serverName: other\n"
+        )
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        m._write_dsh_mcp_config(cfg, 8766, {})
+        parsed = yaml.safe_load(cfg.read_text())
+        ids = [entry["insert"][0]["id"] for entry in parsed]
+        # the user's other server survives every re-run untouched
+        assert ids == ["mcp-client.other", "mcp-client.vectr"]
+        assert "localhost:8766" in cfg.read_text()
+
+    def test_empty_array_is_replaced(self, tmp_path):
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("# Your patch layer\n[]\n")
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        text = cfg.read_text()
+        assert "# Your patch layer" in text  # header comment survives
+        parsed = yaml.safe_load(text)
+        assert parsed[0]["insert"][0]["id"] == "mcp-client.vectr"
+
+    def test_invalid_existing_yaml_is_left_untouched(self, tmp_path, capsys):
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        broken = "this is: [not: valid\n  - yaml: :\n"
+        cfg.write_text(broken)
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        # merged output would not parse → skip rather than compound the damage
+        assert cfg.read_text() == broken
+        assert "not valid YAML" in capsys.readouterr().err
+
+    def test_js_tag_expression_is_preserved_not_rejected(self, tmp_path):
+        # dsh's loader evaluates `!!js` tags; the validator must pass them
+        # through (unknown to PyYAML) instead of rejecting the user's patch.
+        cfg = tmp_path / "cordis.patch.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(
+            "- insert:\n"
+            "    - id: mcp-client.github\n"
+            "      name: '@deepseek-ai/dsh-mcp-client'\n"
+            "      config:\n"
+            "        serverName: github\n"
+            "        env:\n"
+            "          TOKEN: !!js process.env.GITHUB_PERSONAL_ACCESS_TOKEN\n"
+        )
+        m._write_dsh_mcp_config(cfg, 8765, {})
+        text = cfg.read_text()
+        assert "mcp-client.github" in text
+        assert "mcp-client.vectr" in text
+        assert "!!js process.env.GITHUB_PERSONAL_ACCESS_TOKEN" in text
+
+    def test_dsh_home_and_profile_resolution(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DSH_HOME", str(tmp_path))
+        assert m._dsh_home() == tmp_path
+        monkeypatch.setenv("DSH_PROFILE", "headless")
+        assert m._dsh_profile() == "headless"
+        assert m._dsh_patch_path() == tmp_path / "profiles" / "headless" / "cordis.patch.yml"
+
+    def test_written_by_write_workspace_config_when_dsh_home_exists(self, tmp_path, monkeypatch):
+        # `_write_workspace_config` seeds .vectrignore via the indexer, which
+        # imports chromadb — full test deps are a CI concern, skip without them.
+        pytest.importorskip("chromadb")
+        dsh_home = tmp_path / "dshhome"
+        dsh_home.mkdir()
+        monkeypatch.setenv("DSH_HOME", str(dsh_home))
+        m._write_workspace_config(str(tmp_path), 8765)
+        cfg = dsh_home / "profiles" / "web" / "cordis.patch.yml"
+        assert cfg.exists()
+        parsed = yaml.safe_load(cfg.read_text())
+        row = parsed[0]["insert"][0]
+        assert row["id"] == "mcp-client.vectr"
+        assert row["config"]["url"] == "http://localhost:8765/mcp"
+
+    def test_skipped_when_dsh_home_absent(self, tmp_path, monkeypatch):
+        pytest.importorskip("chromadb")
+        monkeypatch.setenv("DSH_HOME", str(tmp_path / "no-such-dsh-home"))
+        m._write_workspace_config(str(tmp_path), 8765)
+        assert not (tmp_path / "no-such-dsh-home").exists()
 
 
 class TestCodexHooks:
