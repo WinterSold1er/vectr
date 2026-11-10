@@ -3817,7 +3817,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_watch(args: argparse.Namespace) -> None:
     """Index workspace(s) and start filesystem watcher without launching the MCP server."""
     import hashlib
-    from agent.config import EMBEDDING_DEFAULT_MODEL
+    from agent.config import embed_model_spec
     from agent.indexer import CodeIndexer
     from agent.watcher import CodeWatcher
     from integrations.workspace_detect import find_workspace_root
@@ -3833,7 +3833,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
     else:
         workspace = find_workspace_root(roots[0])
     extra_roots = roots[1:]
-    embed_model = os.getenv("VECTR_EMBED_MODEL", EMBEDDING_DEFAULT_MODEL)
+    embed_model = embed_model_spec()
 
     # Use same db layout as VectrService so a later `vectr start` shares the index.
     db_hash = hashlib.md5(workspace.encode()).hexdigest()[:12]

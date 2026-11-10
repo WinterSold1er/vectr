@@ -1,0 +1,6 @@
+# vectr-start
+# vectr-managed MCP registration for Codex CLI — re-run `vectr start` / `vectr init`
+# to update the port; do not hand-edit inside this block (it is rewritten in place).
+[mcp_servers.vectr]
+url = "http://localhost:8779/mcp"
+# vectr-end

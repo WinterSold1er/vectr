@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from agent.chroma_dispatch import timed_chroma_call
 from agent.working_context_store._audit import audit
@@ -723,6 +723,11 @@ class WorkingContextStore:
         self._embed_query_fn = embed_query_fn or embed_fn  # query-mode embed, defaults to embed_fn
         self._embed_model = embed_model  # current model name, for the embed-model stamp/migration
         self._notes_col = None
+        # ChromaDB client that owns `working_memory`, kept so an embed-model swap
+        # to a model of a different vector dimensionality can rebuild that
+        # collection (see _recreate_notes_collection) instead of failing every
+        # upsert against the dimension the old model pinned.
+        self._notes_chroma_client: Any = None
         # TRIGGER-ENGINE wave 2b — the S (symbol) primitive's resolver. None
         # until attach_symbol_resolver() runs (phase-2 service init, once the
         # code symbol graph is built); a memory-only daemon or a warm-up
@@ -741,6 +746,7 @@ class WorkingContextStore:
         # attach_symbol_resolver() (same idempotent-upgrade shape).
         self._attach_lock = threading.Lock()
         if embed_fn is not None and notes_chroma_client is not None and not self._vectors_disabled():
+            self._notes_chroma_client = notes_chroma_client
             try:
                 self._notes_col = notes_chroma_client.get_or_create_collection(
                     name="working_memory",
@@ -821,6 +827,7 @@ class WorkingContextStore:
                 return  # already attached
             if embed_fn is None or notes_chroma_client is None or self._vectors_disabled():
                 return
+            self._notes_chroma_client = notes_chroma_client
             try:
                 notes_col = notes_chroma_client.get_or_create_collection(
                     name="working_memory",
@@ -2023,7 +2030,11 @@ class WorkingContextStore:
         includes superseded notes: they remain queryable via
         `recall(include_superseded=True)`, so their vectors must stay in the
         current embedding space too. Note content, ids, and every other SQL
-        column are untouched; only the vector side is rewritten.
+        column are untouched; only the vector side is rewritten. When the
+        previous model pinned a different vector dimensionality on the
+        collection the upsert is rejected, so the collection is dropped and
+        rebuilt (see _recreate_notes_collection) and the pass retried — still
+        vectors only, still rebuilt from the SQLite rows.
         """
         with self._conn() as conn:
             rows = conn.execute("SELECT note_id, content FROM notes").fetchall()
@@ -2044,13 +2055,55 @@ class WorkingContextStore:
         if not contents:
             return 0
 
+        from chromadb.errors import ChromaError
+
+        try:
+            self._upsert_note_vectors(ids, contents)
+        except ChromaError as exc:
+            # ChromaDB pins a collection's vector dimensionality at its first
+            # insert, so re-embedding with a model of ANOTHER dimensionality
+            # cannot land in the collection the old model created (verified
+            # against the installed client: the upsert raises
+            # chromadb.errors.InvalidArgumentError). Rebuild the vector side
+            # only and retry the migration once. A failure after the retry
+            # propagates to the caller's warning path, which leaves the SQLite
+            # notes exactly as they were.
+            logger.warning(
+                "vectr: note re-embed upsert failed (%s) — rebuilding the "
+                "working_memory vector collection and retrying once", exc,
+            )
+            self._recreate_notes_collection()
+            self._upsert_note_vectors(ids, contents)
+        return len(contents)
+
+    def _upsert_note_vectors(self, ids: list[str], contents: list[str]) -> None:
+        """One batched pass of note-vector upserts into `working_memory`."""
         for start in range(0, len(contents), _NOTES_REEMBED_BATCH_SIZE):
             batch_ids = ids[start:start + _NOTES_REEMBED_BATCH_SIZE]
             batch_contents = contents[start:start + _NOTES_REEMBED_BATCH_SIZE]
             vectors = self._embed_fn(batch_contents)
             with timed_chroma_call("upsert"):
                 self._notes_col.upsert(ids=batch_ids, embeddings=vectors)
-        return len(contents)
+
+    def _recreate_notes_collection(self) -> None:
+        """Drop and rebuild the `working_memory` vector collection.
+
+        Vectors only. That collection holds ids + embeddings and every embedding
+        is reconstructible from its note's SQLite row, while the note itself —
+        content, id, tags, kind, priority, timestamps — lives in
+        working_context.sqlite and is neither read nor written here. A rebuild
+        therefore cannot delete or overwrite a note; the caller re-embeds every
+        note from its row immediately afterwards.
+        """
+        if self._notes_chroma_client is None:
+            raise RuntimeError(
+                "cannot rebuild the working_memory collection: its ChromaDB "
+                "client is unavailable"
+            )
+        self._notes_chroma_client.delete_collection("working_memory")
+        self._notes_col = self._notes_chroma_client.get_or_create_collection(
+            name="working_memory", metadata={"hnsw:space": "cosine"}
+        )
 
     def backfill_missing_vectors(self) -> int:
         """Embed and store a vector for every note that doesn't have one yet

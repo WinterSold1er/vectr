@@ -27,7 +27,7 @@ from agent.config import (
     ARC_DETECTION_ENABLED,
     BOUNDARY_PRECOMPACT_ENABLED,
     BOUNDARY_PRECOMPACT_TOKEN_CAP,
-    EMBEDDING_DEFAULT_MODEL,
+    embed_model_spec,
     EPISODES_DIGEST_HEAD_LINES,
     EPISODES_DIGEST_MAX_CHARS,
     EPISODES_DIGEST_TAIL_LINES,
@@ -262,7 +262,7 @@ class VectrService:
         # via the provider's embed_query (registered "query" prompt), never embed().
         # See agent/indexer/_types.py:LocalEmbedProvider for the query/document split,
         # detected from the loaded model itself rather than hardcoded per model.
-        self._embed_model = os.getenv("VECTR_EMBED_MODEL", EMBEDDING_DEFAULT_MODEL)
+        self._embed_model = embed_model_spec()
         # Memory-only mode: code indexing + file watcher are disabled.
         # Reads from env (propagated by _do_start) or from the constructor arg.
         self._memory_only: bool = memory_only or (os.getenv("VECTR_MEMORY_ONLY", "") == "1")

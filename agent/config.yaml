@@ -1641,6 +1641,18 @@ embedding:
   # default's behavior; raise deliberately, with indexing throughput in mind.
   max_seq_length: 512
 
+  # Output size asked of providers that support truncated output (Google
+  # batchEmbedContents outputDimensionality). null keeps the provider's own
+  # default — Google's full 3072-dim output, which is the only Google output
+  # returned already L2-normalized; any smaller value is renormalized by
+  # GoogleEmbedProvider so cosine scoring stays comparable.
+  output_dimensionality: null
+
+  # Environment variable holding a remote provider's API key (Google). Falls
+  # back to "gemini_api_key" in ~/.vectr/secrets.json (keep that file mode 600).
+  # The key value itself is never logged or quoted in an error message.
+  api_key_env: GEMINI_API_KEY
+
   # Hard cap on the number of CPU threads the local (torch-backed) embedding
   # model may use — applied via torch.set_num_threads/set_num_interop_threads
   # at LocalEmbedProvider construction, so it also governs the cross-encoder

@@ -241,12 +241,33 @@ No port, no daemon: a single foreground process framed as newline-delimited JSON
 ## How it works
 
 1. **AST-aware chunking.** tree-sitter parses each file and splits at function, class, and method boundaries. No chunk breaks mid-logic.
-2. **Code embeddings.** `ibm-granite/granite-embedding-english-r2` (local, CPU-fast, overridable) maps natural-language queries to code symbols, so "JWT validation" finds `verify_jwt_token`. BM25 handles exact symbol names.
+2. **Code embeddings.** `ibm-granite/granite-embedding-english-r2` by default (local, CPU-fast; any model or API provider can be configured — see *Choosing the embedding model*) maps natural-language queries to code symbols, so "JWT validation" finds `verify_jwt_token`. BM25 handles exact symbol names.
 3. **Hybrid search.** Vector similarity and BM25 combined, weighted by codebase characteristics. Large and unfamiliar leans semantic, small and well-documented leans BM25.
 4. **Symbol graph.** Call edges, import chains, and HTTP routes (Flask, FastAPI, Express, Spring) are extracted and stored. `vectr_locate` resolves a name through a 6-strategy cascade: exact match, suffix, same-module, import-chain, substring, then fuzzy. A fuzzy answer is always rendered as explicitly inexact rather than presented as a confident match, because a confident wrong symbol is worse than a not-found.
 5. **Working memory.** `vectr_remember` stores structured notes to SQLite and ChromaDB. `vectr_recall` runs semantic search over notes rather than a SQL LIKE, so multi-word queries still find the relevant context.
 6. **Trigger evaluation.** Each note's conditions are checked deterministically by the daemon at lifecycle moments, with a per-session fire ledger and injection budgets, so a note resurfaces exactly when it applies and never twice in the same window.
 7. **MCP protocol.** 19 tools served over HTTP. Any MCP-compatible AI code editor connects without plugins.
+
+### Choosing the embedding model
+
+The embedding model is configuration, not a constant. The first of these that is set wins:
+
+1. `VECTR_EMBED_MODEL` (environment).
+2. `.vectr/config.yaml` in the workspace.
+3. `~/.vectr/config.yaml`.
+4. vectr's bundled default — `ibm-granite/granite-embedding-english-r2`, local and keyless.
+
+```yaml
+# .vectr/config.yaml
+embedding:
+  model: google/gemini-embedding-2  # the prefix selects the provider
+  output_dimensionality: 3072       # optional; null (default) keeps the provider's own size
+  api_key_env: GEMINI_API_KEY       # optional; the name of the key's environment variable
+```
+
+The spec picks the provider: a bare `org/model` runs locally through sentence-transformers, and `voyage*`, `openai/<model>` or `google/<model>` call their APIs. The Google provider calls `batchEmbedContents` and needs a key in `GEMINI_API_KEY` (or whatever `api_key_env` names) or in `~/.vectr/secrets.json` as `{"gemini_api_key": "..."}` — keep that file mode 600, and note the key value is never written to a log.
+
+Changing the model changes the vector space, so vectr rebuilds rather than mixing vectors: the code index is dropped and re-embedded, and working-memory note vectors are re-embedded in place from their SQLite rows. Your notes are never deleted by a model change.
 
 ---
 

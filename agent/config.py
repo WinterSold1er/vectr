@@ -1,6 +1,8 @@
 """vectr bundled-config loader.
 
-Reads ``agent/config.yaml`` at import time and caches the results.  All paths
+Reads ``agent/config.yaml`` at import time and caches the results, layering the
+user's ``embedding:`` settings from ``~/.vectr/config.yaml`` and the workspace
+``.vectr/config.yaml`` over the bundled block (workspace wins).  All paths
 are resolved via ``importlib.resources`` so this works both when running from
 the repository root *and* when vectr is installed as the global binary
 (``/opt/homebrew/bin/vectr`` or similar pip install), where a ``cwd``-relative
@@ -492,11 +494,26 @@ NOTFOUND_FLOOR_BANNER_CLI : str
     prompt — no `vectr locate` subcommand exists.
 
 EMBEDDING_DEFAULT_MODEL : str
-    Default local (sentence-transformers) embedding model for the L3 content
-    index (UPG-EMBEDDER-SWAP-GRANITE). A workspace's ChromaDB collection is
-    stamped with whichever model built it (CodeIndexer's embed-model stamp);
-    changing this value forces a full vector index rebuild on next index
-    rather than mixing vectors from two models in one collection.
+    Default embedding model for the L3 content index (UPG-EMBEDDER-SWAP-GRANITE).
+    Resolved through the layering of UPG-EMBED-CONFIG-LAYERING — workspace
+    ``.vectr/config.yaml`` ``embedding.model`` > global ``~/.vectr/config.yaml``
+    > bundled ``agent/config.yaml`` — and ``VECTR_EMBED_MODEL`` outranks all
+    three (``embed_model_spec()``). The spec selects the provider: a bare name
+    is local (sentence-transformers), ``voyage*``/``openai/<m>``/``google/<m>``
+    are API providers. A workspace's ChromaDB collection is stamped with
+    whichever model built it (CodeIndexer's embed-model stamp); changing this
+    value forces a full vector index rebuild on next index rather than mixing
+    vectors from two models in one collection.
+
+EMBEDDING_OUTPUT_DIMENSIONALITY : int | None
+    ``embedding.output_dimensionality`` — the output size asked of providers
+    that support truncation (Google ``batchEmbedContents``
+    ``outputDimensionality``). null keeps the provider's own default.
+
+EMBEDDING_API_KEY_ENV : str
+    ``embedding.api_key_env`` — name of the environment variable holding a
+    remote provider's API key (default GEMINI_API_KEY). The value is never
+    logged or quoted in an error message.
 
 EMBEDDING_THREAD_CAP : int
     Resolved CPU thread cap applied to the local (torch-backed) embedding
@@ -637,6 +654,7 @@ vectr_cache_root() -> Path
 from __future__ import annotations
 
 import importlib.resources as _ilr
+import logging as _logging
 import os as _os
 import re as _re
 from pathlib import Path
@@ -694,10 +712,60 @@ _StrictBoolLoader.add_implicit_resolver(
 )
 
 
+_config_log = _logging.getLogger("vectr.config")
+
+
+def embedding_overlay_paths() -> list[Path]:
+    """User ``config.yaml`` overlays, LOWEST precedence first: the global
+    ``~/.vectr/config.yaml``, then the workspace ``.vectr/config.yaml`` (the
+    workspace file wins). The workspace is ``VECTR_WORKSPACE`` when a daemon set
+    it, else the current directory — the same workspace the daemon indexes."""
+    workspace = _os.environ.get("VECTR_WORKSPACE") or _os.getcwd()
+    return [
+        Path.home() / ".vectr" / "config.yaml",
+        Path(workspace) / ".vectr" / "config.yaml",
+    ]
+
+
+def merge_embedding_overlays(cfg: dict[str, Any], overlays: list[Path]) -> None:
+    """Layer the user's ``embedding:`` settings over the bundled block, applying
+    ``overlays`` in lowest-precedence-first order so a later file wins.
+
+    Only the user-facing embedding settings are layerable
+    (``model``, ``output_dimensionality``, ``api_key_env``); every other config
+    block stays bundled-only. An overlay that cannot be read or parsed is
+    reported on the vectr logger and skipped — a half-applied or silently
+    ignored user config is worse than an announced one.
+    """
+    embedding = cfg.setdefault("embedding", {})
+    for path in overlays:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _config_log.warning("vectr: ignoring unreadable %s: %s", path, exc)
+            continue
+        try:
+            data = _yaml.load(raw, Loader=_StrictBoolLoader)
+        except _yaml.YAMLError as exc:
+            _config_log.warning("vectr: ignoring invalid YAML in %s: %s", path, exc)
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("embedding"), dict):
+            continue
+        user = data["embedding"]
+        if user.get("model") is not None:
+            embedding["default_model"] = str(user["model"])
+        for key in ("output_dimensionality", "api_key_env"):
+            if user.get(key) is not None:
+                embedding[key] = user[key]
+
+
 def _load_config() -> dict[str, Any]:
-    """Load and return the parsed agent/config.yaml as a dict."""
-    raw = _read_bundled_text("config.yaml")
-    return _yaml.load(raw, Loader=_StrictBoolLoader)  # type: ignore[no-any-return]
+    """Load agent/config.yaml and layer the user embedding overlays on it."""
+    cfg = _yaml.load(_read_bundled_text("config.yaml"), Loader=_StrictBoolLoader)
+    merge_embedding_overlays(cfg, embedding_overlay_paths())
+    return cfg  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
@@ -1094,11 +1162,51 @@ DEFAULT_PORT: int = 8765
 DEFAULT_HOST: str = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
-# Embedding — default local model (UPG-EMBEDDER-SWAP-GRANITE)
+# Embedding — default model, layerable (UPG-EMBEDDER-SWAP-GRANITE,
+# UPG-EMBED-CONFIG-LAYERING): workspace .vectr/config.yaml >
+# ~/.vectr/config.yaml > bundled agent/config.yaml, and VECTR_EMBED_MODEL above
+# all three. `embedding.model` in an overlay is the user-facing name for the
+# bundled `default_model`. Provider choice comes from the spec itself: a bare
+# name is local (sentence-transformers), `voyage*` / `openai/<m>` /
+# `google/<m>` select API providers — see agent/indexer/_types.py.
 # ---------------------------------------------------------------------------
 
+EMBEDDING_MODEL_ENV: str = "VECTR_EMBED_MODEL"
 EMBEDDING_DEFAULT_MODEL: str = str(_cfg["embedding"]["default_model"])
 EMBEDDING_MAX_SEQ_LENGTH: int = int(_cfg["embedding"]["max_seq_length"])
+
+
+def _resolve_output_dimensionality(raw: Any) -> int | None:
+    """``embedding.output_dimensionality``: null keeps the provider's own
+    default output size; a value must be a positive integer. A malformed value
+    fails loudly at startup rather than sending a broken request later."""
+    if raw is None:
+        return None
+    try:
+        dim = int(str(raw))
+    except ValueError:
+        dim = -1
+    if dim <= 0:
+        raise ValueError(
+            f"embedding.output_dimensionality must be a positive integer or null, got {raw!r}"
+        )
+    return dim
+
+
+EMBEDDING_OUTPUT_DIMENSIONALITY: int | None = _resolve_output_dimensionality(
+    _cfg["embedding"].get("output_dimensionality")
+)
+
+# Name of the environment variable holding a remote provider's API key. The
+# value is never logged or quoted in an error message — only the channel is.
+EMBEDDING_API_KEY_ENV: str = str(_cfg["embedding"].get("api_key_env") or "GEMINI_API_KEY")
+
+
+def embed_model_spec() -> str:
+    """The embedding model spec to run with: ``VECTR_EMBED_MODEL`` first, then
+    the layered ``embedding.model``. Call sites use this instead of reading the
+    env var themselves so the precedence rule lives in exactly one place."""
+    return _os.environ.get(EMBEDDING_MODEL_ENV) or EMBEDDING_DEFAULT_MODEL
 
 # UPG-EMBED-THREAD-CONTENTION: 0 means "auto" — derive from
 # thread_cap_auto_fraction * os.cpu_count(), minimum 1 thread. A positive
