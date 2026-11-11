@@ -25,6 +25,7 @@ derive from the identical string via app.cmdnorm.
 from __future__ import annotations
 
 import difflib
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -45,7 +46,16 @@ from agent.config import (
     ARC_WINDOW_MAX_PENDING_PER_VERB_FAMILY,
     ARC_WINDOW_TTL_SECONDS,
 )
-from app.cmdnorm import NormalizedCommand, classify_arg, leading_cd_target, normalize_command
+from app.cmdnorm import (
+    CD_ABSOLUTE,
+    CD_NONE,
+    CD_RELATIVE,
+    CD_SYMBOLIC_HOME,
+    NormalizedCommand,
+    classify_arg,
+    leading_cd_resolution,
+    normalize_command,
+)
 
 _PENDING_OUTCOMES = frozenset({"failure", "soft_failure"})
 _IGNORED_OUTCOMES = frozenset({"interrupted", "unknown", None})
@@ -191,20 +201,50 @@ def _effective_cwd(n: NormalizedCommand, episode: dict[str, Any]) -> Any:
     an agent that writes `cd /other/repo && cmd` inside `cmd_raw` changes
     the effective directory without changing the episode's own `cwd`
     field, so two episodes sharing a harness cwd can still execute in
-    unrelated repos. A leading `cd <path> &&` in `cmd_raw` (structural
-    command-shape parsing — same category as the rest of app.cmdnorm's
-    verb/flag/arg normalization, not query-content classification) always
-    wins when present; only when there is no leading `cd` (or it is a
-    shape `app.cmdnorm.leading_cd_target` deliberately does not resolve,
-    see its docstring) does this fall back to the episode `cwd` field,
-    which is today's pre-fix behavior."""
-    cd_target = leading_cd_target(n.cmd_raw)
-    return cd_target if cd_target is not None else episode.get("cwd")
+    unrelated repos.
+
+    Resolution rules (see `app.cmdnorm.leading_cd_resolution` for the full
+    classification — structural command-shape parsing, same category as
+    the rest of app.cmdnorm's verb/flag/arg normalization, never
+    query-content classification):
+      - no leading `cd`          -> the episode `cwd` field (pre-fix behavior);
+      - absolute target          -> the target itself, lexically normalized
+        (`os.path.normpath` only — never `abspath`, which would consult
+        THIS process's cwd, and never `realpath`, which would touch the
+        filesystem and break the detector's replay determinism);
+      - relative target          -> composed with the `cwd` field, again
+        normpath'd — so `cwd=/work/A` + `cd sub && x` keys as `/work/A/sub`
+        and can never pair with `/work/B`'s `sub`;
+      - tilde/$HOME forms        -> the symbolic tilde-form itself: constant
+        per session/machine even though its absolute value is unknowable;
+      - unresolvable (`cd -`, `$var` targets, declined shapes) or a
+        relative target with NO usable `cwd` field to compose against ->
+        None, meaning "refuse": the caller must not bucket this episode at
+        all (see `_bucket_key`). Refusing costs a missed lesson; falling
+        back to a KNOWN-wrong directory key risks a false lesson the
+        distiller may persist into memory permanently."""
+    status, target = leading_cd_resolution(n.cmd_raw)
+    if status == CD_NONE:
+        return episode.get("cwd")
+    if status == CD_ABSOLUTE:
+        return os.path.normpath(target)
+    if status == CD_SYMBOLIC_HOME:
+        return target
+    if status == CD_RELATIVE:
+        base = episode.get("cwd")
+        if not isinstance(base, str) or not base.strip():
+            return None
+        return os.path.normpath(os.path.join(base, target))
+    # CD_UNRESOLVABLE (imported vocabulary lives in app.cmdnorm): refuse.
+    return None
 
 
-def _bucket_key(n: NormalizedCommand, episode: dict[str, Any]) -> tuple[str, Any]:
+def _bucket_key(n: NormalizedCommand, episode: dict[str, Any]) -> tuple[str, Any] | None:
     """Pending-failure bucket key (review 2026-07-22, refined
-    UPG-ARC-CWD-VS-EFFECTIVE-DIR): `(verb-family, effective_cwd)`.
+    UPG-ARC-CWD-VS-EFFECTIVE-DIR): `(verb-family, effective_cwd)`, or None
+    when the effective directory is unresolvable — a refused episode
+    neither enters pending nor resolves one (an arc that cannot be placed
+    truthfully is never offered at all).
     effective_cwd is a BUCKET KEY, not a mutation axis — the original draft
     listed cwd on both sides, which is contradictory: cwd-as-mutation-axis
     binds unrelated repos' builds into false arcs (the same command failing
@@ -214,7 +254,10 @@ def _bucket_key(n: NormalizedCommand, episode: dict[str, Any]) -> tuple[str, Any
     strips it (`app.cmdnorm._strip_leading_cd`) — so cross-cwd matching is
     nearly all downside. See `_effective_cwd` for why the bucket key is
     derived from `cmd_raw`'s leading `cd`, not the raw `cwd` field alone."""
-    return (_verb_family(n), _effective_cwd(n, episode))
+    key_dir = _effective_cwd(n, episode)
+    if key_dir is None:
+        return None
+    return (_verb_family(n), key_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +474,13 @@ class ArcDetector:
         normalized: NormalizedCommand,
         ts: float,
     ) -> None:
-        bucket = state.pending.setdefault(_bucket_key(normalized, episode), [])
+        # UPG-ARC-CWD-VS-EFFECTIVE-DIR refusal bias: an episode whose
+        # effective directory cannot be determined truthfully never enters
+        # pending at all.
+        bucket_key = _bucket_key(normalized, episode)
+        if bucket_key is None:
+            return
+        bucket = state.pending.setdefault(bucket_key, [])
         bucket.append(
             _PendingFailure(episode=episode, normalized=normalized, ts=ts, command_index=state.command_count)
         )
@@ -492,6 +541,10 @@ class ArcDetector:
         success_norm: NormalizedCommand,
     ) -> list[Arc]:
         bucket_key = _bucket_key(success_norm, success_episode)
+        if bucket_key is None:
+            # Same refusal bias as _add_pending: a success whose effective
+            # directory is unknowable resolves nothing.
+            return []
         bucket = state.pending.get(bucket_key)
         if not bucket:
             return []

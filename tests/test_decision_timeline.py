@@ -325,6 +325,116 @@ class TestChronologicalSort:
 
 
 # ---------------------------------------------------------------------------
+# (2b) UPG-RECALL-SEMANTIC-POOL-SORT-TRUNCATION: an explicit non-relevance
+# sort must not be silently bounded by the semantic candidate pool
+# ---------------------------------------------------------------------------
+
+_POOL_MARKER = "zzq-off-topic-marker-banana-stand"
+
+
+def _structured_embed(texts: list[str]) -> list[list[float]]:
+    """Two-direction embedder for pool-truncation tests: text containing
+    _POOL_MARKER maps to vector A, everything else to ORTHOGONAL vector B.
+    Unlike a hash embedder this GUARANTEES the marked note ranks strictly
+    last for an unmarked query, so its exclusion from the limit*3 pool is
+    deterministic rather than luck-of-the-hash."""
+    vecs = []
+    for t in texts:
+        if _POOL_MARKER in t:
+            v = [1.0] + [0.0] * 15
+        else:
+            v = [0.0, 1.0] + [0.0] * 14
+        vecs.append(v)
+    return vecs
+
+
+class TestSemanticPoolSortTruncation:
+    """With more matching notes than limit*3, re-sorting only the semantic
+    candidate pool silently dropped the true oldest/highest-priority note
+    (it never made the pool). An explicit non-relevance sort now also
+    prefetches the true top-limit rows by the requested key via the same
+    WHERE clause."""
+
+    def _store(self, tmp_path):
+        import chromadb
+        from agent.working_context_store import WorkingContextStore
+        client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+        return WorkingContextStore(
+            str(tmp_path), embed_fn=_structured_embed, notes_chroma_client=client,
+        )
+
+    def _seed(self, store):
+        """7 decisions with identical on-topic embeddings plus the TRUE
+        OLDEST decision whose marker content embeds orthogonally — it can
+        only miss the semantic pool."""
+        ws = "/ws"
+        ids = [
+            store.remember(ws, f"decision {i}: use blue-green deploys", kind="decision")
+            for i in range(7)
+        ]
+        target = store.remember(
+            ws, f"decision about {_POOL_MARKER} and unrelated subsystems", kind="decision",
+        )
+        now = time.time()
+        for i, nid in enumerate(ids):
+            _set_created_at(store, nid, now - 100 + i)
+        _set_created_at(store, target, now - 10_000)  # far oldest overall
+        return ws, target
+
+    def test_chronological_surfaces_the_true_oldest_despite_pool_miss(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        ws, target = self._seed(store)
+        # limit=2 -> pool holds min(6, 8) = 6 of the 7 on-topic notes; the
+        # marked note (orthogonal to the query) never ranks into it. The
+        # prefetch must still deliver the true oldest note FIRST.
+        notes = store.recall(
+            ws, query="deployment decisions", kind="decision",
+            sort_by="chronological", limit=2,
+        )
+        assert len(notes) == 2
+        assert notes[0].note_id == target
+
+    def test_relevance_default_still_excludes_the_off_pool_note(self, tmp_path) -> None:
+        """Control pinning the default path UNCHANGED: relevance keeps its
+        exact pre-existing semantics — the fix must not leak prefetched rows
+        into it."""
+        store = self._store(tmp_path)
+        ws, target = self._seed(store)
+        notes = store.recall(
+            ws, query="deployment decisions", kind="decision",
+            sort_by="relevance", limit=2,
+        )
+        assert all(n.note_id != target for n in notes)
+
+    def test_prefetch_reuses_the_metadata_filters(self, tmp_path) -> None:
+        """The prefetch runs the same METADATA filters as the candidate fetch
+        (it drops only the semantic `note_id IN (...)` restriction), so a
+        non-matching kind can enter neither via the semantic pool nor via the
+        sort-aware prefetch.
+
+        Both conditions here are load-bearing. The stray is seeded OLDER than
+        the target, so a kind filter that failed to reach the prefetch would
+        put it first rather than merely somewhere in the tail. And limit=2
+        keeps the semantic pool (6) smaller than the filtered corpus (9), so
+        the prefetch is the only path that can deliver the target at all — at
+        a limit whose pool covers every note, this assertion would hold with
+        the prefetch deleted entirely."""
+        store = self._store(tmp_path)
+        ws, target = self._seed(store)
+        stray = store.remember(ws, f"finding about {_POOL_MARKER}", kind="finding")
+        _set_created_at(store, stray, time.time() - 20_000)  # older than target
+        notes = store.recall(
+            ws, query="deployment decisions", kind="decision",
+            sort_by="chronological", limit=2,
+        )
+        assert len(notes) == 2
+        assert notes[0].note_id == target
+        assert all(n.note_id != stray for n in notes)
+        assert all(n.kind == "decision" for n in notes)
+        assert all(n.note_id != stray for n in notes)
+
+
+# ---------------------------------------------------------------------------
 # (3) Chronological rendering: date instead of relative age
 # ---------------------------------------------------------------------------
 

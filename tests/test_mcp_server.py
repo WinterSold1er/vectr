@@ -19,6 +19,7 @@ from integrations.mcp_server import (
     _EXPLORATION_TOOLS,
     _MEMORY_WRITE_TOOLS,
     _MEMORY_TOOLS,
+    _UTILITY_TOOLS,
     handle_tools_call,
     handle_tools_list,
     enable_memory_for_session,
@@ -83,6 +84,11 @@ def _mock_service():
         # UPG-HOOK-INJECT-OBSERVABILITY: hook injection counters are always
         # present in the real service.status() output — mock the real shape.
         "hook_injection_counts": {},
+        # UPG-PURPOSE-RESUME-HOLE: ARCH-4 purpose-chunk count and per-run
+        # backfill-gap count are always present in the real service.status()
+        # output — mock the real shape.
+        "total_purpose_chunks": 80,
+        "purpose_backfill_pending_files": 0,
     }
     svc.get_map.return_value = "# Passport\nA FastAPI service."
     # UPG-6.2: save_map returns a shaped result, not None — real shape.
@@ -98,7 +104,7 @@ def _mock_service():
     # tests below override this per-case (return_value or side_effect) when
     # they need a specific note_id or an error path.
     svc.remember_with_extras.return_value = RememberOutcome(
-        note_id=42, related=[], proxy_anchor_suggestions=[],
+        note_id=42, related=[], revoked_related=[], proxy_anchor_suggestions=[],
     )
     # UPG-SCOPE-SURFACE-BACK: the MCP remember confirmation looks up the
     # resolved note via get_note() to surface its scope — a real WorkingNote
@@ -276,6 +282,60 @@ class TestHandleToolsList:
                          "vectr_fetch"):
             assert expected in names
 
+    def test_handle_tools_list_docstring_lists_every_real_tool(self) -> None:
+        """UPG-MCP-TOOLS-LIST-DOCSTRING: the docstring on handle_tools_list
+        was hand-curated and drifted (omitted vectr_pin, vectr_distill,
+        vectr_anchor, vectr_resume, vectr_ingest_traces, vectr_snapshot_list).
+        Derive the correct inventory from the actual gating code's tool
+        groups and assert the docstring mentions every member — a future
+        tool addition that forgets to update the docstring will fail here
+        with a precise list of missing names, not a 'docstring looks
+        wrong' message.
+        """
+        from integrations.mcp_server._dispatch import handle_tools_list as _h
+
+        # Always-shown = exploration + memory-write + utility, derived from
+        # the same constants the live code uses (no hand-copy).
+        always_shown = {t["name"] for t in _EXPLORATION_TOOLS}
+        always_shown |= {t["name"] for t in _MEMORY_WRITE_TOOLS}
+        always_shown |= {t["name"] for t in _UTILITY_TOOLS}
+        # Gated on notes existing = the _MEMORY_TOOLS list verbatim.
+        gated = {t["name"] for t in _MEMORY_TOOLS}
+
+        doc = _h.__doc__ or ""
+        missing_always = sorted(always_shown - _names_in_doc(doc))
+        missing_gated = sorted(gated - _names_in_doc(doc))
+        assert not missing_always, (
+            f"handle_tools_list docstring is missing always-shown tool(s): "
+            f"{missing_always} — derive the list from _EXPLORATION_TOOLS + "
+            f"_MEMORY_WRITE_TOOLS + _UTILITY_TOOLS, not by hand"
+        )
+        assert not missing_gated, (
+            f"handle_tools_list docstring is missing gated tool(s): "
+            f"{missing_gated} — derive the list from _MEMORY_TOOLS, not by hand"
+        )
+
+        # And: no name mentioned in the docstring that is NOT a real tool
+        # (catches typos and retired tools lingering in the prose).
+        real_all = always_shown | gated
+        # Strip the leading 'vectr_' prefix token off each doc mention so
+        # the comparison uses full tool names.
+        all_mentioned = _names_in_doc(doc)
+        spurious = sorted(all_mentioned - real_all)
+        assert not spurious, (
+            f"handle_tools_list docstring mentions tool(s) that are not in any "
+            f"grouping: {spurious}"
+        )
+
+
+def _names_in_doc(doc: str) -> set[str]:
+    """Pick `vectr_<word>` tokens out of a docstring — only the ones bounded
+    by non-word characters (so 'vectr_pin' inside 'vectr_pinned' is not
+    matched). Cheap tokeniser; fine for a 6-line docstring.
+    """
+    import re
+    return {m.group(0) for m in re.finditer(r"\bvectr_[a-z][a-z0-9_]*", doc)}
+
 
 # ---------------------------------------------------------------------------
 # T13: Adaptive tool registration
@@ -355,7 +415,7 @@ class TestAdaptiveToolRegistration:
         sid = "sess-remember-005"
         svc = MagicMock()
         svc.remember_with_extras.return_value = RememberOutcome(
-            note_id=1, related=[], proxy_anchor_suggestions=[],
+            note_id=1, related=[], revoked_related=[], proxy_anchor_suggestions=[],
         )
         svc.search_only = False
 
@@ -632,7 +692,13 @@ class TestVectrSearch:
         text = result["content"][0]["text"]
         assert "Symbol graph (exact matches for query identifiers)" in text
 
-    def test_refetchable_footer_suppressed_in_pointer_mode(self) -> None:
+    def test_refetchable_footer_suppressed_in_pointer_mode(self, monkeypatch) -> None:
+        # UPG-BANNER-CALIBRATION: rank-1 of a low-confidence set is retained
+        # by default now, so a genuinely all-pointer (nothing shown) response
+        # requires disabling the rank-1 exemption for this test — it isolates
+        # the pre-existing footer-suppression path (UPG-LOWCONF-SLIM-DEDUPE),
+        # which still applies whenever retain_body is all False.
+        monkeypatch.setattr("integrations.mcp_server._dispatch.POINTER_MODE_RETAIN_RANK1_ALWAYS", False)
         from agent.searcher import SearchResult, SearchResultList
         r = SearchResult(file_path="auth.py", lines="10-20", symbol_name="login",
                          language="python", score=0.01, content="BODY",
@@ -862,6 +928,46 @@ class TestVectrStatus:
         assert "Hook injections" in text
         assert "SessionStart 3" in text
         assert "PreToolUse 2" in text
+
+    def test_purpose_vectors_count_in_output(self) -> None:
+        # UPG-PURPOSE-RESUME-HOLE: total_purpose_chunks must render on its
+        # own line, not just be inferable from total_chunks.
+        svc = _mock_service()
+        svc.status.return_value = {**svc.status.return_value, "total_purpose_chunks": 80}
+        text = handle_tools_call("vectr_status", {}, svc)["content"][0]["text"]
+        assert "Purpose vectors: 80" in text
+
+    def test_purpose_backfill_warning_absent_when_no_gap(self) -> None:
+        # UPG-PURPOSE-RESUME-HOLE: a workspace with no open purpose-vector
+        # gap (the common case) stays terse, same as Watcher/Hook injections.
+        svc = _mock_service()
+        svc.status.return_value = {**svc.status.return_value, "purpose_backfill_pending_files": 0}
+        text = handle_tools_call("vectr_status", {}, svc)["content"][0]["text"]
+        assert "WARNING" not in text
+
+    def test_purpose_backfill_warning_shown_with_gap_count(self) -> None:
+        # UPG-PURPOSE-RESUME-HOLE: when the most recent index run found
+        # files with current body content but incomplete purpose vectors,
+        # vectr_status must say so explicitly with the exact file count,
+        # not leave the caller to divide total_chunks by total_purpose_chunks
+        # (a ratio that is always < 1 even when nothing is wrong).
+        svc = _mock_service()
+        svc.status.return_value = {
+            **svc.status.return_value,
+            "purpose_backfill_pending_files": 7,
+        }
+        text = handle_tools_call("vectr_status", {}, svc)["content"][0]["text"]
+        assert "WARNING" in text
+        assert "7 file(s)" in text
+
+    def test_purpose_vectors_pending_line_shown_during_background_backfill(self) -> None:
+        # UPG-PURPOSE-PASS-DEFERRAL: distinct from the gap warning above —
+        # this covers the in-flight window where a backfill has already
+        # been dispatched to the background thread and is still running.
+        svc = _mock_service()
+        svc.status.return_value = {**svc.status.return_value, "purpose_vectors_pending": True}
+        text = handle_tools_call("vectr_status", {}, svc)["content"][0]["text"]
+        assert "backfilling in the background" in text
 
     def test_notes_count_zero_shows_skip_hint(self) -> None:
         svc = _mock_service()
@@ -1303,7 +1409,7 @@ class TestRelativePathRender:
 # for the write-time resolution itself).
 _DEFAULT_TRIGGER_PARAMS = dict(
     triggers=None, provenance="agent", scope=None, anchors=None, supersedes=None,
-    contradicts=None, session_id=None, user_quote=None,
+    contradicts=None, session_id=None, user_quote=None, pin=False,
 )
 
 
@@ -1460,7 +1566,7 @@ class TestVectrRemember:
             kind="gotcha", title="", agent="",
             triggers=[{"path": "src/auth.py", "event": "pre-edit"}],
             provenance="auto", scope="repo", anchors=["src/auth.py"], supersedes=None,
-            contradicts=None, session_id=None, user_quote=None,
+            contradicts=None, session_id=None, user_quote=None, pin=False,
         )
 
     def test_remember_passes_supersedes_as_int(self) -> None:
@@ -1470,7 +1576,7 @@ class TestVectrRemember:
             content="corrected finding", tags=None, priority="medium",
             kind="finding", title="", agent="",
             triggers=None, provenance="agent", scope=None, anchors=None, supersedes=7,
-            contradicts=None, session_id=None, user_quote=None,
+            contradicts=None, session_id=None, user_quote=None, pin=False,
         )
 
     def test_remember_non_integer_supersedes_returns_error(self) -> None:
@@ -1490,7 +1596,7 @@ class TestVectrRemember:
             content="the API actually returns a dict", tags=None, priority="medium",
             kind="finding", title="", agent="",
             triggers=None, provenance="agent", scope=None, anchors=None, supersedes=None,
-            contradicts=7, session_id=None, user_quote=None,
+            contradicts=7, session_id=None, user_quote=None, pin=False,
         )
 
     def test_remember_non_integer_contradicts_returns_error(self) -> None:
@@ -1597,6 +1703,7 @@ class TestVectrRememberWriteTimeOffersSuffixRendering:
                 "kind": "finding", "priority": "medium", "similarity": 0.81,
                 "created_at": 0.0,
             }],
+            revoked_related=[],
             proxy_anchor_suggestions=[],
         )
         result = handle_tools_call("vectr_remember", {"content": "a new note"}, svc)
@@ -1617,6 +1724,7 @@ class TestVectrRememberWriteTimeOffersSuffixRendering:
                 "note_id": 7, "title": long_title, "kind": "finding",
                 "priority": "medium", "similarity": 0.9, "created_at": 0.0,
             }],
+            revoked_related=[],
             proxy_anchor_suggestions=[],
         )
         result = handle_tools_call("vectr_remember", {"content": "a new note"}, svc)
@@ -1629,10 +1737,56 @@ class TestVectrRememberWriteTimeOffersSuffixRendering:
         result = handle_tools_call("vectr_remember", {"content": "a new note"}, svc)
         assert "Related existing notes" not in result["content"][0]["text"]
 
+    def test_revoked_suffix_present_with_data(self) -> None:
+        svc = _mock_service()
+        svc.remember_with_extras.return_value = RememberOutcome(
+            note_id=42,
+            related=[],
+            revoked_related=[{
+                "note_id": 9, "title": "a belief already marked wrong",
+                "similarity": 0.88, "revoked_date": "2026-08-01",
+                "reason": "turned out to be wrong",
+            }],
+            proxy_anchor_suggestions=[],
+        )
+        result = handle_tools_call("vectr_remember", {"content": "a new note"}, svc)
+        text = result["content"][0]["text"]
+        assert (
+            "DETERRENT — an existing note like this one was already revoked:"
+        ) in text
+        assert (
+            '#9 "a belief already marked wrong" (similarity 0.88, '
+            "revoked 2026-08-01, reason: turned out to be wrong)"
+        ) in text
+        assert "Do not re-derive or restate it without verification" in text
+
+    def test_revoked_suffix_truncates_long_titles_around_60_chars(self) -> None:
+        svc = _mock_service()
+        long_title = "B" * 80
+        svc.remember_with_extras.return_value = RememberOutcome(
+            note_id=42,
+            related=[],
+            revoked_related=[{
+                "note_id": 9, "title": long_title,
+                "similarity": 0.9, "revoked_date": "2026-08-01",
+                "reason": "wrong",
+            }],
+            proxy_anchor_suggestions=[],
+        )
+        result = handle_tools_call("vectr_remember", {"content": "a new note"}, svc)
+        text = result["content"][0]["text"]
+        assert "B" * 57 + "..." in text
+        assert "B" * 80 not in text
+
+    def test_revoked_suffix_absent_when_revoked_related_is_empty(self) -> None:
+        svc = _mock_service()  # default RememberOutcome from _mock_service has revoked_related=[]
+        result = handle_tools_call("vectr_remember", {"content": "a new note"}, svc)
+        assert "DETERRENT" not in result["content"][0]["text"]
+
     def test_proxy_suffix_present_with_data(self) -> None:
         svc = _mock_service()
         svc.remember_with_extras.return_value = RememberOutcome(
-            note_id=42, related=[],
+            note_id=42, related=[], revoked_related=[],
             proxy_anchor_suggestions=["Dockerfile", ".github/workflows/ci.yml"],
         )
         result = handle_tools_call(
@@ -1640,7 +1794,10 @@ class TestVectrRememberWriteTimeOffersSuffixRendering:
         )
         text = result["content"][0]["text"]
         assert "Process files present here: Dockerfile, .github/workflows/ci.yml." in text
-        assert "re-store it with anchors=[...] and supersedes=<note_id>." in text
+        # UPG-ANCHOR-ATTACH: the suggestion now advertises the single-call
+        # vectr_anchor primitive instead of the re-store workaround.
+        assert "vectr_anchor(note_id=<this note>, anchors=[<path>])" in text
+        assert "no re-store needed" in text
         assert (
             "A changed anchor means the process MAY have changed, "
             "never that the note is wrong."
@@ -1664,6 +1821,7 @@ class TestVectrRememberWriteTimeOffersSuffixRendering:
                 "note_id": 7, "title": "x", "kind": "finding",
                 "priority": "medium", "similarity": 0.9, "created_at": 0.0,
             }],
+            revoked_related=[],
             proxy_anchor_suggestions=["Dockerfile"],
         )
         result = handle_tools_call(
@@ -1950,17 +2108,261 @@ class TestVectrRecall:
         handle_tools_call("vectr_recall", {"note_id": 7}, svc)
         assert_seam_call(svc.recall, VectrService.recall, note_id=7)
 
+    def test_recall_note_id_hash_prefix_is_an_error_not_a_fallback(self) -> None:
+        """UPG-RECALL-NOTE-ID-NO-EXPAND: note_id= is a LOOKUP of one stored
+        note, not a retrieval — a malformed id ('#581' copied from the [#N]
+        prefix in index output, the reported live symptom) must be rejected
+        explicitly instead of silently degrading to the generic ranked/index
+        path."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_recall", {"note_id": "#581"}, svc)
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert "integer" in text
+        assert "'#581'" in text  # the offending value is echoed for recovery
+        svc.recall.assert_not_called()
+
+    def test_recall_note_id_bool_is_an_error_not_silent_note_1(self) -> None:
+        """JSON true/false are int subclasses; int(True)==1 would silently
+        expand an unrelated note. Must error like any other malformed id."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_recall", {"note_id": True}, svc)
+        assert result["isError"] is True
+        svc.recall.assert_not_called()
+
+    def test_recall_note_id_numeric_string_still_coerces(self) -> None:
+        """A numeric string ("581" without the '#') is still accepted — the
+        fix targets malformed ids, not lenient int parsing."""
+        svc = _mock_service()
+        handle_tools_call("vectr_recall", {"note_id": "581"}, svc)
+        assert_seam_call(svc.recall, VectrService.recall, note_id=581)
+
     def test_recall_passes_sort_by_and_max_age(self) -> None:
         """UPG-RECALL-HIERARCHY: sort_by and max_age_days reach the service."""
         svc = _mock_service()
         handle_tools_call("vectr_recall", {"sort_by": "recency", "max_age_days": 7.0}, svc)
         assert_seam_call(svc.recall, VectrService.recall, sort_by="recency", max_age_days=7.0)
 
+    def test_recall_unknown_sort_by_is_rejected_with_vocab(self) -> None:
+        """UPG-MCP-SORTBY-PASSTHROUGH: an out-of-vocabulary sort_by must be
+        rejected at the MCP dispatch boundary, not silently treated as
+        'relevance' by the store. Error shape mirrors REST's 422 body
+        (app/models.py::RecallRequest.validate_sort_by) so both surfaces
+        agree on the vocabulary and the wording."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_recall", {"sort_by": "newest"}, svc)
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert "sort_by must be one of" in text
+        for vocab in ("relevance", "recency", "priority", "chronological"):
+            assert vocab in text, f"vocab term {vocab!r} missing from error"
+        svc.recall.assert_not_called()
+
+    def test_recall_every_documented_sort_value_accepted(self) -> None:
+        """Same vocabulary as REST (test_recall_rest_every_documented_sort_value_accepted).
+        The MCP schema enum already constrains well-behaved clients; this
+        pins the dispatch-side check to the same four values."""
+        for value in ("relevance", "recency", "priority", "chronological"):
+            svc = _mock_service()
+            result = handle_tools_call("vectr_recall", {"sort_by": value}, svc)
+            assert result["isError"] is False, f"sort_by={value!r} must be accepted"
+
     def test_recall_returns_notes_text(self) -> None:
         svc = _mock_service()
         result = handle_tools_call("vectr_recall", {}, svc)
         assert result["isError"] is False
         assert "Notes" in result["content"][0]["text"]
+
+
+class TestVectrAnchor:
+    """UPG-ANCHOR-ATTACH: vectr_anchor dispatch — first-class post-write
+    anchoring, replacing the re-store-with-supersedes workaround."""
+
+    def test_anchor_calls_service_and_renders_result(self) -> None:
+        svc = _mock_service()
+        svc.attach_anchors.return_value = {"attached": ["Dockerfile"], "already_present": []}
+        result = handle_tools_call("vectr_anchor", {"note_id": 42, "anchors": ["Dockerfile"]}, svc)
+        assert result["isError"] is False
+        assert_seam_call(
+            svc.attach_anchors, VectrService.attach_anchors,
+            note_id=42, anchors=["Dockerfile"],
+        )
+        text = result["content"][0]["text"]
+        assert "Attached 1 anchor(s)" in text
+        # The deterrent framing travels with every anchor write.
+        assert "never that the note is wrong" in text
+
+    def test_anchor_reports_already_present_paths_as_noop(self) -> None:
+        svc = _mock_service()
+        svc.attach_anchors.return_value = {"attached": [], "already_present": ["Dockerfile"]}
+        result = handle_tools_call("vectr_anchor", {"note_id": 42, "anchors": ["Dockerfile"]}, svc)
+        assert result["isError"] is False
+        assert "no-op" in result["content"][0]["text"]
+
+    def test_anchor_unknown_note_is_an_explicit_error(self) -> None:
+        """Lookup semantics, consistent with vectr_pin/promote/revoke and
+        with UPG-RECALL-NOTE-ID-NO-EXPAND's never-fallback rule."""
+        svc = _mock_service()
+        svc.attach_anchors.return_value = None
+        result = handle_tools_call("vectr_anchor", {"note_id": 99999, "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        assert "not found" in result["content"][0]["text"]
+
+    def test_anchor_missing_note_id_is_an_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_anchor", {"anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        svc.attach_anchors.assert_not_called()
+
+    def test_anchor_bool_note_id_is_an_error_not_silent_note_1(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_anchor", {"note_id": True, "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        svc.attach_anchors.assert_not_called()
+
+    def test_anchor_malformed_note_id_is_an_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_anchor", {"note_id": "#42", "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        svc.attach_anchors.assert_not_called()
+
+    def test_anchor_missing_empty_or_non_string_anchors_are_errors(self) -> None:
+        svc = _mock_service()
+        for bad_args in (
+            {"note_id": 42},                          # anchors absent
+            {"note_id": 42, "anchors": []},           # empty list
+            {"note_id": 42, "anchors": [""]},         # empty string element
+            {"note_id": 42, "anchors": [42]},         # non-string element
+            {"note_id": 42, "anchors": "a.py"},       # bare string, not a list
+        ):
+            result = handle_tools_call("vectr_anchor", bad_args, svc)
+            assert result["isError"] is True, f"{bad_args!r} must be rejected"
+        svc.attach_anchors.assert_not_called()
+
+    def test_anchor_threads_transport_session_id(self) -> None:
+        """Session identity is transport-level (the harness's own session,
+        same convention as vectr_remember) — it feeds the
+        UPG-ANCHOR-UNOBSERVED-BINDING observation verdict per attached path."""
+        svc = _mock_service()
+        svc.attach_anchors.return_value = {"attached": ["a.py"], "already_present": []}
+        handle_tools_call(
+            "vectr_anchor", {"note_id": 9, "anchors": ["a.py"]}, svc,
+            session_id="sess-1",
+        )
+        assert_seam_call(svc.attach_anchors, VectrService.attach_anchors, session_id="sess-1")
+
+    def test_anchor_schema_declares_both_required_args(self) -> None:
+        from integrations.mcp_server._schemas import MCP_TOOLS
+        matches = [t for t in MCP_TOOLS if t["name"] == "vectr_anchor"]
+        assert len(matches) == 1
+        schema = matches[0]["inputSchema"]
+        assert schema["required"] == ["note_id", "anchors"]
+        assert matches[0]["annotations"]["idempotentHint"] is True
+
+    def test_anchor_is_memory_ready_gated(self) -> None:
+        """Servable as soon as phase 1 construction completes, like its
+        sibling working-note mutators."""
+        from integrations.mcp_server._schemas import MEMORY_READY_TOOLS
+        assert "vectr_anchor" in MEMORY_READY_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# vectr_unanchor (UPG-ANCHOR-DETACH)
+# ---------------------------------------------------------------------------
+
+class TestVectrUnanchor:
+    """UPG-ANCHOR-DETACH: vectr_unanchor dispatch — first-class post-write
+    de-anchoring, the inverse of vectr_anchor."""
+
+    def test_unanchor_calls_service_and_renders_result(self) -> None:
+        svc = _mock_service()
+        svc.detach_anchors.return_value = {"removed": ["Dockerfile"], "not_present": []}
+        result = handle_tools_call("vectr_unanchor", {"note_id": 42, "anchors": ["Dockerfile"]}, svc)
+        assert result["isError"] is False
+        assert_seam_call(
+            svc.detach_anchors, VectrService.detach_anchors,
+            note_id=42, anchors=["Dockerfile"],
+        )
+        text = result["content"][0]["text"]
+        assert "Removed 1 anchor(s)" in text
+
+    def test_unanchor_reports_not_present_paths_as_noop(self) -> None:
+        svc = _mock_service()
+        svc.detach_anchors.return_value = {"removed": [], "not_present": ["Dockerfile"]}
+        result = handle_tools_call("vectr_unanchor", {"note_id": 42, "anchors": ["Dockerfile"]}, svc)
+        assert result["isError"] is False
+        assert "no-op" in result["content"][0]["text"]
+        assert "Dockerfile" in result["content"][0]["text"]
+
+    def test_unanchor_unknown_note_is_an_explicit_error(self) -> None:
+        """Lookup semantics, consistent with vectr_anchor's not-found shape
+        and UPG-RECALL-NOTE-ID-NO-EXPAND's never-fallback rule."""
+        svc = _mock_service()
+        svc.detach_anchors.return_value = None
+        result = handle_tools_call("vectr_unanchor", {"note_id": 99999, "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        assert "not found" in result["content"][0]["text"]
+
+    def test_unanchor_value_error_on_empty_anchors_is_an_error(self) -> None:
+        """Store raises ValueError on empty anchors; dispatch surfaces it
+        as a tool error, same shape as vectr_anchor's empty-anchors error."""
+        svc = _mock_service()
+        svc.detach_anchors.side_effect = ValueError("detach_anchors requires at least one anchor path")
+        result = handle_tools_call("vectr_unanchor", {"note_id": 42, "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        assert "requires at least one anchor" in result["content"][0]["text"]
+
+    def test_unanchor_missing_note_id_is_an_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_unanchor", {"anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        svc.detach_anchors.assert_not_called()
+
+    def test_unanchor_bool_note_id_is_an_error_not_silent_note_1(self) -> None:
+        """Same guard as vectr_anchor: JSON true is an int subclass
+        (int(True) == 1) and would silently mutate an unrelated note."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_unanchor", {"note_id": True, "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        svc.detach_anchors.assert_not_called()
+
+    def test_unanchor_malformed_note_id_is_an_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_unanchor", {"note_id": "#42", "anchors": ["a.py"]}, svc)
+        assert result["isError"] is True
+        svc.detach_anchors.assert_not_called()
+
+    def test_unanchor_missing_empty_or_non_string_anchors_are_errors(self) -> None:
+        """Same load-bearing non-empty-list guard as vectr_anchor: REST
+        enforces min_length=1 and the CLI enforces nargs='+', so the
+        dispatch-side check must agree or the surface splits."""
+        svc = _mock_service()
+        for bad_args in (
+            {"note_id": 42},                          # anchors absent
+            {"note_id": 42, "anchors": []},           # empty list
+            {"note_id": 42, "anchors": [""]},         # empty string element
+            {"note_id": 42, "anchors": [42]},         # non-string element
+            {"note_id": 42, "anchors": "a.py"},       # bare string, not a list
+        ):
+            result = handle_tools_call("vectr_unanchor", bad_args, svc)
+            assert result["isError"] is True, f"{bad_args!r} must be rejected"
+        svc.detach_anchors.assert_not_called()
+
+    def test_unanchor_schema_declares_both_required_args(self) -> None:
+        from integrations.mcp_server._schemas import MCP_TOOLS
+        matches = [t for t in MCP_TOOLS if t["name"] == "vectr_unanchor"]
+        assert len(matches) == 1
+        schema = matches[0]["inputSchema"]
+        assert schema["required"] == ["note_id", "anchors"]
+        assert matches[0]["annotations"]["idempotentHint"] is True
+        assert matches[0]["annotations"]["destructiveHint"] is False
+
+    def test_unanchor_is_memory_ready_gated(self) -> None:
+        """Servable as soon as phase 1 construction completes, like its
+        sibling working-note mutators — no model load, no indexer, no
+        searcher, no watcher required to detach an anchor."""
+        from integrations.mcp_server._schemas import MEMORY_READY_TOOLS
+        assert "vectr_unanchor" in MEMORY_READY_TOOLS
 
     def test_recall_appends_eviction_hint_when_should_evict(self) -> None:
         svc = _mock_service()
@@ -2104,6 +2506,30 @@ class TestVectrForget:
         svc.forget_note.assert_not_called()
         svc.forget_all.assert_not_called()
 
+    def test_forget_note_id_bool_is_an_error_not_silent_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: JSON true/false are int subclasses;
+        int(True) == 1 would silently delete note #1 — must error like any
+        other malformed id. The destructive failure mode is the reason this
+        item leads the lane."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_forget", {"note_id": True}, svc)
+        assert result["isError"] is True
+        svc.forget_note.assert_not_called()
+        svc.forget_all.assert_not_called()
+        # The offender is echoed so a model can recover without re-deriving
+        # what it sent (same shape as vectr_recall/vectr_anchor's guard).
+        assert "True" in result["content"][0]["text"]
+
+    def test_forget_note_id_one_int_still_deletes_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: the bool guard must not block a real
+        int 1 — only the bool True/False are rejected."""
+        svc = _mock_service()
+        svc.forget_note.return_value = True
+        result = handle_tools_call("vectr_forget", {"note_id": 1}, svc)
+        assert result["isError"] is False
+        svc.forget_note.assert_called_once_with(1)
+        assert "#1" in result["content"][0]["text"]
+
     def test_forget_all_true_clears_workspace(self) -> None:
         svc = _mock_service()
         svc.forget_all.return_value = 5
@@ -2139,11 +2565,16 @@ class TestVectrForget:
         tools = handle_tools_list(session_id="fresh-session-no-notes")["tools"]
         names = {t["name"] for t in tools}
         # UPG-MEMORY-STATE-MACHINE §4.2 added vectr_revoke/vectr_reinstate (18 = 16 + 2);
-        # memoization-l3-distiller-design added vectr_distill (19 = 18 + 1).
-        assert len(tools) == 19
+        # memoization-l3-distiller-design added vectr_distill (19 = 18 + 1);
+        # UPG-RECALL-MISS-FLOOR part (b) added vectr_pin (20 = 19 + 1);
+        # UPG-ANCHOR-ATTACH added vectr_anchor (21 = 20 + 1);
+        # UPG-NOTE-RETIRE-POST-HOC added vectr_supersede (22 = 21 + 1);
+        # UPG-ANCHOR-DETACH added vectr_unanchor (23 = 22 + 1).
+        assert len(tools) == 23
         assert {
             "vectr_recall", "vectr_forget", "vectr_promote", "vectr_revoke", "vectr_reinstate",
-            "vectr_snapshot", "vectr_snapshot_list", "vectr_resume", "vectr_distill",
+            "vectr_snapshot", "vectr_snapshot_list", "vectr_resume", "vectr_distill", "vectr_pin",
+            "vectr_supersede",
         } <= names
 
     def test_all_tools_env_flag_off_keeps_gating(self, monkeypatch) -> None:
@@ -2200,6 +2631,25 @@ class TestVectrPromote:
         result = handle_tools_call("vectr_promote", {"note_id": "abc", "to": "agent"}, svc)
         assert result["isError"] is True
         svc.promote_note.assert_not_called()
+
+    def test_promote_note_id_bool_is_an_error_not_silent_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: same guard as vectr_recall/vectr_anchor
+        — JSON true/false are int subclasses; int(True) == 1 would promote
+        an unrelated note."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_promote", {"note_id": True, "to": "agent"}, svc)
+        assert result["isError"] is True
+        svc.promote_note.assert_not_called()
+        assert "True" in result["content"][0]["text"]
+
+    def test_promote_note_id_one_int_still_promotes_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: only bool True/False is rejected; an
+        actual int 1 still reaches the service."""
+        svc = _mock_service()
+        svc.promote_note.return_value = True
+        result = handle_tools_call("vectr_promote", {"note_id": 1, "to": "agent"}, svc)
+        assert result["isError"] is False
+        svc.promote_note.assert_called_once_with(1, "agent")
 
     def test_promote_not_found_returns_error(self) -> None:
         svc = _mock_service()
@@ -2268,6 +2718,22 @@ class TestVectrRevoke:
         assert result["isError"] is True
         svc.revoke_note.assert_not_called()
 
+    def test_revoke_note_id_bool_is_an_error_not_silent_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: int(True) == 1 would revoke note #1."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_revoke", {"note_id": True, "reason": "wrong"}, svc)
+        assert result["isError"] is True
+        svc.revoke_note.assert_not_called()
+        assert "True" in result["content"][0]["text"]
+
+    def test_revoke_note_id_one_int_still_revokes_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: only bool is rejected; int 1 still works."""
+        svc = _mock_service()
+        svc.revoke_note.return_value = True
+        result = handle_tools_call("vectr_revoke", {"note_id": 1, "reason": "wrong"}, svc)
+        assert result["isError"] is False
+        svc.revoke_note.assert_called_once_with(1, "wrong", actor="agent")
+
     def test_revoke_not_found_returns_error(self) -> None:
         svc = _mock_service()
         svc.revoke_note.return_value = False
@@ -2322,6 +2788,22 @@ class TestVectrReinstate:
         assert result["isError"] is True
         svc.reinstate_note.assert_not_called()
 
+    def test_reinstate_note_id_bool_is_an_error_not_silent_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: int(True) == 1 would reinstate note #1."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_reinstate", {"note_id": True}, svc)
+        assert result["isError"] is True
+        svc.reinstate_note.assert_not_called()
+        assert "True" in result["content"][0]["text"]
+
+    def test_reinstate_note_id_one_int_still_reinstates_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: only bool is rejected; int 1 still works."""
+        svc = _mock_service()
+        svc.reinstate_note.return_value = True
+        result = handle_tools_call("vectr_reinstate", {"note_id": 1}, svc)
+        assert result["isError"] is False
+        svc.reinstate_note.assert_called_once_with(1, actor="agent", reason=None)
+
     def test_reinstate_not_found_returns_error(self) -> None:
         svc = _mock_service()
         svc.reinstate_note.return_value = False
@@ -2344,6 +2826,226 @@ class TestVectrReinstate:
         assert "vectr_reinstate" in {t["name"] for t in _MEMORY_TOOLS}
         write_names = {t["name"] for t in _MEMORY_WRITE_TOOLS}
         assert "vectr_reinstate" not in write_names
+
+
+class TestVectrSupersede:
+    """vectr_supersede (UPG-NOTE-RETIRE-POST-HOC): retire an ALREADY-STORED
+    note as superseded. Same MCP-surface conventions as vectr_revoke/
+    vectr_reinstate above — actor hardcoded to "agent" (never a caller
+    argument on the AI's own surface)."""
+
+    def test_supersede_calls_service_with_successor_and_agent_actor(self) -> None:
+        svc = _mock_service()
+        svc.supersede_note.return_value = True
+        result = handle_tools_call(
+            "vectr_supersede", {"note_id": 12, "superseded_by": 15, "reason": "replaced in substance"}, svc
+        )
+        svc.supersede_note.assert_called_once_with(12, superseded_by=15, reason="replaced in substance", actor="agent")
+        assert result["isError"] is False
+        assert "#12" in result["content"][0]["text"]
+        assert "#15" in result["content"][0]["text"]
+
+    def test_supersede_without_successor_omits_replacement_line(self) -> None:
+        svc = _mock_service()
+        svc.supersede_note.return_value = True
+        result = handle_tools_call("vectr_supersede", {"note_id": 12}, svc)
+        svc.supersede_note.assert_called_once_with(12, superseded_by=None, reason=None, actor="agent")
+        assert result["isError"] is False
+        assert "replacement is" not in result["content"][0]["text"]
+
+    def test_supersede_names_the_factual_badge_not_the_revoked_deterrent(self) -> None:
+        # The confirmation text must teach the distinction: a retired note was
+        # true when written (factual badge); a revoked note was WRONG.
+        svc = _mock_service()
+        svc.supersede_note.return_value = True
+        result = handle_tools_call("vectr_supersede", {"note_id": 12}, svc)
+        text = result["content"][0]["text"]
+        assert "[superseded ...]" in text
+        assert "not the revoked deterrent" in text
+
+    def test_supersede_string_superseded_by_is_coerced(self) -> None:
+        svc = _mock_service()
+        svc.supersede_note.return_value = True
+        handle_tools_call("vectr_supersede", {"note_id": "12", "superseded_by": "15"}, svc)
+        svc.supersede_note.assert_called_once_with(12, superseded_by=15, reason=None, actor="agent")
+
+    def test_supersede_missing_note_id_returns_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_supersede", {}, svc)
+        assert result["isError"] is True
+        svc.supersede_note.assert_not_called()
+
+    def test_supersede_non_integer_note_id_returns_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_supersede", {"note_id": "abc"}, svc)
+        assert result["isError"] is True
+        svc.supersede_note.assert_not_called()
+
+    def test_supersede_bool_note_id_returns_error(self) -> None:
+        # JSON true/false are int subclasses; int(True) == 1 would retire an
+        # unrelated note. Same guard as vectr_recall's note_id path.
+        svc = _mock_service()
+        result = handle_tools_call("vectr_supersede", {"note_id": True}, svc)
+        assert result["isError"] is True
+        svc.supersede_note.assert_not_called()
+
+    def test_supersede_bool_superseded_by_returns_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_supersede", {"note_id": 12, "superseded_by": False}, svc)
+        assert result["isError"] is True
+        svc.supersede_note.assert_not_called()
+
+    def test_supersede_non_integer_superseded_by_returns_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_supersede", {"note_id": 12, "superseded_by": "soon"}, svc)
+        assert result["isError"] is True
+        svc.supersede_note.assert_not_called()
+
+    def test_supersede_not_found_returns_error(self) -> None:
+        svc = _mock_service()
+        svc.supersede_note.return_value = False
+        result = handle_tools_call("vectr_supersede", {"note_id": 999}, svc)
+        assert result["isError"] is True
+        assert "not found" in result["content"][0]["text"].lower()
+
+    def test_supersede_value_error_from_service_returns_mcp_error(self) -> None:
+        # Covers every store-side validation raise reaching this surface:
+        # missing successor, self-successor, human-provenance boundary.
+        svc = _mock_service()
+        svc.supersede_note.side_effect = ValueError(
+            "superseded_by references note #15, which does not exist in this workspace"
+        )
+        result = handle_tools_call("vectr_supersede", {"note_id": 12, "superseded_by": 15}, svc)
+        assert result["isError"] is True
+        assert "does not exist" in result["content"][0]["text"]
+
+    def test_supersede_in_tools_list(self) -> None:
+        names = {t["name"] for t in handle_tools_list()["tools"]}
+        assert "vectr_supersede" in names
+
+    def test_supersede_gated_with_other_memory_read_tools(self) -> None:
+        assert "vectr_supersede" in {t["name"] for t in _MEMORY_TOOLS}
+        write_names = {t["name"] for t in _MEMORY_WRITE_TOOLS}
+        assert "vectr_supersede" not in write_names
+
+
+class TestVectrRememberResumePriorityHint:
+    """UPG-RESUME-TASK-PRIORITY-VISIBILITY: a kind='task' note stored with
+    the priority default ('medium') never appears on session-start/resume —
+    those surfaces show only priority='high'. The write confirmation says so,
+    but ONLY when the caller let the default stand: an explicitly chosen
+    lower priority is an intentional ranking decision, not an oversight."""
+
+    # Bug-present shape: with the hint block deleted, the first test's
+    # assertion fails ("priority='high'" absent from the task-note text);
+    # the explicit-priority tests would still pass (they assert absence),
+    # which is why the omitted-default case is the headline.
+
+    def test_task_note_with_default_priority_carries_resume_hint(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_remember", {"content": "checkpoint: auth flow done", "kind": "task"}, svc)
+        assert result["isError"] is False
+        text = result["content"][0]["text"]
+        assert "session-start/resume surfaces show only priority='high'" in text
+        assert 'priority="high"' in text
+        assert "supersedes=<this id>" in text
+
+    def test_explicit_medium_priority_stays_silent(self) -> None:
+        # An explicitly chosen medium is deliberate — no nagging.
+        svc = _mock_service()
+        result = handle_tools_call(
+            "vectr_remember", {"content": "checkpoint", "kind": "task", "priority": "medium"}, svc
+        )
+        assert result["isError"] is False
+        assert "session-start/resume surfaces show only" not in result["content"][0]["text"]
+
+    def test_explicit_high_priority_stays_silent(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call(
+            "vectr_remember", {"content": "checkpoint", "kind": "task", "priority": "high"}, svc
+        )
+        assert result["isError"] is False
+        assert "session-start/resume surfaces show only" not in result["content"][0]["text"]
+
+    def test_non_task_kind_never_hints(self) -> None:
+        # Resume visibility is a TASK-note concern only; findings/gotchas/
+        # directives have their own delivery channels.
+        for kind in ("finding", "gotcha", "directive"):
+            svc = _mock_service()
+            result = handle_tools_call("vectr_remember", {"content": "a note", "kind": kind}, svc)
+            assert result["isError"] is False
+            assert "session-start/resume surfaces show only" not in result["content"][0]["text"]
+
+
+class TestVectrPin:
+    """vectr_pin (UPG-RECALL-MISS-FLOOR part (b)): explicit Tier 0
+    membership toggle. Same MCP-surface conventions as vectr_promote/
+    vectr_revoke/vectr_reinstate above."""
+
+    def test_pin_calls_service(self) -> None:
+        svc = _mock_service()
+        svc.pin_note.return_value = True
+        result = handle_tools_call("vectr_pin", {"note_id": 12}, svc)
+        svc.pin_note.assert_called_once_with(12, True)
+        assert result["isError"] is False
+        assert "#12" in result["content"][0]["text"]
+
+    def test_pin_defaults_pinned_true(self) -> None:
+        svc = _mock_service()
+        svc.pin_note.return_value = True
+        handle_tools_call("vectr_pin", {"note_id": 12}, svc)
+        svc.pin_note.assert_called_once_with(12, True)
+
+    def test_unpin_calls_service_with_false(self) -> None:
+        svc = _mock_service()
+        svc.pin_note.return_value = True
+        result = handle_tools_call("vectr_pin", {"note_id": 12, "pinned": False}, svc)
+        svc.pin_note.assert_called_once_with(12, False)
+        assert result["isError"] is False
+
+    def test_pin_missing_note_id_returns_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_pin", {}, svc)
+        assert result["isError"] is True
+        svc.pin_note.assert_not_called()
+
+    def test_pin_non_integer_note_id_returns_error(self) -> None:
+        svc = _mock_service()
+        result = handle_tools_call("vectr_pin", {"note_id": "abc"}, svc)
+        assert result["isError"] is True
+        svc.pin_note.assert_not_called()
+
+    def test_pin_note_id_bool_is_an_error_not_silent_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: int(True) == 1 would pin note #1."""
+        svc = _mock_service()
+        result = handle_tools_call("vectr_pin", {"note_id": True}, svc)
+        assert result["isError"] is True
+        svc.pin_note.assert_not_called()
+        assert "True" in result["content"][0]["text"]
+
+    def test_pin_note_id_one_int_still_pins_note_1(self) -> None:
+        """UPG-MCP-NOTEID-BOOL-GUARDS: only bool is rejected; int 1 still works."""
+        svc = _mock_service()
+        svc.pin_note.return_value = True
+        result = handle_tools_call("vectr_pin", {"note_id": 1}, svc)
+        assert result["isError"] is False
+        svc.pin_note.assert_called_once_with(1, True)
+
+    def test_pin_not_found_returns_error(self) -> None:
+        svc = _mock_service()
+        svc.pin_note.return_value = False
+        result = handle_tools_call("vectr_pin", {"note_id": 999}, svc)
+        assert result["isError"] is True
+        assert "not found" in result["content"][0]["text"].lower()
+
+    def test_pin_in_tools_list(self) -> None:
+        names = {t["name"] for t in handle_tools_list()["tools"]}
+        assert "vectr_pin" in names
+
+    def test_pin_gated_with_other_memory_read_tools(self) -> None:
+        assert "vectr_pin" in {t["name"] for t in _MEMORY_TOOLS}
+        write_names = {t["name"] for t in _MEMORY_WRITE_TOOLS}
+        assert "vectr_pin" not in write_names
 
 
 # ---------------------------------------------------------------------------
@@ -2406,8 +3108,10 @@ class TestFormatSearchResults:
 
     def test_score_order_explain_annotates_large_divergence(self) -> None:
         # UPG-SCORE-ORDER-EXPLAIN (B6): a below-rank-1 result whose displayed
-        # relevance clears the divergence margin (>=1.5x rank 1) is annotated
-        # with the demoting prior's reason.
+        # relevance clears the divergence margin is annotated with the demoting
+        # prior's reason. UPG-GATE-V4-MINORS: the margin is headroom share, not
+        # a fixed multiple — this case consumes (0.90-0.30)/(1-0.30) = ~86% of
+        # the range above rank 1, far past min_headroom_ratio (0.65).
         from agent.searcher import SearchResult, SearchResultList
         rank1 = SearchResult(file_path="core.py", lines="1-40", symbol_name="select",
                              language="python", score=0.30, content="def select(): ...",
@@ -2427,22 +3131,134 @@ class TestFormatSearchResults:
                              language="python", score=0.90, content="y",
                              score_source="reranker", quality_reason="test-file demotion")
         text = _format_search_results(SearchResultList([rank1, rank2]), "q", 5, 100)
-        assert "ranked lower" not in text  # 0.90 < 1.5*0.80
+        # Expectation UNCHANGED by UPG-GATE-V4-MINORS: (0.90-0.80)/(1-0.80)
+        # = 50% of the remaining range — a near-tie, below min_headroom_ratio
+        # (0.65), left unlabeled.
+        assert "ranked lower" not in text
+
+    def test_score_order_explain_annotates_confident_query_inversion(self) -> None:
+        # UPG-GATE-V4-MINORS (b) regression, measured gate witness (query
+        # "i18n translation activation"): rank-5 displayed 0.969 against
+        # rank-1's 0.864 and could NOT be annotated — scores are bounded in
+        # [0, 1], so the old rule (r.score >= 1.5 * top_score) required
+        # top_score < 2/3 to ever fire. The headroom-share rule annotates it:
+        # (0.969 - 0.864) / (1 - 0.864) = ~77% >= min_headroom_ratio (0.65).
+        from agent.searcher import SearchResult, SearchResultList
+        results = [
+            SearchResult(file_path="core.py", lines="1-40", symbol_name="activate",
+                         language="python", score=0.864, content="a",
+                         score_source="reranker"),
+            SearchResult(file_path="mid1.py", lines="1-10", symbol_name="m1",
+                         language="python", score=0.900, content="b",
+                         score_source="reranker"),
+            SearchResult(file_path="mid2.py", lines="1-10", symbol_name="m2",
+                         language="python", score=0.920, content="c",
+                         score_source="reranker"),
+            SearchResult(file_path="mid3.py", lines="1-10", symbol_name="m3",
+                         language="python", score=0.930, content="d",
+                         score_source="reranker"),
+            SearchResult(file_path="tests/test_i18n.py", lines="1-20", symbol_name="test_translation",
+                         language="python", score=0.969, content="e",
+                         score_source="reranker", quality_reason="test-file demotion"),
+        ]
+        text = _format_search_results(SearchResultList(results), "i18n translation activation", 12, 500)
+        assert "(ranked lower: test-file demotion)" in text
+        # Only the gross inversion carries a note. The mid-pack results are
+        # doubly ineligible: they carry no quality_reason (suppressed under
+        # part (a)), and their gaps from rank 1 are near-ties anyway
+        # ((0.930 - 0.864)/0.136 ≈ 49%, below the 65% bar).
+        assert text.count("(ranked lower:") == 1
+
+    def test_score_order_explain_headroom_threshold_boundary(self) -> None:
+        # UPG-GATE-V4-MINORS (b): pin the constant itself at rank-1 0.80,
+        # where the remaining range is 0.20 and the threshold gap is
+        # 0.65 * 0.20 = 0.13. A gap of 0.125 stays unlabeled; 0.140 is
+        # annotated.
+        from agent.searcher import SearchResult, SearchResultList
+
+        def _render(rank2_score: float) -> str:
+            rank1 = SearchResult(file_path="core.py", lines="1-40", symbol_name="a",
+                                 language="python", score=0.80, content="x",
+                                 score_source="reranker")
+            rank2 = SearchResult(file_path="b.py", lines="1-10", symbol_name="b",
+                                 language="python", score=rank2_score, content="y",
+                                 score_source="reranker", quality_reason="private helper")
+            return _format_search_results(SearchResultList([rank1, rank2]), "q", 5, 100)
+
+        assert "ranked lower" not in _render(0.925)   # gap 0.125 < 0.13
+        assert "(ranked lower: private helper)" in _render(0.940)  # gap 0.140 >= 0.13
+
+    def test_score_order_explain_never_fires_without_an_inversion(self) -> None:
+        # UPG-GATE-V4-MINORS (b) edge guard: the headroom form multiplies out
+        # to zero when top_score == 1.0, so equal top scores would satisfy
+        # gap >= 0 if the strict r.score > top_score requirement were ever
+        # dropped. A saturated set must stay unlabeled.
+        from agent.searcher import SearchResult, SearchResultList
+        rank1 = SearchResult(file_path="core.py", lines="1-40", symbol_name="a",
+                             language="python", score=1.0, content="x",
+                             score_source="reranker")
+        rank2 = SearchResult(file_path="b.py", lines="1-10", symbol_name="b",
+                             language="python", score=1.0, content="y",
+                             score_source="reranker", quality_reason="trivial stub")
+        text = _format_search_results(SearchResultList([rank1, rank2]), "q", 5, 100)
+        assert "ranked lower" not in text
+
+    def test_score_order_explain_requires_a_real_demotion_reason(self) -> None:
+        # UPG-GATE-V4-MINORS (a): with no quality demotion recorded for the
+        # chunk, there is nothing honest to attribute its lower rank to (the
+        # cause lives on rank-1's side or in pool order). The annotation must
+        # be SUPPRESSED, not filled with the old "composite ranking prior"
+        # mechanism name — a reason-shaped string that explains nothing.
+        from agent.searcher import SearchResult, SearchResultList
+        rank1 = SearchResult(file_path="core.py", lines="1-40", symbol_name="select",
+                             language="python", score=0.30, content="def select(): ...",
+                             score_source="reranker")
+        rank2 = SearchResult(file_path="lib.rs", lines="1-10", symbol_name="Layout",
+                             language="rust", score=0.90, content="pub use foo::Bar;",
+                             score_source="reranker")  # quality_reason defaults to ""
+        text = _format_search_results(SearchResultList([rank1, rank2]), "q", 5, 100)
+        assert "ranked lower" not in text
+        assert "composite ranking prior" not in text
 
     def test_low_confidence_renders_pointer_mode(self) -> None:
         # UPG-LOWCONF-OUTPUT-SLIM / UPG-FLOOR-SLIM-PAYLOAD (B4): the low-confidence
-        # result set ships pointers, not full bodies.
+        # result set ships pointers, not full bodies, for a non-top-ranked
+        # result. UPG-BANNER-CALIBRATION: rank-1 is now always retained (see
+        # test_rank1_always_retained_in_low_confidence_set below), so this
+        # test uses a two-result set and asserts stripping on rank 2.
         from agent.searcher import SearchResult, SearchResultList
+        top = SearchResult(file_path="top.py", lines="1-5", symbol_name="top_fn",
+                           language="python", score=0.5, content="TOP_BODY_TOKEN",
+                           score_source="reranker", ce_relevance=0.5)
         r = SearchResult(file_path="auth.py", lines="10-20", symbol_name="login",
                          language="python", score=0.01, content="SECRET_BODY_TOKEN in here",
-                         score_source="reranker")
-        rl = SearchResultList([r])
+                         score_source="reranker", ce_relevance=0.01)
+        rl = SearchResultList([top, r])
         rl.low_confidence = True
         text = _format_search_results(rl, "unrelated", 5, 100)
         assert "auth.py" in text          # pointer present
         assert "login" in text
-        assert "SECRET_BODY_TOKEN" not in text   # body omitted
+        assert "SECRET_BODY_TOKEN" not in text   # rank-2 body omitted
         assert "pointers only" in text
+
+    def test_rank1_always_retained_in_low_confidence_set(self) -> None:
+        # UPG-BANNER-CALIBRATION / F47: a retain floor set >= the ce-floor
+        # that triggered low_confidence can never pass for the exact result
+        # that triggered it (rank-1's own ce_relevance is what was compared
+        # against notfound_floor.min_top_relevance). Rank-1 is exempted by
+        # RANK, not score, so it always keeps its body/excerpt in a
+        # low-confidence set — this is the F47 acceptance case: rank-1
+        # correct, ce_relevance far below any absolute floor, body must
+        # still ship (no forced vectr_fetch round trip).
+        from agent.searcher import SearchResult, SearchResultList
+        r = SearchResult(file_path="query.py", lines="1-40", symbol_name="Query",
+                         language="python", score=0.024, content="F47_CORRECT_BODY_TOKEN",
+                         score_source="reranker", ce_relevance=0.024)
+        rl = SearchResultList([r])
+        rl.low_confidence = True
+        text = _format_search_results(rl, "SQL query construction code", 5, 100)
+        assert "F47_CORRECT_BODY_TOKEN" in text, "rank-1's body must ship even at ce_relevance 0.024"
+        assert "top-ranked result" in text
 
     def test_full_mode_still_shows_body(self) -> None:
         from agent.searcher import SearchResult, SearchResultList
@@ -2457,6 +3273,10 @@ class TestFormatSearchResults:
     # the retention floor keeps a body/excerpt even when the SET is flagged
     # low confidence.
     def test_individually_strong_result_keeps_excerpt_in_low_confidence_set(self) -> None:
+        # UPG-BANNER-CALIBRATION: `strong` placed at rank-1 (also independently
+        # clears the floor) and `weak` at rank-2 — isolates the floor
+        # mechanism from the separate, unconditional rank-1 exemption (see
+        # test_rank1_always_retained_in_low_confidence_set for that case).
         from agent.searcher import SearchResult, SearchResultList
         strong = SearchResult(
             file_path="payments.py", lines="10-20", symbol_name="charge_card",
@@ -2468,48 +3288,90 @@ class TestFormatSearchResults:
             language="python", score=0.05, content="WEAK_BODY_TOKEN here",
             score_source="reranker", ce_relevance=0.05,
         )
-        rl = SearchResultList([weak, strong])
+        rl = SearchResultList([strong, weak])
         rl.low_confidence = True
         text = _format_search_results(rl, "unrelated", 5, 100)
         assert "STRONG_BODY_TOKEN" in text, "an individually-strong result must keep its body"
-        assert "WEAK_BODY_TOKEN" not in text, "a genuinely weak result stays pointer-only"
+        assert "WEAK_BODY_TOKEN" not in text, "a genuinely weak, non-rank-1 result stays pointer-only"
         assert "individually strong" in text, "the retained result must be labeled"
         assert "0.531" in text
 
-    def test_all_weak_low_confidence_set_still_pointer_only(self) -> None:
-        """No result clears the retention floor — every result stays a bare
-        pointer, identical to pre-fix behaviour."""
+    def test_all_weak_non_rank1_result_still_pointer_only(self) -> None:
+        """No result clears the retention floor and it is not rank-1 — stays
+        a bare pointer. UPG-BANNER-CALIBRATION: rank-1 of a low-confidence
+        set is always retained now (see test_rank1_always_retained_in_low_
+        confidence_set), so this asserts stripping on a weak rank-2 instead.
+        rank-1's own ce_relevance (0.10) is also kept below the retention
+        floor here so it is exempted by RANK alone, not by the floor — the
+        "individually strong" (floor) label must not appear at all."""
         from agent.searcher import SearchResult, SearchResultList
+        top = SearchResult(
+            file_path="top.py", lines="1-5", symbol_name="top_fn",
+            language="python", score=0.10, content="TOP_BODY_TOKEN",
+            score_source="reranker", ce_relevance=0.10,
+        )
         r = SearchResult(
             file_path="auth.py", lines="10-20", symbol_name="login",
             language="python", score=0.05, content="SECRET_BODY_TOKEN in here",
             score_source="reranker", ce_relevance=0.05,
         )
-        rl = SearchResultList([r])
+        rl = SearchResultList([top, r])
         rl.low_confidence = True
         text = _format_search_results(rl, "unrelated", 5, 100)
         assert "SECRET_BODY_TOKEN" not in text
         assert "individually strong" not in text
 
-    def test_no_reranker_low_confidence_set_still_pointer_only(self) -> None:
+    def test_no_reranker_non_rank1_result_still_pointer_only(self) -> None:
         """Zero-DF-triggered low_confidence with no reranker run (ce_relevance
-        None on every result) must not retain any body — there is no
-        calibrated score to clear the floor with."""
+        None on every result): a non-top-ranked result must not retain any
+        body — there is no calibrated score to clear the floor with, and it
+        is not exempted by rank either. Rank-1 retains regardless (rank-based
+        exemption, not score-based) — see test_rank1_always_retained_in_
+        low_confidence_set / test_rank1_retained_without_reranker."""
         from agent.searcher import SearchResult, SearchResultList
+        top = SearchResult(
+            file_path="top.py", lines="1-5", symbol_name="top_fn",
+            language="python", score=0.9, content="TOP_DENSE_BODY_TOKEN",
+        )  # ce_relevance defaults to None (no reranker)
         r = SearchResult(
             file_path="auth.py", lines="10-20", symbol_name="login",
-            language="python", score=0.9, content="DENSE_ONLY_BODY_TOKEN",
+            language="python", score=0.8, content="DENSE_ONLY_BODY_TOKEN",
         )  # ce_relevance defaults to None (no reranker)
-        rl = SearchResultList([r])
+        rl = SearchResultList([top, r])
         rl.low_confidence = True
         text = _format_search_results(rl, "unrelated", 5, 100)
         assert "DENSE_ONLY_BODY_TOKEN" not in text
 
+    def test_rank1_retained_without_reranker(self) -> None:
+        """UPG-BANNER-CALIBRATION: rank-1's rank-based exemption does not
+        require a ce_relevance judgment at all — a zero-DF-triggered
+        low_confidence set with no reranker run still ships rank-1's body,
+        labeled without a ce_relevance number (there is none to show)."""
+        from agent.searcher import SearchResult, SearchResultList
+        top = SearchResult(
+            file_path="top.py", lines="1-5", symbol_name="top_fn",
+            language="python", score=0.9, content="TOP_DENSE_BODY_TOKEN",
+        )  # ce_relevance defaults to None (no reranker)
+        rl = SearchResultList([top])
+        rl.low_confidence = True
+        text = _format_search_results(rl, "unrelated", 5, 100)
+        assert "TOP_DENSE_BODY_TOKEN" in text
+        assert "ce_relevance" not in text  # nothing to show — no reranker ran
+
     def test_retention_floor_boundary(self) -> None:
         """ce_relevance exactly at the configured floor retains; just below
-        does not (matches ranking.pointer_mode_retain.min_relevance = 0.30)."""
+        does not. UPG-BANNER-CALIBRATION: min_relevance is now decoupled from
+        notfound_floor.min_top_relevance; both cases below are placed at
+        rank-2 (behind an always-retained rank-1 filler) so the boundary
+        check isolates the floor mechanism from the rank-1 exemption."""
         from agent.config import POINTER_MODE_RETAIN_MIN_RELEVANCE
         from agent.searcher import SearchResult, SearchResultList
+
+        filler_top = SearchResult(
+            file_path="top.py", lines="1-5", symbol_name="top_fn",
+            language="python", score=0.9, content="FILLER_TOP_BODY",
+            score_source="reranker", ce_relevance=0.9,
+        )
 
         at_floor = SearchResult(
             file_path="a.py", lines="1-5", symbol_name="a",
@@ -2517,7 +3379,7 @@ class TestFormatSearchResults:
             content="AT_FLOOR_BODY", score_source="reranker",
             ce_relevance=POINTER_MODE_RETAIN_MIN_RELEVANCE,
         )
-        rl = SearchResultList([at_floor])
+        rl = SearchResultList([filler_top, at_floor])
         rl.low_confidence = True
         text = _format_search_results(rl, "unrelated", 5, 100)
         assert "AT_FLOOR_BODY" in text, "a result exactly at the floor must retain its body"
@@ -2528,7 +3390,7 @@ class TestFormatSearchResults:
             content="BELOW_FLOOR_BODY", score_source="reranker",
             ce_relevance=POINTER_MODE_RETAIN_MIN_RELEVANCE - 0.01,
         )
-        rl2 = SearchResultList([below_floor])
+        rl2 = SearchResultList([filler_top, below_floor])
         rl2.low_confidence = True
         text2 = _format_search_results(rl2, "unrelated", 5, 100)
         assert "BELOW_FLOOR_BODY" not in text2, "a result just below the floor must stay pointer-only"

@@ -227,6 +227,42 @@ class TestMarkerMatchingOverTextOnly:
         assert match_markers("nothing interesting here", "") == []
 
 
+class TestGoFailMarkerDoesNotClaimPytestFailures:
+    """`go_test.fail` was a bare `^FAIL`, and pytest's short summary prints
+    one `FAILED tests/x.py::test_y` line per failing test. Because
+    `match_markers` scans the combined digest with no per-tool scoping, every
+    failing Python run also matched the Go marker. Both are kind: failure, so
+    the OUTCOME was right by accident — but `markers_matched` is the record of
+    which tool reported what, and arcs are keyed off it, so a Go marker on a
+    pytest run is a false attribution. Same cross-tool contamination class as
+    TestZeroCountNeverFalsePositivesAsFailure below."""
+
+    def test_pytest_failed_summary_does_not_match_the_go_marker(self):
+        result = derive_outcome(
+            rc=1, is_error=False, interrupted=False,
+            stdout_digest=(
+                "FAILED tests/test_x.py::test_a - assert 1 == 2\n"
+                "1 failed, 5 passed in 0.42s"
+            ),
+            stderr_digest="",
+        )
+        assert result["outcome"] == "failure"
+        assert "pytest.failed" in result["markers_matched"]
+        assert "go_test.fail" not in result["markers_matched"]
+
+    def test_real_go_failure_still_matches(self):
+        matched = [m for m, _ in match_markers("FAIL\tgithub.com/x/y\t0.02s", "")]
+        assert "go_test.fail" in matched
+
+    def test_go_build_failure_form_still_matches(self):
+        matched = [m for m, _ in match_markers("FAIL\tgithub.com/x/y [build failed]", "")]
+        assert "go_test.fail" in matched
+
+    def test_bare_fail_line_still_matches(self):
+        matched = [m for m, _ in match_markers("some output\nFAIL", "")]
+        assert "go_test.fail" in matched
+
+
 class TestZeroCountNeverFalsePositivesAsFailure:
     """Adversarial-review fix B3: `\\d+ failed`-style patterns match a fully
     GREEN run's own "0 failed" summary line. `match_markers` scans the

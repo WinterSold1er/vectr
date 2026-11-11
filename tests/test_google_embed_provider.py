@@ -30,7 +30,11 @@ class _Response:
         self._payload = payload if payload is not None else {"embeddings": []}
         self.headers = headers or {}
         self.text = text
-        self.reason_phrase = {200: "OK", 400: "Bad Request", 429: "Too Many Requests"}[status_code]
+        self.reason_phrase = {
+            200: "OK", 400: "Bad Request", 429: "Too Many Requests",
+            500: "Internal Server Error", 502: "Bad Gateway",
+            503: "Service Unavailable", 504: "Gateway Timeout",
+        }[status_code]
 
     def json(self):
         return self._payload
@@ -215,14 +219,63 @@ class TestRateLimiting:
     ) -> None:
         sleeps: list[float] = []
         monkeypatch.setattr(time, "sleep", sleeps.append)
-        post = _FakePost([_Response(status_code=429, text="rate limited")] * 4)
+        attempts = GoogleEmbedProvider._MAX_ATTEMPTS
+        post = _FakePost([_Response(status_code=429, text="rate limited")] * attempts)
         monkeypatch.setattr(httpx, "post", post)
         with pytest.raises(RuntimeError) as exc_info:
             _provider().embed(["text"])
         message = str(exc_info.value)
-        assert "429" in message and "attempt 4/4" in message
-        assert len(post.calls) == 4
-        assert sleeps == [1.0, 2.0, 4.0]
+        assert "429" in message and f"attempt {attempts}/{attempts}" in message
+        assert len(post.calls) == attempts
+        assert sleeps == [min(60.0, 2.0 ** i) for i in range(attempts - 1)]
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_server_errors_are_retried(self, monkeypatch, fake_key, status) -> None:
+        """A single upstream 5xx must not abort the indexing pass."""
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+        post = _FakePost(
+            [
+                _Response(status_code=status, text="upstream unavailable"),
+                _Response(payload=_payload([[1.0, 0.0]])),
+            ]
+        )
+        monkeypatch.setattr(httpx, "post", post)
+        assert len(_provider().embed(["text"])) == 1
+        assert len(post.calls) == 2
+        assert sleeps == [1.0]
+
+    def test_503_twice_then_success(self, monkeypatch, fake_key) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+        post = _FakePost(
+            [
+                _Response(status_code=503, text="maintenance"),
+                _Response(status_code=503, text="maintenance"),
+                _Response(payload=_payload([[1.0, 0.0]])),
+            ]
+        )
+        monkeypatch.setattr(httpx, "post", post)
+        assert len(_provider().embed(["text"])) == 1
+        assert len(post.calls) == 3
+        assert sleeps == [1.0, 2.0]
+
+    def test_persistent_503_raises_after_the_attempts_are_spent(
+        self, monkeypatch, fake_key
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+        attempts = GoogleEmbedProvider._MAX_ATTEMPTS
+        post = _FakePost([_Response(status_code=503, text="upstream down")] * attempts)
+        monkeypatch.setattr(httpx, "post", post)
+        with pytest.raises(RuntimeError) as exc_info:
+            _provider().embed(["text"])
+        message = str(exc_info.value)
+        assert "503" in message and f"attempt {attempts}/{attempts}" in message
+        assert len(post.calls) == attempts
+        # Same capped chain as a 429 without Retry-After: doubling, held at 60s.
+        assert sleeps == [min(60.0, 2.0 ** i) for i in range(attempts - 1)]
+        assert FAKE_KEY not in message, "the key must never reach the error text"
 
 
 class TestTransientTransport:
@@ -283,8 +336,8 @@ class TestTransientTransport:
             _provider().embed(["text"])
         message = str(exc_info.value)
         assert len(post.calls) == attempts
-        # One backoff per retry, none after the last attempt.
-        assert sleeps == [2.0 ** i for i in range(attempts - 1)]
+        # One backoff per retry, none after the last attempt, each capped at 60s.
+        assert sleeps == [min(60.0, 2.0 ** i) for i in range(attempts - 1)]
         assert "gemini-embedding-2" in message
         assert "UNEXPECTED_EOF_WHILE_READING" in message
         assert FAKE_KEY not in message, "the key must never reach the error text"
@@ -399,7 +452,8 @@ class TestErrorPaths:
         monkeypatch.setattr(httpx, "post", _boom)
         with pytest.raises(RuntimeError, match="gemini-embedding-2.*failed"):
             _provider().embed(["text"])
-        assert sleeps == [1.0, 2.0, 4.0]
+        attempts = GoogleEmbedProvider._MAX_ATTEMPTS
+        assert sleeps == [min(60.0, 2.0 ** i) for i in range(attempts - 1)]
 
 
 class TestApiKeyResolution:
@@ -489,11 +543,20 @@ class TestFactoryRouting:
         assert post.calls[0]["url"].endswith("models/gemini-embedding-2:batchEmbedContents")
 
     def test_factory_passes_the_layered_dimension_and_key_env(
-        self, monkeypatch, fake_key
+        self, monkeypatch, tmp_path
     ) -> None:
-        monkeypatch.setattr(types_mod, "_EMBEDDING_API_KEY_ENV", "LAYERED_GEMINI_KEY")
-        monkeypatch.setattr(types_mod, "_EMBEDDING_OUTPUT_DIMENSIONALITY", 768)
+        """`embedding.api_key_env` and `embedding.output_dimensionality` from the
+        workspace .vectr/config.yaml reach the request the factory builds."""
+        (tmp_path / ".vectr").mkdir()
+        (tmp_path / ".vectr" / "config.yaml").write_text(
+            "embedding:\n  api_key_env: LAYERED_GEMINI_KEY\n"
+            "  output_dimensionality: 768\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("VECTR_WORKSPACE", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("VECTR_EMBED_OUTPUT_DIM", raising=False)
         monkeypatch.setenv("LAYERED_GEMINI_KEY", "layered-key")
         post = _FakePost([_Response(payload=_payload([[1.0, 0.0]]))])
         monkeypatch.setattr(httpx, "post", post)

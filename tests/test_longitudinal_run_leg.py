@@ -560,6 +560,19 @@ def test_run_agent_passes_settings_for_hook_arms_only(tmp_path, monkeypatch):
         captured["cmd"] = cmd
         return _FakeProc()
 
+    # Both hook arms exercised below bracket the spawned agent with two
+    # `/v1/status` GETs against the leg's daemon port. Only argv is under
+    # test here, but without this stub those are LIVE connections to
+    # 127.0.0.1:8899 — whether anything answers is a property of the
+    # developer's machine, not of the test. Same stub the delta tests below
+    # use; caught by the conftest socket guard.
+    monkeypatch.setattr(
+        run_leg,
+        "_http_json",
+        lambda method, url, payload=None, timeout=30: {
+            "hook_injection_counts": {"SessionStart": 0, "UserPromptSubmit": 0}
+        },
+    )
     monkeypatch.setattr(run_leg.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(run_leg.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
 
@@ -1968,6 +1981,59 @@ def test_spawn_env_for_agent_strips_and_resets_git_identity_env_vars(monkeypatch
     assert env["GIT_COMMITTER_EMAIL"] == scen.SYNTHETIC_GIT_USER_EMAIL
     assert "Real Operator" not in env.values()
     assert "real.operator@example.org" not in env.values()
+
+
+def test_spawn_env_for_agent_sets_git_config_global_to_synthetic_file(monkeypatch):
+    """UPG-EVAL-IDENTITY-ENV-ISOLATION: GIT_AUTHOR_*/GIT_COMMITTER_* only affect
+    commit authorship, never a `git config` READ, so a workspace with no `.git`
+    at all (e.g. S5, where `deploy/queue.yaml`'s `requested_by` field is filled
+    in by agent judgment rather than a commit) still resolves `git config
+    user.email` to the operator's real `~/.gitconfig` unless GIT_CONFIG_GLOBAL
+    is also redirected. Also proves any pre-existing GIT_CONFIG_GLOBAL from the
+    operator's own shell is stripped, not merely shadowed."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/Users/real-operator/.gitconfig")
+
+    env = run_leg._spawn_env_for_agent("http://127.0.0.1:1234")
+
+    assert env["GIT_CONFIG_GLOBAL"] != "/Users/real-operator/.gitconfig"
+    synthetic_path = Path(env["GIT_CONFIG_GLOBAL"])
+    assert synthetic_path.is_file()
+    content = synthetic_path.read_text(encoding="utf-8")
+    assert scen.SYNTHETIC_GIT_USER_NAME in content
+    assert scen.SYNTHETIC_GIT_USER_EMAIL in content
+
+
+def test_git_config_read_in_gitless_workspace_resolves_synthetic_identity_only_with_env(tmp_path, monkeypatch):
+    """End-to-end proof of the exact leak (deploy s1 shared leg1, observed
+    2026-08-03): a workspace with NO `.git` directory (S5's shape) still lets
+    `git config user.email` resolve through to whatever global config is active
+    -- without `_spawn_env_for_agent`'s GIT_CONFIG_GLOBAL redirect that would be
+    the operator's own `~/.gitconfig` (a real PII leak); with it, the synthetic
+    identity, deterministically, regardless of the operator's actual global
+    config content."""
+    fake_real_global = tmp_path / "real-operator-gitconfig"
+    fake_real_global.write_text("[user]\n\tname = Real Operator\n\temail = real.operator@example.org\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(fake_real_global))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    gitless_workspace = tmp_path / "workspace-no-git"
+    gitless_workspace.mkdir()
+    assert not (gitless_workspace / ".git").exists()
+
+    # Without the harness's env (simulating the pre-fix world): the leak.
+    leaked = subprocess.run(
+        ["git", "config", "user.email"], cwd=str(gitless_workspace),
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert leaked == "real.operator@example.org"
+
+    # With _spawn_env_for_agent's env: the synthetic identity, every time.
+    agent_env = run_leg._spawn_env_for_agent("http://127.0.0.1:1234")
+    protected = subprocess.run(
+        ["git", "config", "user.email"], cwd=str(gitless_workspace),
+        capture_output=True, text=True, check=True, env=agent_env,
+    ).stdout.strip()
+    assert protected == scen.SYNTHETIC_GIT_USER_EMAIL
 
 
 # ---------------------------------------------------------------------------

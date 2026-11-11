@@ -283,7 +283,7 @@ class TestMemoryRoutesDispatchOffLoop:
         from app.service import RememberOutcome
         svc = _memory_mock_service()
         seen, effect = _capture_thread(
-            RememberOutcome(note_id=42, related=[], proxy_anchor_suggestions=[]),
+            RememberOutcome(note_id=42, related=[], revoked_related=[], proxy_anchor_suggestions=[]),
         )
         svc.remember_with_extras.side_effect = effect
         resp = self._run(svc, lambda c: c.post("/v1/remember", json={"content": "a note"}))
@@ -373,7 +373,7 @@ class TestMemoryMcpToolsDispatchOffLoop:
 
         svc = _memory_mock_service()
         seen, effect = _capture_thread(
-            RememberOutcome(note_id=11, related=[], proxy_anchor_suggestions=[]),
+            RememberOutcome(note_id=11, related=[], revoked_related=[], proxy_anchor_suggestions=[]),
         )
         svc.remember_with_extras.side_effect = effect
         svc.get_note.return_value = None

@@ -12,7 +12,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
+# UPG-L3-CONFIG-READ-TIME: `BOUNDARY_PRECOMPACT_ENABLED` /
+# `BOUNDARY_PRECOMPACT_TOKEN_CAP` are read at REQUEST time via the module
+# attribute (`config.BOUNDARY_PRECOMPACT_*` in `_boundary_precompact_text`
+# below), not bound by value here — the same rule `app/routes.py` documents
+# for its config reads, so a test override (or a future reload path) is
+# honored instead of baked in at import. Everything else keeps this file's
+# dominant by-value convention.
+import agent.config as config
 from agent.config import (
     DEFAULT_PORT,
     INDEXING_VECTOR_STORE_DISPATCH_MAX_WORKERS,
@@ -25,9 +34,7 @@ from agent.config import (
     SEARCH_IDENTIFIER_HINT_NEARMISS_ENABLED,
     SEARCH_IDENTIFIER_HINT_NEARMISS_MAX,
     ARC_DETECTION_ENABLED,
-    BOUNDARY_PRECOMPACT_ENABLED,
-    BOUNDARY_PRECOMPACT_TOKEN_CAP,
-    embed_model_spec,
+    EMBEDDING_DEFAULT_MODEL,
     EPISODES_DIGEST_HEAD_LINES,
     EPISODES_DIGEST_MAX_CHARS,
     EPISODES_DIGEST_TAIL_LINES,
@@ -44,15 +51,18 @@ from agent.config import (
     MEMORY_WRITE_RELATED_ENABLED,
     MEMORY_WRITE_RELATED_LIMIT,
     MEMORY_WRITE_RELATED_MIN_SIMILARITY,
+    MEMORY_WRITE_RELATED_REVOKED_ENABLED,
+    MEMORY_WRITE_RELATED_REVOKED_LIMIT,
     MEMORY_WRITE_PROXY_SUGGEST_ENABLED,
     MEMORY_WRITE_PROXY_SUGGEST_LIMIT,
+    MEMORY_WRITE_USER_QUOTE_AUTO_BIND_MAX_AGE_SECONDS,
     vectr_cache_root,
 )
 from agent.eviction_advisor import EvictionAdvisor
 from agent.proxy_anchors import suggest_proxy_anchors
 from agent.trigger_engine import TriggerFireLedger, TurnInjectionLedger, token_estimate
 from agent.version_stamp import compute_version_stamp
-from agent.working_context_store._related import RelatedNote
+from agent.working_context_store._related import RelatedNote, RevokedRelatedNote
 
 logger = logging.getLogger(__name__)
 
@@ -204,13 +214,14 @@ def _format_commit_note_content(
 @dataclass(frozen=True)
 class RememberOutcome:
     """Return shape of `VectrService.remember_with_extras()` — the write
-    itself (`note_id`) plus two strictly-additive write-time offers computed
-    alongside it (see that method's docstring for the exact gating). Never
-    replaces the plain `remember()` -> int contract: this is a NEW method,
-    kept separate so existing callers (and the 495+ test call sites against
-    `remember()`) are untouched."""
+    itself (`note_id`) plus three strictly-additive write-time offers
+    computed alongside it (see that method's docstring for the exact
+    gating). Never replaces the plain `remember()` -> int contract: this is
+    a NEW method, kept separate so existing callers (and the 495+ test call
+    sites against `remember()`) are untouched."""
     note_id: int
     related: list[RelatedNote]
+    revoked_related: list[RevokedRelatedNote]
     proxy_anchor_suggestions: list[str]
 
 
@@ -227,6 +238,7 @@ class VectrService:
         workspace_explicit: bool = False,
         configure_ide: bool = True,
         defer_search_init: bool = False,
+        proactive_now_fn: Callable[[], float] | None = None,
     ) -> None:
         """`defer_search_init` (UPG-STDIO-MEMORY-READY): when True, this
         constructor runs ONLY the fast, synchronous phase below — no
@@ -262,7 +274,13 @@ class VectrService:
         # via the provider's embed_query (registered "query" prompt), never embed().
         # See agent/indexer/_types.py:LocalEmbedProvider for the query/document split,
         # detected from the loaded model itself rather than hardcoded per model.
-        self._embed_model = embed_model_spec()
+        # Embed-model precedence: VECTR_EMBED_MODEL env > <workspace>/.vectr/config.yaml
+        # embedding.model > ~/.vectr/config.yaml > bundled default (agent/indexer/_types.py).
+        from agent.indexer._types import resolve_embed_model
+        self._embed_model = resolve_embed_model(
+            os.getenv("VECTR_EMBED_MODEL"), self._workspace_root, EMBEDDING_DEFAULT_MODEL
+        )
+
         # Memory-only mode: code indexing + file watcher are disabled.
         # Reads from env (propagated by _do_start) or from the constructor arg.
         self._memory_only: bool = memory_only or (os.getenv("VECTR_MEMORY_ONLY", "") == "1")
@@ -398,12 +416,38 @@ class VectrService:
         self._hook_injection_counts: dict[str, int] = {}
         self._hook_injection_lock = threading.Lock()
 
+        # Most recently captured `UserPromptSubmit` prompt for this workspace
+        # (UPG-PROVENANCE-NEVER-RISES) — the harness-driven fallback for
+        # `remember()`'s `user_quote` binding (see `bind_user_quote_auto` in
+        # agent/working_context_store/_user_quote.py). Written verbatim in
+        # `recall(hook_event="UserPromptSubmit")` below, straight from the raw
+        # hook payload, never from any interpretation of it. Workspace-scoped
+        # rather than session_id-keyed by necessity, not preference: the
+        # harness's own session_id (captured on this same hook call) and the
+        # MCP transport's session_id (generated fresh per stdio process — see
+        # integrations/mcp_server/_stdio.py) are different identifier spaces
+        # with no shared key to correlate a `vectr_remember` call back to the
+        # `UserPromptSubmit` call that preceded it in the same turn; "most
+        # recent prompt in this workspace, if recent enough" is the strongest
+        # available proxy for "same turn" given one VectrService instance
+        # normally serves one active agent session at a time. `remember()`
+        # applies the actual recency gate (`auto_bind_max_age_seconds`) — this
+        # is a plain last-write-wins cache with no TTL logic of its own.
+        self._last_user_prompt: str = ""
+        self._last_user_prompt_ts: float = 0.0
+        self._last_user_prompt_lock = threading.Lock()
+
         # Proactive context (UPG-PRO) — per-channel injection counters (like the
         # hook counters above) + a per-session dedup ledger shared across the
         # matcher/gate for the lifetime of this process. Lazily built.
         self._proactive_injection_counts: dict[str, int] = {}
         self._proactive_injection_lock = threading.Lock()
         self._proactive_ledger = None  # agent.proactive.gate.LedgerStore
+        # Injectable clock threaded into that ledger's TTL cooldown
+        # (UPG-GATE-NOWFN-PLUMBING): tests pass a fake clock so TTL expiry
+        # is provable end-to-end at service level; production leaves it
+        # None and the LedgerStore keeps its time.monotonic default.
+        self._proactive_now_fn = proactive_now_fn
 
         # Deferred-charge retrievals awaiting delivery confirmation
         # (UPG-PROXY-APPEND-BURNS-COOLDOWN): delivery_token -> the retrieval
@@ -958,6 +1002,25 @@ class VectrService:
         with self._hook_injection_lock:
             return dict(self._hook_injection_counts)
 
+    def _recent_user_message_for_auto_bind(self) -> str | None:
+        """The most recently captured `UserPromptSubmit` prompt for this
+        workspace (UPG-PROVENANCE-NEVER-RISES), or `None` if none was
+        captured within `MEMORY_WRITE_USER_QUOTE_AUTO_BIND_MAX_AGE_SECONDS`
+        — the recency gate `remember()` relies on before ever passing a
+        candidate down to `WorkingContextStore.remember()`'s own
+        `recent_user_message` parameter (itself pure/clock-free; see its
+        docstring). `None` covers both "never captured" and "captured but
+        stale" identically — `bind_user_quote_auto` treats them the same
+        way (no recent turn to compare against)."""
+        with self._last_user_prompt_lock:
+            prompt = self._last_user_prompt
+            ts = self._last_user_prompt_ts
+        if not prompt or not ts:
+            return None
+        if time.time() - ts > MEMORY_WRITE_USER_QUOTE_AUTO_BIND_MAX_AGE_SECONDS:
+            return None
+        return prompt
+
     # ------------------------------------------------------------------
     # L3 — search and index operations
     # ------------------------------------------------------------------
@@ -1405,6 +1468,24 @@ class VectrService:
         return {
             "indexed_files": self._indexer.indexed_file_count if self._indexer else 0,
             "total_chunks": self._indexer.total_chunks if self._indexer else 0,
+            # UPG-PURPOSE-RESUME-HOLE: purpose (ARCH-4 dual-vector) chunk
+            # count, surfaced alongside total_chunks so a gap this large
+            # (an interrupted deferred pass leaving most of the corpus
+            # without purpose vectors) cannot hide behind a green status —
+            # previously computed (CodeIndexer.total_purpose_chunks) but
+            # never rendered on any status surface.
+            "total_purpose_chunks": self._indexer.total_purpose_chunks if self._indexer else 0,
+            # Count of files this workspace's most recent index_workspace()
+            # run found with current body content but incomplete purpose
+            # vectors, as of the START of that run — 0 once dispatch for
+            # that backfill has been sent (see
+            # CodeIndexer.purpose_backfill_pending_files docstring for the
+            # exact "cleared at dispatch, not at completion" semantics;
+            # `purpose_vectors_pending` below covers the in-flight window
+            # for the deferred/background case).
+            "purpose_backfill_pending_files": (
+                self._indexer.purpose_backfill_pending_files if self._indexer else 0
+            ),
             "last_indexed": self.last_indexed,
             "embed_model": self._embed_model,
             "workspace_root": self._workspace_root,
@@ -1596,9 +1677,21 @@ class VectrService:
     def locate(self, name: str, limit: int = 10) -> list:
         return self._symbol_graph.locate(self._workspace_root, name, limit)
 
-    def locate_with_snippets(self, name: str, limit: int = 10, caller_file: str | None = None):
-        """Locate symbols via L2 multi-strategy resolution. Returns LocateResult. No LLM call."""
-        return self._symbol_graph.locate_l2(self._workspace_root, name, limit=limit, caller_file=caller_file)
+    def locate_with_snippets(self, name: str, limit: int = 10, caller_file: str | None = None,
+                             with_near_miss: bool = True):
+        """Locate symbols via L2 multi-strategy resolution. Returns LocateResult. No LLM call.
+
+        UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: this is the primary locate
+        surface (MCP `vectr_locate` + REST `/v1/locate`), so a total miss
+        carries deterministic near-miss candidates on the result's
+        `near_miss` field by default — explicitly labeled inexact wherever
+        rendered, never merged into `symbols`. Internal callers that only
+        need exact resolution (the search-hint paths call the symbol graph
+        directly) keep the cheaper no-suggestion behaviour."""
+        return self._symbol_graph.locate_l2(
+            self._workspace_root, name, limit=limit, caller_file=caller_file,
+            with_near_miss=with_near_miss,
+        )
 
     def trace(self, name: str, direction: str = "both", limit: int = 20,
               include_builtins: bool = False) -> dict:
@@ -1661,6 +1754,7 @@ class VectrService:
         supersedes: int | None = None,
         contradicts: int | None = None,
         user_quote: str | None = None,
+        pin: bool = False,
     ) -> int:
         """`agent` (UPG-SUBAGENT-MEMORY): optional caller-declared identifier
         for the agent/subagent authoring this note (e.g. "coder-2") — never
@@ -1689,12 +1783,29 @@ class VectrService:
         successful bind, stores the note at provenance="user-stated"; a
         failed bind never fails the write. No validation here — the store
         stays the single source of truth for that rule, like every parameter
-        above.
+        above. When this is omitted (or fails to bind), the store still
+        tries the harness-driven fallback below before giving up — see
+        `recent_user_message`.
+
+        `recent_user_message` is NOT a caller parameter — this method always
+        supplies it itself, from `_recent_user_message_for_auto_bind()`
+        (UPG-PROVENANCE-NEVER-RISES): the raw text of the most recently
+        captured `UserPromptSubmit` prompt for this workspace, already
+        recency-gated against `auto_bind_max_age_seconds`, or `None` when
+        there is no recent-enough one. The store tries this ONLY when
+        `user_quote` did not already bind, and it never overrides an
+        explicit caller claim.
 
         `scope`: None (the default) means OMITTED — the store resolves it to
         this note's kind's default scope at write time
         (UPG-TRIGGER-SCOPE-KIND-DEFAULTS). An explicitly passed scope,
-        including the literal string "workspace", always wins verbatim."""
+        including the literal string "workspace", always wins verbatim.
+
+        `pin` (UPG-RECALL-MISS-FLOOR part (b)): explicit Tier 0 membership at
+        write time — equivalent to calling `pin_note(note_id, True)`
+        immediately after this write, offered inline so a caller doesn't
+        need the note_id back for the common "remember and pin" case.
+        Default False changes nothing about existing callers."""
         self._require_memory_layer()
         note_id = self._context_store.remember(
             workspace=self._workspace_root,
@@ -1712,6 +1823,8 @@ class VectrService:
             supersedes=supersedes,
             contradicts=contradicts,
             user_quote=user_quote,
+            recent_user_message=self._recent_user_message_for_auto_bind(),
+            pin=pin,
         )
         self._bump_notes_epoch()
         return note_id
@@ -1732,24 +1845,35 @@ class VectrService:
         supersedes: int | None = None,
         contradicts: int | None = None,
         user_quote: str | None = None,
+        pin: bool = False,
     ) -> RememberOutcome:
-        """Same parameters and same write as `remember()`, plus two
+        """Same parameters and same write as `remember()`, plus three
         strictly-additive write-time offers for the caller LLM — never a
         second write, never a gate on the first one.
 
         The write always succeeds or raises exactly as `remember()` does
         (this method calls it directly, so every existing validation error
-        propagates unchanged). Once `note_id` exists, computing the two
-        offers below is wrapped in one `try/except Exception`: any failure
-        there — including one offer succeeding and the other raising — logs
-        at debug and degrades the WHOLE extras computation to empty lists.
-        A related-notes/proxy-anchor lookup must never turn a successful
-        write into a failed response.
+        propagates unchanged). Once `note_id` exists, computing the offers
+        below is wrapped in one `try/except Exception`: any failure there —
+        including one offer succeeding and another raising — logs at debug
+        and degrades the WHOLE extras computation to empty lists. A
+        related-notes/proxy-anchor lookup must never turn a successful write
+        into a failed response.
 
         `related`: the nearest existing ACTIVE notes to this one, computed
         only when `MEMORY_WRITE_RELATED_ENABLED` — see
         `agent/working_context_store/_related.py` for the exact contract
         (nearest-by-similarity only, never a contradiction judgment).
+
+        `revoked_related` (UPG-RELATED-REVOKED-DETERRENT): separately, the
+        nearest existing REVOKED note to this one, computed only when
+        `MEMORY_WRITE_RELATED_REVOKED_ENABLED` — the deliberate exception to
+        "active only" above, because a revoked near-duplicate is the single
+        highest-value thing this offer can surface: it catches the caller
+        about to re-assert a belief the user already marked wrong, at write
+        time rather than only when the new note happens to be recalled
+        later. See `agent/working_context_store/_related.py` for why this is
+        a separate lookup rather than a filter change to `related` above.
 
         `proxy_anchor_suggestions`: workspace-relative paths of proxy-anchor
         files present in this workspace (see `agent/proxy_anchors.py`),
@@ -1774,9 +1898,11 @@ class VectrService:
             supersedes=supersedes,
             contradicts=contradicts,
             user_quote=user_quote,
+            pin=pin,
         )
 
         related: list[RelatedNote] = []
+        revoked_related: list[RevokedRelatedNote] = []
         proxy_anchor_suggestions: list[str] = []
         try:
             if MEMORY_WRITE_RELATED_ENABLED and self._context_store is not None:
@@ -1784,6 +1910,13 @@ class VectrService:
                     self._workspace_root,
                     note_id,
                     limit=MEMORY_WRITE_RELATED_LIMIT,
+                    min_similarity=MEMORY_WRITE_RELATED_MIN_SIMILARITY,
+                )
+            if MEMORY_WRITE_RELATED_REVOKED_ENABLED and self._context_store is not None:
+                revoked_related = self._context_store.revoked_related_notes(
+                    self._workspace_root,
+                    note_id,
+                    limit=MEMORY_WRITE_RELATED_REVOKED_LIMIT,
                     min_similarity=MEMORY_WRITE_RELATED_MIN_SIMILARITY,
                 )
             if (
@@ -1800,11 +1933,13 @@ class VectrService:
                 note_id, exc_info=True,
             )
             related = []
+            revoked_related = []
             proxy_anchor_suggestions = []
 
         return RememberOutcome(
             note_id=note_id,
             related=related,
+            revoked_related=revoked_related,
             proxy_anchor_suggestions=proxy_anchor_suggestions,
         )
 
@@ -2137,6 +2272,92 @@ class VectrService:
             self._bump_notes_epoch()
         return reinstated
 
+    def supersede_note(
+        self,
+        note_id: int,
+        superseded_by: int | None = None,
+        reason: str | None = None,
+        actor: str = "agent",
+    ) -> bool:
+        """Post-hoc supersession (UPG-NOTE-RETIRE-POST-HOC): retire an
+        already-stored note as superseded — for a replacement that was
+        written without `supersedes=` and an old note only later discovered
+        to be already-superseded-in-substance. See
+        `WorkingContextStore.supersede_note()` for the exact contract
+        (raises ValueError on an invalid actor, a missing successor, or a
+        human-provenance target retired by an agent-actor call; returns
+        False if the note does not exist). The note is not deleted and not
+        revoked — it stops being a default recall/fire candidate and renders
+        with the factual "[superseded ...]" badge."""
+        self._require_memory_layer()
+        retired = self._context_store.supersede_note(
+            self._workspace_root, note_id,
+            superseded_by=superseded_by, reason=reason, actor=actor,
+        )
+        if retired:
+            self._bump_notes_epoch()
+        return retired
+
+    def pin_note(self, note_id: int, pinned: bool = True) -> bool:
+        """Explicit Tier 0 membership toggle (UPG-RECALL-MISS-FLOOR part
+        (b)): set/clear a note's `pinned` flag. Pinned notes are injected
+        unconditionally alongside `kind="directive"` notes on every
+        `vectr_recall(query=...)` call, regardless of query content, up to
+        `RECALL_FLOOR_TIER0_MAX_NOTES` — see
+        `WorkingContextStore.set_pinned()` for the exact contract (returns
+        False if the note does not exist). Idempotent: pinning an
+        already-pinned note (or unpinning an already-unpinned one) still
+        returns True and bumps the epoch, matching `promote_note()`'s
+        no-op-is-still-a-success semantics."""
+        self._require_memory_layer()
+        changed = self._context_store.set_pinned(self._workspace_root, note_id, pinned)
+        if changed:
+            self._bump_notes_epoch()
+        return changed
+
+    def attach_anchors(
+        self, note_id: int, anchors: list[str], session_id: str | None = None,
+    ) -> dict | None:
+        """Attach anchor paths to an existing note post-write
+        (UPG-ANCHOR-ATTACH): the single-call replacement for the
+        re-store-with-supersedes workaround. See
+        `WorkingContextStore.attach_anchors()` for the exact contract
+        (raises ValueError on empty anchors; returns None if the note does
+        not exist). Idempotent: already-present paths land in
+        `already_present`; the notes epoch is bumped only when at least one
+        path was actually added, so a fully-idempotent repeat is not a
+        mutation."""
+        self._require_memory_layer()
+        result = self._context_store.attach_anchors(
+            self._workspace_root, note_id, anchors, session_id=session_id,
+        )
+        if result and result["attached"]:
+            self._bump_notes_epoch()
+        return result
+
+    def detach_anchors(
+        self, note_id: int, anchors: list[str],
+    ) -> dict | None:
+        """Remove anchor paths from an existing note (UPG-ANCHOR-DETACH,
+        `vectr_unanchor`): the inverse of `attach_anchors()`. The
+        single-call replacement for the re-store-with-supersedes
+        workaround's mirror case. See
+        `WorkingContextStore.detach_anchors()` for the exact contract
+        (raises ValueError on empty anchors; returns None if the note does
+        not exist). Idempotent: paths not on the note land in
+        `not_present`; the notes epoch is bumped only when at least one
+        path was actually removed, so a fully-idempotent repeat is not a
+        mutation. Path comparison is exact-string on element 0 of the
+        pair, matching `attach_anchors()` so a note is detachable by the
+        same spelling that anchored it."""
+        self._require_memory_layer()
+        result = self._context_store.detach_anchors(
+            self._workspace_root, note_id, anchors,
+        )
+        if result and result["removed"]:
+            self._bump_notes_epoch()
+        return result
+
     def get_note(self, note_id: int):
         """Fetch a single note by ID (UPG-RECALL-HIERARCHY expand path)."""
         self._require_memory_layer()
@@ -2216,6 +2437,17 @@ class VectrService:
             turn_counter_ledger = self._ledger_for(session_id)
             if turn_counter_ledger is not None:
                 turn_counter_ledger.advance_turn()
+        if hook_event == "UserPromptSubmit" and query:
+            # UPG-PROVENANCE-NEVER-RISES: capture the raw prompt text verbatim
+            # (never anything derived from it) for remember()'s harness-driven
+            # user_quote auto-bind fallback — see `_last_user_prompt`'s own
+            # comment at __init__ for why this is workspace-scoped rather than
+            # session_id-keyed. Unconditional on session_id (unlike the ledger
+            # block just above, which needs it) since the cache itself only
+            # needs the prompt text and a timestamp.
+            with self._last_user_prompt_lock:
+                self._last_user_prompt = query
+                self._last_user_prompt_ts = time.time()
         if hook_event is not None and min_similarity is None:
             min_similarity = HOOKS_MIN_SIMILARITY
         notes = self._recall_impl(
@@ -2410,6 +2642,16 @@ class VectrService:
             max_age_days=max_age_days,
             sort_by=sort_by,
             session_id=session_id,
+            # UPG-RECALL-MISS-FLOOR parts (b)/(c): this is the ordinary
+            # query-recall branch `vectr_recall`/`vectr recall` actually
+            # hits (boot/file_path/command each have their own branch
+            # above) — the one call site where Tier 0 (directive + pinned,
+            # unconditional) and the deterministic tag/anchor/symbol/title
+            # channels should always compose with the ranked result. See
+            # WorkingContextStore.recall()'s apply_floor docstring for why
+            # every OTHER caller of recall() in this codebase keeps the
+            # parameter's False default unchanged.
+            apply_floor=True,
         )
         # Same cross-surface leak the file_path branch above guards
         # against, but ONLY when `events` is given — i.e. this call is
@@ -2470,9 +2712,21 @@ class VectrService:
 
     def _bump_notes_epoch(self) -> None:
         """Advance the notes-mutation sequence so any recall artifact cached
-        under the previous notes epoch can never be served after a change."""
+        under the previous notes epoch can never be served after a change.
+
+        Also the single choke point every note-write path already passes
+        through (remember/promote/revoke/reinstate/forget), so it doubles as
+        the post-write hook for the debounced `vectr memory export` mirror
+        (UPG-MEMORY-LEGIBLE-FILE-PROJECTION part (a)) — a workspace with no
+        export configured (the default) pays only the cost of a no-op marker-
+        file read; a configured one gets a debounced re-render. Errors inside
+        the export scheduler are swallowed there, never here: a note write
+        must never fail or slow down because export machinery misbehaved."""
         with self._notes_mutation_lock:
             self._notes_mutation_seq += 1
+        if self._context_store is not None:
+            from agent.working_context_store._export import schedule_export_if_configured
+            schedule_export_if_configured(self._workspace_root, self._context_store)
 
     def _index_epoch(self, scope: str) -> str:
         """Identity of the current index state for a cache scope. A change here
@@ -2533,7 +2787,14 @@ class VectrService:
     def _proactive_gate(self, settings):
         from agent.proactive.gate import LedgerStore, ProactiveGate
         if self._proactive_ledger is None:
-            self._proactive_ledger = LedgerStore(settings.cooldown_items)
+            # UPG-PROXY-COOLDOWN-NO-TIME-DECAY: the ledger is created once per
+            # service lifetime, so its TTL is fixed at construction from the
+            # same settings snapshot that sized the ring.
+            self._proactive_ledger = LedgerStore(
+                settings.cooldown_items,
+                ttl_seconds=settings.cooldown_ttl_seconds,
+                now_fn=self._proactive_now_fn or time.monotonic,
+            )
         return ProactiveGate(
             min_similarity=settings.min_similarity,
             max_items_per_event=settings.max_items_per_event,
@@ -3082,18 +3343,23 @@ class VectrService:
         )
 
     def _stale_task_nudge_line(self) -> str:
-        """One-line stale-task hygiene nudge, or "" when below the warn count
+        """One-line stale-task hygiene note, or "" when below the warn count
         (UPG-NUDGE-HOOK-PATH-UNREACHABLE). The same signal vectr_status renders,
         surfaced on the SessionStart injection path so it reaches agents that
-        never call status."""
+        never call status. Neutral framing, never a WARNING, and never names
+        vectr_forget: age alone is not a deterministic staleness signal
+        (UPG-STATUS-AGE-ONLY-FORGET-NUDGE), so the only remediation offered is
+        supersession — a caller judgment about work state, which is the one
+        remediation kind="task" notes admit."""
         count, oldest_id = self.stale_task_summary()
         if count < MEMORY_HYGIENE_STALE_TASK_WARN_COUNT:
             return ""
         return (
-            f"Memory hygiene: {count} task note(s) older than "
+            f"Memory hygiene: {count} task checkpoint(s) older than "
             f"{MEMORY_HYGIENE_STALE_TASK_WARN_AGE_DAYS} days are still active "
-            f"(oldest: #{oldest_id}) — vectr_remember(kind=\"task\", supersedes=<old id>) "
-            "if the work moved on, or vectr_forget(note_id=...) if it's done."
+            f"(oldest: #{oldest_id}) — age alone never retires a note; when one "
+            "describes finished or moved-on work, record that with "
+            "vectr_remember(kind=\"task\", priority=\"high\", supersedes=<old id>)."
         )
 
     def _arc_distill_nudge_line(self) -> str:
@@ -3147,7 +3413,10 @@ class VectrService:
         matcher (UPG-9.4) — restating them here would double the same
         information rather than adding to it.
         """
-        if not BOUNDARY_PRECOMPACT_ENABLED:
+        # Both tunables are read at request time through the config module
+        # (UPG-L3-CONFIG-READ-TIME) — see the import-site note at the top of
+        # this file.
+        if not config.BOUNDARY_PRECOMPACT_ENABLED:
             return ""
         text = _BOUNDARY_PRECOMPACT_BASE_TEXT
         count = (
@@ -3159,7 +3428,7 @@ class VectrService:
                 "pending distillation; keep the reasoning about what they mean."
             )
             candidate = f"{text}\n\n{arc_sentence}"
-            if token_estimate(candidate) <= BOUNDARY_PRECOMPACT_TOKEN_CAP:
+            if token_estimate(candidate) <= config.BOUNDARY_PRECOMPACT_TOKEN_CAP:
                 text = candidate
         return text
 

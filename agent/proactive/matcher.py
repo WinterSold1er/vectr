@@ -43,6 +43,8 @@ from agent.working_context_store._store import (
     _ANTI_MEMORY_TEMPLATE,
     _date_str,
     _note_title,
+    _path_boundary_count,
+    _path_boundary_first,
     _path_boundary_match,
 )
 from agent.working_context_store._types import PROVENANCE_VALUES, WorkingNote
@@ -92,10 +94,8 @@ def _cap(text: str, max_chars: int) -> str:
     summary. The cut backs off to the nearest SENTENCE boundary (". ")
     within the allowed budget when one exists there; failing that, to the
     nearest WORD boundary (" "); failing that (a single token longer than
-    the whole budget), a hard character cut — the same fallback shape
-    `_revoked_summary()`'s own `rpartition(". ")` split already uses
-    elsewhere in this module, applied here to truncation instead of clause
-    reordering. A boundary is only used when it still keeps at least
+    the whole budget), a hard character cut. A boundary is only used when
+    it still keeps at least
     `PROACTIVE_BODY_TRUNCATION_MIN_BOUNDARY_FRACTION` (config.yaml
     `proactive.body_truncation_min_boundary_fraction`) of the budget —
     backing off further than that would throw away most of the content
@@ -166,27 +166,23 @@ def _revoked_summary(note: WorkingNote, state: dict) -> str:
     (`_format_full_block()`), so this single-line proxy injection agrees
     with it.
 
-    The template's own trailing "Do not re-derive this from other sources
-    without verification." clause is relocated to the FRONT of the
-    rendered text — a physical substring of the template's own output, not
-    new wording — so that `_cap()`'s right-truncation can only ever cut
-    the tail (the quoted raw claim) and can never remove the deterrent
-    warning itself. `rpartition(". ")` finds this split point exactly:
-    the deterrent sentence has no internal ". " of its own, so whatever
-    occurs in `reason`/`summary` text, the LAST ". " in the formatted
-    string is always the boundary right before it."""
+    UPG-DETERRENT-TITLE-ONLY: `_ANTI_MEMORY_TEMPLATE` itself now puts the
+    "Do not re-derive..." warning FIRST and the free-text `reason` ahead of
+    the (already short, `_note_title()`-bounded) quoted summary, so
+    `_cap()`'s right-truncation naturally sacrifices the quote before the
+    reason, and the reason before the warning, with no reordering needed
+    here — this function used to relocate the warning to the front at
+    render time via `rpartition(". ")`; that is now redundant since the
+    template's own field order already does it, uniformly across every
+    surface that renders this template (not just this one)."""
     revoked_date = _date_str(state["ts"]) if state.get("ts") else _date_str(note.created_at)
     reason = state.get("reason") or "no reason given"
-    anti_memory = _ANTI_MEMORY_TEMPLATE.format(
+    return _ANTI_MEMORY_TEMPLATE.format(
         created_date=_date_str(note.created_at),
         revoked_date=revoked_date,
         reason=reason,
         summary=_note_title(note),
     )
-    prefix, sep, clause = anti_memory.rpartition(". ")
-    if not sep:
-        return anti_memory
-    return f"{clause} {prefix}."
 
 
 def _note_summary(note: WorkingNote, state: dict | None = None) -> str:
@@ -247,12 +243,25 @@ def _structural_note_candidate(
     score_mention: float,
     state: dict | None = None,
     anchor_path: str | None = None,
+    path_mention_count: int = 0,
+    path_mention_first_offset: int = -1,
 ) -> Candidate:
     """`relation` is one of the STRUCTURAL_TIER_* constants `_first_anchor()`
     resolved: DECLARED_ANCHOR, DECLARED_TRIGGER, or MENTION (raw — kind
     branching below turns a mention into GOTCHA_MENTION or plain MENTION,
     exactly as before this note's kind was already the only thing that
-    branch depended on)."""
+    branch depended on).
+
+    `path_mention_count` / `path_mention_first_offset`
+    (UPG-PROXY-WEAK-TIER-TIEBREAK): how many times the matched file's
+    basename occurs in this note's content at a genuine path boundary, and
+    where the first one lands — carried on the Candidate so the gate can
+    break ties among EQUAL-score candidates (every Tier-D item scores the
+    same `structural_scores.mention`) by relevance instead of insertion
+    order. Both are structural note-vs-path properties computed by the
+    same predicate `_path_boundary_match()` applies; they never touch
+    `score`, which would change tier competition against the semantic
+    band."""
     summary = _note_summary(note, state)
     kind_label = _kind_label(note, state)
     provenance_label = _provenance_label(note)
@@ -303,6 +312,10 @@ def _structural_note_candidate(
         # gate can pick the whole block's envelope wording without parsing
         # rendered text.
         note_provenance=provenance_label,
+        # UPG-PROXY-WEAK-TIER-TIEBREAK: the equal-score relevance tie-break
+        # signals (see this function's docstring).
+        path_mention_count=path_mention_count,
+        path_mention_first_offset=path_mention_first_offset,
     )
 
 
@@ -469,6 +482,19 @@ class ProactiveMatcher:
                 found = _first_anchor(note, anchors)
                 if found is not None:
                     anchor_path, anchor, relation = found
+                    # UPG-PROXY-WEAK-TIER-TIEBREAK: count how hard THIS note
+                    # talks about the matched file (basename occurrences at
+                    # genuine path boundaries, and where the first lands) —
+                    # the gate's equal-score tie-break signals.
+                    # UPG-MATCHER-RELATIVE-ANCHOR-LABEL: `anchor` may now be
+                    # the declared form that actually matched (a full path or
+                    # a glob), so the signals stay keyed to the BASENAME they
+                    # have always counted — the label change alters nothing
+                    # about equal-score ordering.
+                    base = anchors[anchor_path]
+                    content = note.content or ""
+                    mention_count = _path_boundary_count(content, base)
+                    mention_first_offset = _path_boundary_first(content, base)
                 else:
                     # Defensive fallback: the source returned a note this
                     # window's anchors/triggers/content narrowing can't
@@ -478,6 +504,12 @@ class ProactiveMatcher:
                     # existing behaviour before the anchor/trigger/mention
                     # 3-way split.
                     anchor_path, anchor, relation = None, "file", STRUCTURAL_TIER_DECLARED_ANCHOR
+                    # Leave the tie-break signals at their inert defaults:
+                    # `anchor` above is a display placeholder ("file"), not a
+                    # filename, and boundary-counting a common English word
+                    # would be prose statistics, not structure.
+                    mention_count = 0
+                    mention_first_offset = -1
                 candidates.append(
                     _structural_note_candidate(
                         note, anchor, relation, self._max_chars,
@@ -487,6 +519,8 @@ class ProactiveMatcher:
                         self._structural_score_mention,
                         state,
                         anchor_path,
+                        mention_count,
+                        mention_first_offset,
                     )
                 )
 
@@ -541,6 +575,12 @@ def _first_anchor(
     that case as "mentions X", the weakest provenance claim. Returns None
     when the note is about none of the window's files.
 
+    The display label is the form that ACTUALLY matched
+    (UPG-MATCHER-RELATIVE-ANCHOR-LABEL): the declared anchor string (basename
+    or exact path — whichever the note's `anchors` column contains; basename
+    wins when both are declared), or the declared glob pattern for a trigger
+    match. Never a derived form the author didn't write.
+
     The window file path (`anchors` dict's key, not its basename value) is
     returned alongside the display label so `match()` can carry it onto the
     STRUCTURAL_TIER_DECLARED_ANCHOR `Candidate.anchor_path` (UPG-PROXY-
@@ -550,10 +590,18 @@ def _first_anchor(
     declared = {a[0] for a in (note.anchors or []) if a}
     for path, base in anchors.items():
         if base and (base in declared or path in declared):
-            return path, base, STRUCTURAL_TIER_DECLARED_ANCHOR
+            # Report the declared string that actually matched, not
+            # unconditionally the basename (UPG-MATCHER-RELATIVE-ANCHOR-LABEL);
+            # when BOTH forms are declared, keep the historical basename.
+            return path, base if base in declared else path, STRUCTURAL_TIER_DECLARED_ANCHOR
     for path, base in anchors.items():
-        if path_trigger_match(note.triggers, (path, base)) is not None:
-            return path, base, STRUCTURAL_TIER_DECLARED_TRIGGER
+        matched_glob = path_trigger_match(note.triggers, (path, base))
+        if matched_glob is not None:
+            # Render the glob that actually matched — path_trigger_match()
+            # returns it explicitly for this explanatory purpose, and a
+            # wildcard glob reported as one concrete basename overstates a
+            # package-wide declaration as a single-file one.
+            return path, matched_glob, STRUCTURAL_TIER_DECLARED_TRIGGER
     content = note.content or ""
     for path, base in anchors.items():
         if base and _path_boundary_match(content, base):

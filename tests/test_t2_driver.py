@@ -7,7 +7,8 @@ here. NEVER against the real `tmp/poc-camel` fixture or the live vectr
 daemon: every git repo, patch, and artifact tree below is built fresh under
 `tmp_path`, and `daemon_settle`/`preflight_vectr` (network calls) are
 deliberately not exercised live -- this file spawns no `claude -p` session
-and makes no HTTP request.
+and makes no HTTP request -- see `_offline_token_counter` for the one
+place that claim was quietly untrue until CI proved it.
 """
 from __future__ import annotations
 
@@ -729,7 +730,27 @@ def test_run_claude_session_normal_exit_is_not_flagged_timed_out():
 # modifying run_t1b.parse_transcript itself).
 # ---------------------------------------------------------------------------
 
-def test_summary_forces_is_error_when_no_result_event():
+@pytest.fixture
+def _offline_token_counter(monkeypatch):
+    """`summarize_task_result` counts the final answer through run_t1c's
+    `count_tokens`, which lazily does `tiktoken.get_encoding("cl100k_base")`
+    -- a FIRST-CALL NETWORK FETCH from openaipublic.blob.core.windows.net.
+
+    A developer machine has a warm tiktoken cache, so the fetch never
+    happens locally; CI's is cold, so both tests below failed there (run
+    32962144004) the moment the suite-wide socket guard started refusing
+    egress. The module docstring's "makes no HTTP request" was therefore
+    false for exactly these two. The subject here is the is_error
+    post-check, not tokenization, so count words and stay offline.
+    (tests/conftest.py additionally points TIKTOKEN_CACHE_DIR at an empty
+    per-run dir, so a warm cache can no longer mask this class locally.)
+    """
+    import run_t1c
+
+    monkeypatch.setattr(run_t1c, "count_tokens", lambda text: len((text or "").split()))
+
+
+def test_summary_forces_is_error_when_no_result_event(_offline_token_counter):
     task = {"id": "T2-01", "category": "bugfix", "prompt": "fix it"}
     # No terminal "result" event -- session went silent mid-stream.
     events = [{"type": "assistant", "message": {"content": []}, "_t": 0.0}]
@@ -747,7 +768,7 @@ def test_summary_forces_is_error_when_no_result_event():
     assert summary["error"] == "no result event"
 
 
-def test_summary_leaves_is_error_alone_when_result_event_present():
+def test_summary_leaves_is_error_alone_when_result_event_present(_offline_token_counter):
     task = {"id": "T2-01", "category": "bugfix", "prompt": "fix it"}
     events = [{"type": "result", "is_error": False, "result": "done", "_t": 1.0}]
     summary = run_t2._t1c_summarize_task_result(task, "vectr", events, wall_s=5.0)

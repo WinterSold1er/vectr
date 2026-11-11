@@ -291,7 +291,7 @@ def _base_mock_service():
     # the confirmation message. Return the REAL outcome type.
     from app.service import RememberOutcome
     svc.remember_with_extras.return_value = RememberOutcome(
-        note_id=1, related=[], proxy_anchor_suggestions=[],
+        note_id=1, related=[], revoked_related=[], proxy_anchor_suggestions=[],
     )
     svc.promote_note.return_value = True
     svc.revoke_note.return_value = True
@@ -355,17 +355,18 @@ def client_real_memory(tmp_path):
 
     def _remember(content, tags=None, priority="medium", session_id=None, kind="finding", title="",
                   agent="", triggers=None, provenance="agent", scope=None, anchors=None,
-                  supersedes=None, contradicts=None, user_quote=None):
+                  supersedes=None, contradicts=None, user_quote=None, pin=False):
         return real_store.remember(
             ws, content, tags, priority, session_id, kind=kind, title=title, author_id=agent,
             triggers=triggers, provenance=provenance, scope=scope, anchors=anchors,
             supersedes=supersedes, contradicts=contradicts, user_quote=user_quote,
+            pin=pin,
         )
 
     def _remember_with_extras(content, tags=None, priority="medium", session_id=None,
                                kind="finding", title="", agent="", triggers=None,
                                provenance="agent", scope=None, anchors=None,
-                               supersedes=None, contradicts=None, user_quote=None):
+                               supersedes=None, contradicts=None, user_quote=None, pin=False):
         """Mirrors VectrService.remember_with_extras's own gating (app/
         service.py) against this fixture's real store, so /v1/remember
         REST tests routed through this fixture get a REAL RememberOutcome
@@ -380,12 +381,15 @@ def client_real_memory(tmp_path):
             MEMORY_WRITE_RELATED_ENABLED,
             MEMORY_WRITE_RELATED_LIMIT,
             MEMORY_WRITE_RELATED_MIN_SIMILARITY,
+            MEMORY_WRITE_RELATED_REVOKED_ENABLED,
+            MEMORY_WRITE_RELATED_REVOKED_LIMIT,
             MEMORY_WRITE_PROXY_SUGGEST_ENABLED,
             MEMORY_WRITE_PROXY_SUGGEST_LIMIT,
         )
         note_id = _remember(
             content, tags, priority, session_id, kind, title, agent, triggers,
             provenance, scope, anchors, supersedes, contradicts, user_quote,
+            pin=pin,
         )
         related = []
         if MEMORY_WRITE_RELATED_ENABLED:
@@ -393,11 +397,18 @@ def client_real_memory(tmp_path):
                 ws, note_id, limit=MEMORY_WRITE_RELATED_LIMIT,
                 min_similarity=MEMORY_WRITE_RELATED_MIN_SIMILARITY,
             )
+        revoked_related = []
+        if MEMORY_WRITE_RELATED_REVOKED_ENABLED:
+            revoked_related = real_store.revoked_related_notes(
+                ws, note_id, limit=MEMORY_WRITE_RELATED_REVOKED_LIMIT,
+                min_similarity=MEMORY_WRITE_RELATED_MIN_SIMILARITY,
+            )
         proxy_anchor_suggestions = []
         if MEMORY_WRITE_PROXY_SUGGEST_ENABLED and kind == "operational" and not anchors:
             proxy_anchor_suggestions = suggest_proxy_anchors(ws, MEMORY_WRITE_PROXY_SUGGEST_LIMIT)
         return RememberOutcome(
-            note_id=note_id, related=related, proxy_anchor_suggestions=proxy_anchor_suggestions,
+            note_id=note_id, related=related, revoked_related=revoked_related,
+            proxy_anchor_suggestions=proxy_anchor_suggestions,
         )
 
     svc.remember.side_effect = _remember
@@ -408,6 +419,14 @@ def client_real_memory(tmp_path):
     )
     svc.reinstate_note.side_effect = lambda note_id, actor="agent", reason=None: real_store.reinstate_note(
         ws, note_id, actor=actor, reason=reason
+    )
+    # 1.12.0 routes: a MagicMock here answers 200 for a note that does not
+    # exist, so wire them to the real store like the other note mutations.
+    svc.pin_note.side_effect = lambda note_id, pinned=True: real_store.set_pinned(
+        ws, note_id, pinned
+    )
+    svc.supersede_note.side_effect = lambda note_id, superseded_by=None, reason=None, actor="agent": real_store.supersede_note(
+        ws, note_id, superseded_by=superseded_by, reason=reason, actor=actor
     )
 
     # TRIGGER-ENGINE wave 2a: a minimal per-session ledger registry mirroring

@@ -5,10 +5,8 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from agent.config import (
-    EMBEDDING_API_KEY_ENV as _EMBEDDING_API_KEY_ENV,
     EMBEDDING_DEFAULT_MODEL as _EMBEDDING_DEFAULT_MODEL,
     EMBEDDING_MAX_SEQ_LENGTH as _EMBEDDING_MAX_SEQ_LENGTH,
-    EMBEDDING_OUTPUT_DIMENSIONALITY as _EMBEDDING_OUTPUT_DIMENSIONALITY,
     EMBEDDING_THREAD_CAP as _EMBEDDING_THREAD_CAP,
     vectr_cache_root as _vectr_cache_root,
 )
@@ -183,6 +181,63 @@ class OpenAIEmbedProvider:
         return self.embed(texts)
 
 
+
+# --- embedding settings resolved here (installed 1.12.0 has no config overlay) ---
+def _embed_config_for(workspace_root: str | None) -> dict:
+    """`embedding:` settings from <workspace>/.vectr/config.yaml, then the global
+    ~/.vectr/config.yaml; the workspace file wins key by key. An existing file
+    that is unreadable or malformed raises instead of being ignored."""
+    import os
+    from pathlib import Path
+
+    import yaml
+
+    merged: dict = {}
+    ws = workspace_root or os.environ.get("VECTR_WORKSPACE") or os.getcwd()
+    for path in (Path(ws) / ".vectr" / "config.yaml", Path.home() / ".vectr" / "config.yaml"):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"vectr: {path} could not be read: {exc}") from exc
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            raise RuntimeError(f"vectr: {path} is not valid YAML: {exc}") from exc
+        section = data.get("embedding") if isinstance(data, dict) else None
+        if isinstance(section, dict):
+            merged = {**section, **merged}
+    return merged
+
+
+def resolve_embed_model(explicit_env: str | None, workspace_root: str | None, default: str) -> str:
+    """Embed-model precedence: VECTR_EMBED_MODEL env > workspace .vectr/config.yaml
+    embedding.model > ~/.vectr/config.yaml embedding.model > bundled default."""
+    if explicit_env:
+        return explicit_env
+    model = _embed_config_for(workspace_root).get("model")
+    return str(model) if model else default
+
+
+def _google_output_dimensionality(cfg: dict) -> int | None:
+    """outputDimensionality for the Google call: VECTR_EMBED_OUTPUT_DIM env, then
+    embedding.output_dimensionality from the config files. Nothing is invented
+    here — unset means "ask the API for its own default"."""
+    import os
+
+    raw = os.environ.get("VECTR_EMBED_OUTPUT_DIM") or cfg.get("output_dimensionality")
+    if raw is None or raw == "":
+        return None
+    try:
+        dim = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"vectr: invalid embedding output dimension {raw!r}") from exc
+    if dim <= 0:
+        raise RuntimeError(f"vectr: embedding output dimension must be positive, got {dim}")
+    return dim
+
+
 def _resolve_google_api_key(env_name: str) -> str:
     """Key for the Google embeddings API: `env_name` first, then the
     "gemini_api_key" entry of ~/.vectr/secrets.json.
@@ -232,10 +287,10 @@ def _embed_chars_per_second() -> float:
     """Embedding request budget in characters per second, used to pace
     batchEmbedContents against the key's tokens-per-minute quota.
 
-    Measured 2026-11-10 against gemini-embedding-2: 100-text batches (~14k tokens
-    each) sent back to back return HTTP 429, the same batches spaced 40s apart
-    return 200 — about 72k chars/min on the free tier. Override with
-    VECTR_EMBED_CHARS_PER_SECOND once the key moves to a paid quota tier.
+    Measured 2026-11-10 against gemini-embedding-2: batches of ~14k tokens sent
+    back to back return HTTP 429, the same batches spaced 40s apart return 200
+    (about 72k chars/min on the free tier). Override with
+    VECTR_EMBED_CHARS_PER_SECOND once the key is on a paid quota tier.
     """
     import os
 
@@ -263,14 +318,14 @@ class GoogleEmbedProvider:
     """
 
     _BATCH_LIMIT = 100          # batchEmbedContents accepts at most 100 requests
-    _MAX_ATTEMPTS = 4
+    _MAX_ATTEMPTS = 8           # 429 windows last about a minute; a short retry chain just fails
     _TIMEOUT_SECONDS = 30.0
 
     def __init__(
         self,
         model_name: str,
         output_dimensionality: int | None = None,
-        api_key_env: str = _EMBEDDING_API_KEY_ENV,
+        api_key_env: str | None = None,
     ) -> None:
         if not model_name:
             raise ValueError(
@@ -278,7 +333,9 @@ class GoogleEmbedProvider:
             )
         self._model = model_name
         self._dim = output_dimensionality
-        self._api_key = _resolve_google_api_key(api_key_env)
+        self._api_key = _resolve_google_api_key(
+            api_key_env or _embed_config_for(None).get("api_key_env") or "GEMINI_API_KEY"
+        )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embed(texts, "RETRIEVAL_DOCUMENT")
@@ -296,9 +353,8 @@ class GoogleEmbedProvider:
         for start in range(0, len(texts), self._BATCH_LIMIT):
             batch = texts[start:start + self._BATCH_LIMIT]
             vectors.extend(self._embed_batch(batch, task_type))
-            # Hold the request rate under the key's tokens-per-minute budget: pause
-            # for as long as this batch's payload would take at that rate, but never
-            # long enough to stall a pass. Only when another batch follows.
+            # Hold the request rate under the key's tokens-per-minute budget:
+            # pause for as long as this batch's payload would take at that rate.
             if start + self._BATCH_LIMIT < len(texts):
                 time.sleep(min(60.0, sum(len(t) for t in batch) / budget))
         return vectors
@@ -332,12 +388,9 @@ class GoogleEmbedProvider:
                     timeout=self._TIMEOUT_SECONDS,
                 )
             except httpx.HTTPError as exc:
-                # Connection-level failures (TLS handshake resets such as
-                # UNEXPECTED_EOF_WHILE_READING, read timeouts, refused connections)
+                # Connection-level failures (TLS handshake resets, read timeouts)
                 # are transient: retry them with the same capped backoff as a 429
-                # instead of aborting a whole indexing pass half-indexed. The key
-                # is not in play here — it rides in a header, not in the URL that
-                # httpx quotes in the error.
+                # instead of aborting the whole indexing pass.
                 if attempt < self._MAX_ATTEMPTS:
                     time.sleep(min(60.0, 2.0 ** (attempt - 1)))
                     continue
@@ -353,6 +406,13 @@ class GoogleEmbedProvider:
                 except (TypeError, ValueError):
                     delay = min(60.0, 2.0 ** (attempt - 1))
                 time.sleep(max(0.0, delay))
+                continue
+
+            if response.status_code >= 500 and attempt < self._MAX_ATTEMPTS:
+                # Upstream 5xx (500/502/503/504) are server-side and transient
+                # like a 429: retry on the same capped backoff instead of
+                # aborting the whole indexing pass on a single bad response.
+                time.sleep(min(60.0, 2.0 ** (attempt - 1)))
                 continue
 
             if response.status_code != 200:
@@ -405,9 +465,10 @@ def get_embed_provider(model_spec: str) -> EmbedProvider:
     if model_spec.startswith("openai/"):
         return OpenAIEmbedProvider(model_spec.split("/", 1)[1])
     if model_spec.startswith("google/"):
+        cfg = _embed_config_for(None)
         return GoogleEmbedProvider(
             model_spec.split("/", 1)[1],
-            output_dimensionality=_EMBEDDING_OUTPUT_DIMENSIONALITY,
-            api_key_env=_EMBEDDING_API_KEY_ENV,
+            output_dimensionality=_google_output_dimensionality(cfg),
+            api_key_env=str(cfg.get("api_key_env") or "GEMINI_API_KEY"),
         )
     return LocalEmbedProvider(model_spec)

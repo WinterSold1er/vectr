@@ -25,6 +25,7 @@ import pytest
 import main as m
 from agent import hook_cli
 from agent.instance_registry import InstanceRegistry, workspace_hash
+from tests.conftest import allow_loopback_port
 
 
 class _FastBindHTTPServer(ThreadingHTTPServer):
@@ -102,11 +103,18 @@ def stub_daemon(request):
         server.boundary_response = boundary_response
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    try:
-        yield server.server_address[1]
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
+    # This is the suite's one legitimate live-probe user: both hook
+    # implementations dial a REAL local HTTP server with real sockets. The
+    # session-wide socket guard (tests/conftest.py) blocks unregistered
+    # loopback connects, so the ephemeral port this fixture owns is
+    # allow-listed for exactly the fixture's lifetime.
+    port = server.server_address[1]
+    with allow_loopback_port(port):
+        try:
+            yield port
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
 
 
 def _registry_pointing_at(tmp_path, port):

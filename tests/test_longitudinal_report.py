@@ -263,6 +263,41 @@ def test_trajectory_report_row_context_tokens_at_fact_defaults_to_none_when_abse
     assert t["legs"][0]["context_tokens_at_fact"] is None
 
 
+def test_trajectory_report_row_surfaces_conversational_turns_to_fact_and_session_turns_alongside_rdc():
+    """UPG-EVAL-TURNS-UNITS: `conversational_turns_to_fact` (the CLI's own
+    `result.num_turns` unit, scorer.leg_metrics) and `cost.session_turns` are
+    reported on every per-leg row alongside `rdc["turns_to_fact"]` (a distinct-
+    API-call count) -- directly comparable to each other, but neither is folded
+    into RDC(k) itself, and `turns_to_fact` inside `rdc` keeps its original
+    meaning unchanged."""
+    metrics = _metrics()
+    metrics["conversational_turns_to_fact"] = 7
+    legs = [
+        _leg_record(
+            scenario="release_via_ci", arm="proxy", note_variant="plain", seed=0, k=2,
+            metrics=metrics,
+        )
+    ]
+    legs[0]["cost"]["session_turns"] = 9
+    t = report.trajectory_report("release_via_ci-proxy-plain-s0", legs, None, "discovered")
+    row = t["legs"][0]
+    assert row["conversational_turns_to_fact"] == 7
+    assert row["session_turns"] == 9
+    assert "conversational_turns_to_fact" not in row["rdc"]
+    assert "session_turns" not in row["rdc"]
+    assert "conversational_turns_to_fact" not in report.RDC_COMPONENTS
+    assert "session_turns" not in report.RDC_COMPONENTS
+    assert row["rdc"]["turns_to_fact"] == metrics["turns_to_fact"]
+
+
+def test_trajectory_report_row_conversational_turns_to_fact_and_session_turns_default_to_none_when_absent():
+    legs = [_leg_record(scenario="release_via_ci", arm="none", note_variant="none", seed=0, k=2, metrics=_metrics())]
+    t = report.trajectory_report("release_via_ci-none-none-s0", legs, None, "discovered")
+    row = t["legs"][0]
+    assert row["conversational_turns_to_fact"] is None
+    assert row["session_turns"] is None
+
+
 def test_cross_arm_delta_only_pairs_matching_k_present_in_both():
     leg1_record = _leg1_result(mistake_committed=True)
     a_legs = [

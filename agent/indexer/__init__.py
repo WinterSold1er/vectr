@@ -43,6 +43,7 @@ from agent.indexer._types import (
 # continues to work (test_config_loader asserts these are the same objects as config.py).
 from agent.config import (
     INDEXING_MAX_CHUNK_LINES as _MAX_CHUNK_LINES,
+    INDEXING_MAX_CHUNK_CHARS as _MAX_CHUNK_CHARS,
     INDEXING_CLASS_HEADER_LINES as _CLASS_HEADER_LINES,
 )
 
@@ -74,6 +75,7 @@ from agent.indexer._core import CodeIndexer
 __all__ = [
     # Config-sourced tunables (re-exported for test_config_loader)
     "_MAX_CHUNK_LINES",
+    "_MAX_CHUNK_CHARS",
     "_CLASS_HEADER_LINES",
     # Constants
     "LANG_BY_EXT",

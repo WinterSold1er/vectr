@@ -1365,8 +1365,8 @@ def test_censoring_never_imputes_from_session_totals(tmp_path):
     assert metrics["censored"] is True
     assert metrics["censor_reason"] == "fact never acquired"
     for key in (
-        "turns_to_fact", "tool_calls_to_fact", "output_tokens_to_fact",
-        "billable_tokens_to_fact", "context_tokens_at_fact",
+        "turns_to_fact", "conversational_turns_to_fact", "tool_calls_to_fact",
+        "output_tokens_to_fact", "billable_tokens_to_fact", "context_tokens_at_fact",
         "usd_to_fact_alloc", "usd_to_fact_basis",
     ):
         assert metrics[key] is None, f"{key} was imputed on a censored leg: {metrics[key]!r}"
@@ -1467,6 +1467,10 @@ def test_billable_tokens_to_fact_counts_a_split_api_call_once(tmp_path):
 
     expected_billable = scorer._billable_tokens(usage_a) + scorer._billable_tokens(usage_b)
     assert metrics["turns_to_fact"] == 2  # 2 real calls, not 3 raw events
+    # No `user` event precedes the fact-acquisition event in this fixture, so
+    # the CLI-native unit is 1 turn -- deliberately different from
+    # turns_to_fact's 2 (UPG-EVAL-TURNS-UNITS: different units, not a bug).
+    assert metrics["conversational_turns_to_fact"] == 1
     assert metrics["output_tokens_to_fact"] == usage_a["output_tokens"] + usage_b["output_tokens"]
     assert metrics["billable_tokens_to_fact"] == pytest.approx(expected_billable)
     # context_tokens_at_fact reads the acquiring event's own usage directly --
@@ -1474,6 +1478,74 @@ def test_billable_tokens_to_fact_counts_a_split_api_call_once(tmp_path):
     assert metrics["context_tokens_at_fact"] == (
         usage_b["input_tokens"] + usage_b["cache_creation_input_tokens"] + usage_b["cache_read_input_tokens"]
     )
+
+
+# ---------------------------------------------------------------------------
+# UPG-EVAL-TURNS-UNITS: turns_to_fact (distinct API calls) and
+# conversational_turns_to_fact (the CLI's own result.num_turns unit) are
+# different units, both reported, and turns_to_fact is never silently
+# redefined into the new one.
+# ---------------------------------------------------------------------------
+
+
+def test_conversational_turns_before_reproduces_num_turns_formula():
+    """`_conversational_turns_before` must match the CLI's own counting rule
+    exactly: verified against every one of this repo's 48 preserved real
+    stream-json transcripts with a `result` event that
+    `num_turns == count(all "user"-type events) + 1`, zero exceptions. This
+    fixture is the minimal shape that rule covers: 2 completed tool
+    round-trips (2 `user` events) before a 3rd, still-open turn."""
+    events = [
+        {"type": "system"},
+        {"type": "assistant", "message": {"id": "m1", "content": [{"type": "tool_use"}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        {"type": "assistant", "message": {"id": "m2", "content": [{"type": "tool_use"}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        {"type": "assistant", "message": {"id": "m3", "content": [{"type": "tool_use"}]}},
+    ]
+    assert scorer._conversational_turns_before(events, event_index=5) == 3
+    # Restricting to a prefix (stopping before the 2nd round-trip completes)
+    # gives the CLI-native turn number of THAT turn, not the session total.
+    assert scorer._conversational_turns_before(events, event_index=3) == 2
+    assert scorer._conversational_turns_before(events, event_index=1) == 1
+
+
+def test_conversational_turns_to_fact_exceeds_turns_to_fact_when_message_id_reused(tmp_path):
+    """Reproduces the exact shape found in a preserved real transcript
+    (release_via_ci-hook-sessionstart-plain-s0 leg 4): the CLI sometimes
+    reuses ONE `message.id` across a CHAIN of sequential tool_use/tool_result
+    round-trips, so `_dedupe_assistant_messages`'s per-message-id collapse
+    (correct for its own purpose -- not double-billing one real call) merges
+    what are actually several distinct CLI-native turns into a single
+    turns_to_fact increment. conversational_turns_to_fact must NOT inherit
+    that undercount."""
+    scenario = scen.get("release_via_ci")
+    leg = scenario.legs[0]
+    events = [
+        {"type": "system", "subtype": "init", "mcp_servers": [], "tools": []},
+        # Same message.id ("msg_R") reused across 3 sequential round-trips.
+        {"type": "assistant", "message": {"id": "msg_R", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "echo one"}}], "usage": {}}},
+        {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        {"type": "assistant", "message": {"id": "msg_R", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "echo two"}}], "usage": {}}},
+        {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        {
+            "type": "assistant",
+            "message": {
+                "id": "msg_R",
+                "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "git tag v1.4.0 && git push --tags"}}],
+                "usage": {},
+            },
+        },
+        {"type": "result", "subtype": "success", "num_turns": 3, "usage": {}},
+    ]
+    actions = scorer.build_action_stream(events)
+    metrics = scorer.leg_metrics(
+        leg, events=events, actions=actions, workspace=tmp_path,
+        leg_start_baselines={}, k=1, origin=scenario.origin,
+    )
+    assert metrics["turns_to_fact"] == 1  # one message.id, deduped
+    assert metrics["conversational_turns_to_fact"] == 3  # 3 real round-trips
+    assert metrics["conversational_turns_to_fact"] > metrics["turns_to_fact"]
 
 
 # ---------------------------------------------------------------------------

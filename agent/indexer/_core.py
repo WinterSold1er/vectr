@@ -41,6 +41,8 @@ from agent.indexer._constants import (
     _MTIME_CACHE_SCHEMA_KEY,
     INDEXING_SCHEMA_VERSION,
     _EMBED_MODEL_STAMP_FILE,
+    _PURPOSE_CACHE_FILE,
+    _PURPOSE_CACHE_SCHEMA_KEY,
 )
 from agent.indexer._chunking import chunk_file
 from agent.indexer._priority import lowered_priority, pace
@@ -182,6 +184,13 @@ class CodeIndexer:
         self._stats_seeded = False
         self._lang_chunk_counts: dict[str, int] = {}
         self._lang_files: dict[str, set[str]] = {}
+        # Live body-collection chunk count per file path (UPG-CHUNK-DELTA-
+        # PARTIAL-FILE-DISCARD). A file's chunks all carry one language (it is
+        # derived from the extension), so this is keyed by path alone. It is
+        # what lets `_apply_chunk_delta(sign=-1)` tell "some chunks of this
+        # file were deleted" apart from "the file's LAST chunk was deleted" —
+        # only the latter may drop the file from its `_lang_files` bucket.
+        self._file_chunk_counts: dict[str, int] = {}
         # Total chunk counts (body + purpose collections), read by
         # `total_chunks`/`total_purpose_chunks`. Seeded here from a real
         # (but construction-time, always off-the-event-loop) count;
@@ -226,6 +235,20 @@ class CodeIndexer:
         # safely re-embedded, on a later call), matching this whole
         # mechanism's at-least-once checkpoint philosophy.
         self._mtime_cache_lock = threading.Lock()
+        # Same file-corruption guard as `_mtime_cache_lock`, for
+        # `purpose_cache.json` (UPG-PURPOSE-RESUME-HOLE) — written from both
+        # the caller's own thread (the synchronous/inline path, and
+        # `index_workspace`'s one-time migration seed) and the deferred
+        # purpose executor's background thread.
+        self._purpose_cache_lock = threading.Lock()
+        # Number of files `index_workspace()` most recently detected as
+        # having current body content but incomplete purpose vectors, before
+        # dispatching their backfill (UPG-PURPOSE-RESUME-HOLE) — surfaced via
+        # `purpose_backfill_pending_files` for `/v1/status` so a gap this
+        # large cannot hide behind an otherwise-green status. 0 whenever dual
+        # vectors are disabled, the workspace has nothing indexed yet, or the
+        # most recent run found (and dispatched backfill for) no gap.
+        self._purpose_backfill_pending_count = 0
 
         # Deferred: look up get_embed_provider through the package namespace so that
         # test-time monkeypatching of agent.indexer.get_embed_provider is honoured
@@ -296,6 +319,7 @@ class CodeIndexer:
         with self._stats_lock:
             self._lang_chunk_counts = {}
             self._lang_files = {}
+            self._file_chunk_counts = {}
             self._stats_seeded = True
             self._total_chunks_cache = 0
             self._purpose_chunks_cache = 0
@@ -363,7 +387,13 @@ class CodeIndexer:
         # this, editing .vectrignore stops *new* indexing but leaves the old
         # chunks in the collection forever. (UPG-8.4)
         mtime_cache, schema_stale = self._load_mtime_cache_with_reason()
-        pruned = self._prune_orphaned_chunks(should_index_paths, mtime_cache)
+
+        # UPG-PURPOSE-RESUME-HOLE: load the purpose-completion cache before
+        # pruning so an orphaned/excluded file is dropped from BOTH caches in
+        # the same pass its chunks are deleted from both collections —
+        # mirrors _prune_orphaned_chunks' existing mtime_cache mutate-in-place.
+        purpose_cache, purpose_cache_existed = self._load_purpose_cache()
+        pruned = self._prune_orphaned_chunks(should_index_paths, mtime_cache, purpose_cache)
 
         # UPG-EMBEDDER-SWAP-GRANITE: vectors from two different embedding
         # models must never silently coexist in one collection (a same-
@@ -434,12 +464,63 @@ class CodeIndexer:
             else:
                 self._indexed_files.add(str(f))  # already indexed — track in memory
 
+        # UPG-PURPOSE-RESUME-HOLE: files whose body content is CURRENT (not
+        # in `to_index` above — nothing below re-chunks/re-embeds them) but
+        # whose purpose vectors are not confirmed complete: an interrupted
+        # deferred pass (UPG-PURPOSE-PASS-DEFERRAL lost between a content
+        # checkpoint and the purpose pass meant to follow it), or a first
+        # run after upgrading to this cache. Detected on EVERY run,
+        # including one where `to_index` ends up empty — that is the actual
+        # hole this closes: previously, a workspace with nothing new to
+        # content-index returned immediately below without ever revisiting
+        # an old purpose gap, so it could persist forever absent --force or
+        # a file touch.
+        to_index_paths = {str(f) for f, _ in to_index}
+        gap_paths: set[str] = set()
+        if _DUAL_VECTOR_ENABLED:
+            if not purpose_cache_existed and mtime_cache:
+                # One-time migration seed: reconcile against the actual
+                # purpose collection instead of assuming every pre-existing
+                # file is a gap, which would force a corpus-wide purpose-
+                # only backfill on every user's first run after upgrading.
+                purpose_cache = self._seed_purpose_cache_from_collection(mtime_cache)
+                self._save_purpose_cache(purpose_cache)
+            gap_paths = {
+                fpath for fpath, mtime in mtime_cache.items()
+                if fpath not in to_index_paths
+                and fpath in should_index_paths
+                and purpose_cache.get(fpath) != mtime
+            }
+        gap_chunks = self._fetch_body_chunks_for_files(gap_paths)
+        gap_mtimes = {p: mtime_cache[p] for p in gap_paths}
+        self._purpose_backfill_pending_count = len(gap_paths)
+        governed = _INDEX_GOVERNOR_ENABLED and not _foreground_fast_enabled()
+
+        def _dispatch_purpose_pass(chunks: list[CodeChunk], file_mtimes: dict[str, float]) -> None:
+            """Run/schedule the purpose pass (UPG-PURPOSE-PASS-DEFERRAL's
+            existing sync/deferred choice) for `chunks`, then clear the
+            backfill-gap counter — see `purpose_backfill_pending_files`'s
+            docstring for exactly what "clear" means here (dispatch SENT,
+            not necessarily landed, for the deferred case)."""
+            if not chunks:
+                self._purpose_backfill_pending_count = 0
+                return
+            defer_purpose = (
+                _INDEX_GOVERNOR_DEFER_PURPOSE_PASS_ENABLED and not _foreground_fast_enabled()
+            )
+            if defer_purpose:
+                self._schedule_deferred_purpose_pass(chunks, governed=governed, file_mtimes=file_mtimes)
+            else:
+                self._upsert_purpose_vectors(chunks, governed=governed, file_mtimes=file_mtimes)
+            self._purpose_backfill_pending_count = 0
+
         if not to_index:
             if pruned:
                 self._save_mtime_cache(mtime_cache)  # persist orphan removals
             # Embed-model stamp is already written above, right after the
             # mismatch check — no need to repeat it here.
             logger.info("All %d files up to date — nothing to re-index", len(all_files))
+            _dispatch_purpose_pass(gap_chunks, gap_mtimes)
             self._last_indexed = time.time()
             self._refresh_chunk_count_caches()
             return len(self._indexed_files), self.total_chunks
@@ -482,9 +563,16 @@ class CodeIndexer:
             # whitespace/binary) — still persist their mtimes, otherwise
             # `new_mtimes` built during Phase 1 is silently discarded and
             # these files are needlessly re-chunked on every future run
-            # (UPG-INDEX-RESOURCE-GOVERNOR).
+            # (UPG-INDEX-RESOURCE-GOVERNOR). Zero chunks also means zero
+            # purpose-vector candidates — checkpoint purpose_cache the same
+            # way, otherwise these files would look like a permanent
+            # purpose gap on every future run (UPG-PURPOSE-RESUME-HOLE).
             mtime_cache.update(new_mtimes)
             self._save_mtime_cache(mtime_cache)
+            if _DUAL_VECTOR_ENABLED:
+                purpose_cache.update(new_mtimes)
+                self._save_purpose_cache(purpose_cache)
+            _dispatch_purpose_pass(gap_chunks, gap_mtimes)
             self._last_indexed = time.time()
             self._refresh_chunk_count_caches()
             return len(self._indexed_files), self.total_chunks
@@ -541,8 +629,15 @@ class CodeIndexer:
         if zero_chunk_mtimes:
             mtime_cache.update(zero_chunk_mtimes)
             self._save_mtime_cache(mtime_cache)
+            if _DUAL_VECTOR_ENABLED:
+                # Zero chunks for these files means zero purpose-vector
+                # candidates — checkpoint them the same way, otherwise
+                # they'd look like a permanent purpose gap on every future
+                # run (UPG-PURPOSE-RESUME-HOLE). `governed` was already
+                # computed above (gap-detection block), reused here.
+                purpose_cache.update(zero_chunk_mtimes)
+                self._save_purpose_cache(purpose_cache)
 
-        governed = _INDEX_GOVERNOR_ENABLED and not _foreground_fast_enabled()
         with lowered_priority(
             governed,
             macos_qos_class=_INDEX_GOVERNOR_MACOS_QOS_CLASS,
@@ -617,11 +712,13 @@ class CodeIndexer:
         # never re-embeds already-persisted content; at worst it re-runs the
         # (idempotent, upsert-by-chunk_id) purpose pass for files whose
         # purpose vectors hadn't landed yet.
-        defer_purpose = _INDEX_GOVERNOR_DEFER_PURPOSE_PASS_ENABLED and not _foreground_fast_enabled()
-        if defer_purpose:
-            self._schedule_deferred_purpose_pass(all_chunks, governed=governed)
-        else:
-            self._upsert_purpose_vectors(all_chunks, governed=governed)
+        #
+        # UPG-PURPOSE-RESUME-HOLE: `gap_chunks`/`gap_mtimes` (computed above,
+        # before Phase 1) fold any BACKLOG of already-content-indexed files
+        # whose purpose vectors never landed into this SAME dispatch, so one
+        # run closes both this run's own fresh files and any inherited gap
+        # in a single pass/background job rather than two.
+        _dispatch_purpose_pass(all_chunks + gap_chunks, {**new_mtimes, **gap_mtimes})
 
         logger.info("Indexed %d chunks from %d files", total, len(to_index))
 
@@ -735,6 +832,7 @@ class CodeIndexer:
         self,
         chunks: list[CodeChunk],
         governed: bool = False,
+        file_mtimes: dict[str, float] | None = None,
     ) -> None:
         """Embed + upsert the body-stripped purpose text for symbol chunks.
 
@@ -765,16 +863,69 @@ class CodeIndexer:
         touch mtime_cache at all. A file's chunk ids are upserted here
         idempotently keyed by chunk_id, so a crash before this call runs (or
         mid-way through it, whether inline or on the deferred background
-        thread) simply leaves that file's purpose vectors missing/partial;
-        nothing here can corrupt or falsely mark content as incomplete, and
-        a retry (next index_workspace(), or `--force`, or a file touch) is
-        always safe to re-run.
+        thread) simply leaves that file's purpose vectors missing/partial.
+
+        `file_mtimes` (UPG-PURPOSE-RESUME-HOLE), when given, is a
+        file_path -> content-mtime map covering every file contributing
+        chunks to this call. As each file's LAST chunk in `chunks` is
+        reached — the same "last occurrence index" trick index_workspace's
+        Phase 3 uses for mtime_cache; correct regardless of whether a
+        file's chunks are contiguous, which they are NOT for the
+        purpose-only backfill path, since `_fetch_body_chunks_for_files`
+        batches its `$in` query across several files at once — that file's
+        entry is written to the on-disk purpose-completion cache
+        (`purpose_cache.json`) and persisted immediately, not only at the
+        very end: a crash mid-pass loses at most the batch in flight, never
+        the whole call. This is what makes a retry genuinely SELF-HEALING,
+        not merely safe: a plain idempotent retry only stops corruption on
+        replay, but without a persisted per-file completion signal a gap
+        could never be *detected* on a later run at all (mtime_cache alone
+        cannot distinguish "content indexed, purpose written" from "content
+        indexed, purpose pass never got that far"), so nothing would ever
+        prompt the retry to happen in the first place. With this cache, the
+        NEXT ordinary `index_workspace()` call — no `--force` and no file
+        touch required — finds a strictly smaller remaining gap, never the
+        same one repeated; see `index_workspace`'s own gap-detection block
+        for how that next call rediscovers it.
         """
-        if not _DUAL_VECTOR_ENABLED or not chunks:
+        if file_mtimes and not _DUAL_VECTOR_ENABLED:
+            # No purpose collection is being maintained at all — leave
+            # purpose_cache untouched (not "complete") so a later run with
+            # dual-vector re-enabled treats these as unseen rather than
+            # wrongly skipping them; see _seed_purpose_cache_from_collection.
+            return
+        if not chunks:
+            if file_mtimes:
+                purpose_cache, _ = self._load_purpose_cache()
+                purpose_cache.update(file_mtimes)
+                self._save_purpose_cache(purpose_cache)
+            return
+        if not _DUAL_VECTOR_ENABLED:
             return
         total = sum(1 for c in chunks if is_symbol_bearing_chunk(c.symbol_name, c.node_type))
         if total == 0:
+            # Zero symbol-bearing chunks in this call is still a fully
+            # "considered" outcome for every file contributing to `chunks`
+            # — checkpoint them rather than leaving them a permanent gap
+            # (e.g. a file with no functions/classes/etc, UPG-PURPOSE-
+            # RESUME-HOLE).
+            if file_mtimes:
+                purpose_cache, _ = self._load_purpose_cache()
+                purpose_cache.update(file_mtimes)
+                self._save_purpose_cache(purpose_cache)
             return
+
+        # UPG-PURPOSE-RESUME-HOLE: last-occurrence index per file, mirroring
+        # index_workspace Phase 3's file_last_chunk_idx checkpoint trick —
+        # tells us exactly when every chunk belonging to a file has been
+        # considered by the loop below (embedded + upserted, or skipped for
+        # not being symbol-bearing).
+        file_last_chunk_idx: dict[str, int] = {}
+        purpose_cache: dict[str, float] = {}
+        if file_mtimes:
+            for idx, c in enumerate(chunks):
+                file_last_chunk_idx[c.file_path] = idx
+            purpose_cache, _ = self._load_purpose_cache()
 
         phase_start = time.time()
         done = 0
@@ -803,6 +954,29 @@ class CodeIndexer:
                         batch_embeddings, _UPSERT_BATCH_SIZE, op_label="upsert (purpose)",
                     )
                     done += len(batch_ids)
+
+                # Checkpoint purpose completion the same cadence Phase 3
+                # checkpoints content: every `checkpoint_every_batches`
+                # batches, and unconditionally on the last one — so a crash
+                # mid-pass never loses more than that many batches' worth of
+                # already-completed files (UPG-PURPOSE-RESUME-HOLE).
+                batch_num = i // _EMBED_BATCH_SIZE + 1
+                is_last_batch = i + len(batch) >= len(chunks)
+                if file_mtimes and (
+                    batch_num % _INDEX_GOVERNOR_CHECKPOINT_EVERY_BATCHES == 0 or is_last_batch
+                ):
+                    processed_upto = i + len(batch) - 1
+                    newly_done = {
+                        fpath: file_mtimes[fpath]
+                        for fpath, last_idx in file_last_chunk_idx.items()
+                        if fpath in file_mtimes
+                        and last_idx <= processed_upto
+                        and purpose_cache.get(fpath) != file_mtimes[fpath]
+                    }
+                    if newly_done:
+                        purpose_cache.update(newly_done)
+                        self._save_purpose_cache(purpose_cache)
+
                 if governed:
                     pace(
                         time.time() - batch_start,
@@ -818,6 +992,7 @@ class CodeIndexer:
         self,
         chunks: list[CodeChunk],
         governed: bool,
+        file_mtimes: dict[str, float] | None = None,
     ) -> None:
         """UPG-PURPOSE-PASS-DEFERRAL: hand the purpose-vector pass to
         `_purpose_executor` (max_workers=1, see __init__) and return
@@ -829,16 +1004,25 @@ class CodeIndexer:
         inline or on this background thread. `purpose_vectors_pending`
         reads True from the moment this is submitted until the closure's
         `finally` clears it, whether the pass succeeds, raises, or the
-        process is killed mid-pass (in which case the count is simply lost
-        with the process — nothing to clean up, the next
-        `purpose_vectors_pending` read after restart starts at 0 and a
-        fresh index_workspace() call re-evaluates from scratch)."""
+        process is killed mid-pass.
+
+        `file_mtimes` (UPG-PURPOSE-RESUME-HOLE) is threaded straight through
+        to `_upsert_purpose_vectors`, unchanged — its own per-batch
+        checkpointing runs exactly the same way on this background thread
+        as it would inline, so a process kill mid-deferred-pass loses at
+        most the batch in flight, not the whole call: the next ordinary
+        `index_workspace()` re-detects and re-dispatches only the files
+        that never got checkpointed, never the same gap it already closed
+        (this is the crash this mechanism specifically targets — see
+        UPG-PURPOSE-RESUME-HOLE's investigation, where a deferred pass lost
+        between a content checkpoint and its own end-of-run purpose pass
+        left the gap permanent under the pre-fix code)."""
         with self._purpose_pending_lock:
             self._purpose_pending_count += 1
 
         def _run() -> None:
             try:
-                self._upsert_purpose_vectors(chunks, governed=governed)
+                self._upsert_purpose_vectors(chunks, governed=governed, file_mtimes=file_mtimes)
             except Exception:
                 # Best-effort background pass: never let a failure here
                 # surface anywhere but the log. Purpose vectors for the
@@ -915,6 +1099,133 @@ class CodeIndexer:
                 pass
 
     # ------------------------------------------------------------------
+    # Purpose-vector completion cache (UPG-PURPOSE-RESUME-HOLE) — see
+    # _PURPOSE_CACHE_FILE's docstring for why this is a separate file/cache
+    # from the mtime cache rather than another key inside it.
+    # ------------------------------------------------------------------
+
+    def _purpose_cache_path(self) -> Path:
+        return self._db_dir / _PURPOSE_CACHE_FILE
+
+    def _load_purpose_cache(self) -> tuple[dict[str, float], bool]:
+        """Load the purpose-completion cache: file_path -> the content mtime
+        as of which that file's purpose vectors are confirmed fully written.
+
+        Returns `(cache, existed)`. `existed=False` covers both a missing
+        file and a schema-version mismatch (same treatment as
+        `_load_mtime_cache_with_reason`) — `index_workspace()` uses it to
+        tell "this workspace has never run the purpose-completion tracker
+        before" (triggering a one-time reconciliation seed against the
+        actual purpose collection, `_seed_purpose_cache_from_collection`)
+        apart from "this file just doesn't have an entry yet" (an ordinary,
+        cheap incremental gap once the cache exists) — without that
+        distinction, upgrading to this mechanism would make every
+        already-healthy file in an existing large workspace look like a
+        purpose gap and force a needless corpus-wide purpose-only reindex.
+        """
+        path = self._purpose_cache_path()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}, False
+        stored_version = raw.pop(_PURPOSE_CACHE_SCHEMA_KEY, None)
+        if stored_version != INDEXING_SCHEMA_VERSION:
+            return {}, False
+        return raw, True
+
+    def _save_purpose_cache(self, cache: dict[str, float]) -> None:
+        with self._purpose_cache_lock:
+            path = self._purpose_cache_path()
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                payload = dict(cache)
+                payload[_PURPOSE_CACHE_SCHEMA_KEY] = INDEXING_SCHEMA_VERSION
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            except OSError:
+                pass
+
+    def _seed_purpose_cache_from_collection(
+        self, mtime_cache: dict[str, float],
+    ) -> dict[str, float]:
+        """One-time migration seed (UPG-PURPOSE-RESUME-HOLE), called only
+        when `_load_purpose_cache()` reports no usable cache exists yet — a
+        pre-this-mechanism workspace, or one whose cache went stale via an
+        INDEXING_SCHEMA_VERSION bump. Marks every file that already has at
+        least one chunk in the purpose collection as complete, from a single
+        paginated metadata-only scan of `self._purpose_collection` (the same
+        shape/cost as `_collection_file_paths()`'s existing per-run scan of
+        the body collection for orphan pruning — paid once here, not on
+        every subsequent run, since after this call the cache file exists).
+
+        Files with NO purpose-collection presence are deliberately left
+        unseeded — both real cases (a file affected by the historic
+        deferred-pass-lost-on-crash gap, and a file that legitimately has
+        zero symbol-bearing chunks, e.g. pure markdown) fall through to
+        `index_workspace()`'s normal gap detection on this same run, and
+        `_upsert_purpose_vectors`'s own per-file checkpoint resolves both
+        correctly the first time it processes them — a file-presence check
+        alone cannot tell those two cases apart, but processing them once
+        settles it either way, permanently.
+        """
+        if not mtime_cache:
+            return {}
+        files_with_purpose = self._collection_file_paths(self._purpose_collection)
+        return {
+            fpath: mtime for fpath, mtime in mtime_cache.items()
+            if fpath in files_with_purpose
+        }
+
+    def _fetch_body_chunks_for_files(self, file_paths: set[str]) -> list[CodeChunk]:
+        """Reconstruct `CodeChunk`s for `file_paths` from their already-
+        indexed body-collection rows (UPG-PURPOSE-RESUME-HOLE), for the
+        purpose-only backfill path: these files' body content is current
+        (they are staying out of this run's `to_index`), so no re-chunking
+        (tree-sitter) is needed — the body collection already holds exactly
+        the chunk id/content/metadata `_upsert_purpose_vectors` needs to
+        build purpose text. Batches the `$in` where-clause over
+        `_UPSERT_BATCH_SIZE`-sized groups of paths (SQLite's 999-variable
+        limit) and paginates each group's own result set the same way
+        `_collection_file_paths` does. Rows across different files' batches
+        are not guaranteed contiguous in the returned list, but
+        `_upsert_purpose_vectors`'s checkpoint only needs each file's LAST
+        occurrence index, which is correct regardless of interleaving — see
+        that method's checkpoint comment.
+        """
+        if not file_paths:
+            return []
+        chunks: list[CodeChunk] = []
+        paths = list(file_paths)
+        for i in range(0, len(paths), _UPSERT_BATCH_SIZE):
+            batch_paths = paths[i:i + _UPSERT_BATCH_SIZE]
+            offset = 0
+            while True:
+                with _timed_chroma_call("get"):
+                    page = self._collection.get(
+                        where={"file_path": {"$in": batch_paths}},
+                        include=["documents", "metadatas"],
+                        limit=1000,
+                        offset=offset,
+                    )
+                ids = page["ids"]
+                if not ids:
+                    break
+                for cid, doc, meta in zip(ids, page["documents"], page["metadatas"]):
+                    chunks.append(CodeChunk(
+                        chunk_id=cid,
+                        content=doc,
+                        file_path=meta.get("file_path", ""),
+                        language=meta.get("language", ""),
+                        node_type=meta.get("node_type", ""),
+                        start_line=meta.get("start_line", 0),
+                        end_line=meta.get("end_line", 0),
+                        symbol_name=meta.get("symbol_name", ""),
+                    ))
+                offset += len(ids)
+                if len(ids) < 1000:
+                    break
+        return chunks
+
+    # ------------------------------------------------------------------
     # Embedding-model version stamp (UPG-EMBEDDER-SWAP-GRANITE) — see
     # _EMBED_MODEL_STAMP_FILE's docstring for why this is a separate file
     # from the mtime cache rather than another key inside it.
@@ -948,16 +1259,22 @@ class CodeIndexer:
     # Orphan pruning — reconcile the collection against the current walk
     # ------------------------------------------------------------------
 
-    def _collection_file_paths(self) -> set[str]:
-        """Distinct file_path values currently stored in the collection.
-
-        Metadata-only paginated scan (no documents/embeddings loaded)."""
+    def _collection_file_paths(self, collection=None) -> set[str]:
+        """Distinct file_path values currently stored in `collection`
+        (default: the body collection — every pre-existing call site relies
+        on this default). Metadata-only paginated scan (no documents/
+        embeddings loaded). Also used against `self._purpose_collection`
+        by `_seed_purpose_cache_from_collection` (UPG-PURPOSE-RESUME-HOLE)
+        — same shape, so one paginated-scan implementation serves both
+        collections rather than a second hand-maintained copy."""
+        if collection is None:
+            collection = self._collection
         _PAGE = 1000
         paths: set[str] = set()
         offset = 0
         while True:
             with _timed_chroma_call("get"):
-                page = self._collection.get(include=["metadatas"], limit=_PAGE, offset=offset)
+                page = collection.get(include=["metadatas"], limit=_PAGE, offset=offset)
             ids = page["ids"]
             if not ids:
                 break
@@ -971,13 +1288,22 @@ class CodeIndexer:
         return paths
 
     def _prune_orphaned_chunks(
-        self, should_index_paths: set[str], mtime_cache: dict[str, float],
+        self,
+        should_index_paths: set[str],
+        mtime_cache: dict[str, float],
+        purpose_cache: dict[str, float] | None = None,
     ) -> int:
         """Delete chunks for indexed files no longer in the walk set. Returns count.
 
         Files become orphaned when they're newly excluded (.vectrignore/.gitignore),
         deleted, or moved out of all roots. `mtime_cache` is mutated in place so the
         pruned entries don't linger and re-trigger a phantom skip. (UPG-8.4)
+
+        `purpose_cache` (UPG-PURPOSE-RESUME-HOLE), when given, is pruned the
+        same way — an orphaned file's stale purpose-completion entry is
+        harmless either way (gap detection already excludes anything not in
+        `should_index_paths`), but leaving it would let the cache grow
+        unboundedly for a workspace whose files churn over time.
         """
         try:
             indexed_paths = self._collection_file_paths()
@@ -987,6 +1313,8 @@ class CodeIndexer:
         for path in orphaned:
             self.delete_file(path)
             mtime_cache.pop(path, None)
+            if purpose_cache is not None:
+                purpose_cache.pop(path, None)
         if orphaned:
             logger.info("Pruned chunks for %d orphaned/excluded file(s)", len(orphaned))
         return len(orphaned)
@@ -1030,6 +1358,7 @@ class CodeIndexer:
             _PAGE = 1000
             chunks: dict[str, int] = {}
             files: dict[str, set[str]] = {}
+            file_counts: dict[str, int] = {}
             offset = 0
             while True:
                 with _timed_chroma_call("get"):
@@ -1045,11 +1374,13 @@ class CodeIndexer:
                     fp = meta.get("file_path")
                     if fp:
                         files.setdefault(lang, set()).add(fp)
+                        file_counts[fp] = file_counts.get(fp, 0) + 1
                 offset += len(ids)
                 if len(ids) < _PAGE:
                     break
             self._lang_chunk_counts = chunks
             self._lang_files = files
+            self._file_chunk_counts = file_counts
             self._stats_seeded = True
 
     def _apply_chunk_delta(self, metadatas: list[dict], sign: int) -> None:
@@ -1059,25 +1390,60 @@ class CodeIndexer:
         arithmetic — never around a ChromaDB or embedding call — so this
         lock is never the thing a request handler waits on
         (UPG-REST-STARVATION).
+
+        On removal, a file path is dropped from its `_lang_files` bucket only
+        when its LAST body chunk goes (tracked via `_file_chunk_counts`),
+        not on any deletion batch that merely touches the file
+        (UPG-CHUNK-DELTA-PARTIAL-FILE-DISCARD). Today every delete site is
+        whole-file (`_delete_chunks_for_file`, the only caller with
+        `sign=-1`, deletes exactly the `where={"file_path": ...}` result set),
+        so the two behaviours coincide — but the moment any partial-chunk
+        deletion path exists (incremental re-chunk, per-symbol invalidation,
+        quality-based eviction), discarding on first touch would silently
+        undercount `indexed_file_paths`/`indexed_language_stats()["files"]`
+        while `total_chunks` stayed right.
         """
         if not metadatas:
             return
         with self._stats_lock:
-            for meta in metadatas:
-                lang = meta.get("language")
-                if not lang:
-                    continue
-                self._lang_chunk_counts[lang] = max(
-                    0, self._lang_chunk_counts.get(lang, 0) + sign
-                )
-                fp = meta.get("file_path")
-                if sign > 0:
+            if sign > 0:
+                for meta in metadatas:
+                    lang = meta.get("language")
+                    if not lang:
+                        continue
+                    self._lang_chunk_counts[lang] = (
+                        self._lang_chunk_counts.get(lang, 0) + 1
+                    )
+                    fp = meta.get("file_path")
                     if fp:
                         self._lang_files.setdefault(lang, set()).add(fp)
-                elif fp:
-                    files = self._lang_files.get(lang)
-                    if files is not None:
-                        files.discard(fp)
+                        self._file_chunk_counts[fp] = (
+                            self._file_chunk_counts.get(fp, 0) + 1
+                        )
+            else:
+                removed_per_file: dict[str, int] = {}
+                for meta in metadatas:
+                    lang = meta.get("language")
+                    if not lang:
+                        continue
+                    self._lang_chunk_counts[lang] = max(
+                        0, self._lang_chunk_counts.get(lang, 0) - 1
+                    )
+                    fp = meta.get("file_path")
+                    if fp:
+                        removed_per_file[fp] = removed_per_file.get(fp, 0) + 1
+                # A file's chunks all share one language, so scanning every
+                # bucket's set here costs O(languages) — trivial next to the
+                # per-chunk loop above, and immune to any historical metadata
+                # having filed the path under an unexpected bucket.
+                for fp, n_removed in removed_per_file.items():
+                    remaining = self._file_chunk_counts.get(fp, 0) - n_removed
+                    if remaining > 0:
+                        self._file_chunk_counts[fp] = remaining
+                    else:
+                        self._file_chunk_counts.pop(fp, None)
+                        for files in self._lang_files.values():
+                            files.discard(fp)
 
     def _refresh_chunk_count_caches(self) -> None:
         """Refresh `total_chunks`/`total_purpose_chunks` from a real, one-off
@@ -1150,17 +1516,74 @@ class CodeIndexer:
             return self._purpose_pending_count > 0
 
     @property
+    def purpose_backfill_pending_files(self) -> int:
+        """Count of files `index_workspace()` most recently found to have
+        current body content but incomplete purpose vectors, as of the start
+        of that run (UPG-PURPOSE-RESUME-HOLE) — an interrupted deferred
+        pass, or a first run after upgrading to this mechanism. Distinct
+        from `purpose_vectors_pending` (which reports whether a pass is
+        *currently running*, of any kind): this reports the *size of the gap
+        last detected*, so `/v1/status` can distinguish "nothing is wrong"
+        from "N files are still waiting on a backfill that hasn't started
+        yet" instead of only "something is in flight right now". 0 once a
+        run's own dispatch has been sent for backfill (whether or not that
+        backfill has actually landed for the deferred/background case —
+        `purpose_vectors_pending` covers that window)."""
+        return self._purpose_backfill_pending_count
+
+    @property
     def last_indexed_ts(self) -> float:
         return self._last_indexed
 
     @property
     def indexed_file_count(self) -> int:
-        return len(self._indexed_files)
+        """Distinct files present in the body collection (UPG-STATUS-WARMSTART-FILES).
+
+        Derived from the same seeded / incrementally-maintained per-language
+        metadata cache `indexed_language_stats()` reads — actual chunk
+        metadata, i.e. exactly what `total_chunks` counts — so a daemon
+        restart over an already-indexed workspace reports the persisted file
+        count immediately instead of `indexed_files: 0` sitting next to an
+        already-populated `total_chunks` on `/v1/status`. That mismatch was
+        the old behaviour: this used to read `_indexed_files`, the set of
+        files THIS PROCESS has walked, which stays empty until some in-process
+        index run touches it (the wart once forced the benchmark runners to
+        refuse scoring on `indexed_files==0`). `_recreate_collections()`
+        resets the cache together with `_total_chunks_cache`, so both counters
+        also fall to 0 and climb together through a forced rebuild.
+        `_indexed_files` itself keeps its separate, narrower meaning — files
+        walked this process — feeding only `index_workspace()`'s return value;
+        `indexed_file_paths` below reads this same metadata cache, so the two
+        properties can no longer disagree across a warm-start window
+        (UPG-WARMSTART-FINGERPRINT-STARVATION).
+        """
+        self._ensure_stats_seeded()
+        with self._stats_lock:
+            return sum(len(files) for files in self._lang_files.values())
 
     @property
     def indexed_file_paths(self) -> list[str]:
-        """Return a copy of all file paths currently in the index."""
-        return list(self._indexed_files)
+        """All file paths currently present in the body collection.
+
+        Derived from the SAME seeded / incrementally-maintained per-language
+        metadata cache `indexed_file_count` reads — actual chunk metadata, i.e.
+        exactly the corpus that property and `total_chunks` describe. It
+        previously returned `_indexed_files`, the set of files THIS PROCESS has
+        walked, which stays empty across a daemon restart's warm-start window
+        until some in-process index run touches it (UPG-WARMSTART-FINGERPRINT-
+        STARVATION). Every consumer silently degraded over that window: the
+        workspace fingerprint behind `/v1/status`'s strategy rationale was
+        computed from zero files, and vectr_map rendered its passport import
+        graph over an empty file list — silently, because a fingerprint over an
+        empty path set still returns a well-formed answer indistinguishable
+        from a genuinely fileless workspace. Metadata-derived, consumers see
+        the persisted corpus immediately at construction (`_ensure_stats_seeded`
+        runs eagerly in `__init__`), and the property now honours its own
+        documented "currently in the index" contract.
+        """
+        self._ensure_stats_seeded()
+        with self._stats_lock:
+            return [fp for files in self._lang_files.values() for fp in files]
 
     def indexed_language_stats(self) -> dict[str, dict[str, int]]:
         """Per-language coverage in the collection: `{lang: {"files", "chunks"}}`.

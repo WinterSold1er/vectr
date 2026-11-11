@@ -11,8 +11,9 @@ give; the gate only orders, thresholds, and concatenates.
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict, deque
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from agent.config import (
     PROACTIVE_ENVELOPE_CLOSE,
@@ -64,6 +65,12 @@ _ENVELOPE_OPEN_AGENT = PROACTIVE_ENVELOPE_OPEN_AGENT
 _ENVELOPE_OPEN_HUMAN = PROACTIVE_ENVELOPE_OPEN_HUMAN
 _ENVELOPE_CLOSE = PROACTIVE_ENVELOPE_CLOSE
 
+# Sort-key stand-in for a candidate whose first path-mention offset was never
+# computed (or has no mention at all): it must order AFTER every candidate
+# that does carry a mention, never before offset 0 (UPG-PROXY-WEAK-TIER-
+# TIEBREAK). Only ever compared against ints, never returned.
+_UNMENTIONED_SORT_KEY = float("inf")
+
 
 def _envelope_open_for(selected: list[Candidate]) -> str:
     """Pick the envelope-open variant for one packed block (UPG-PROXY-INJECT-
@@ -93,24 +100,75 @@ class SessionLedger:
     Suppresses re-injecting the same item within a cooldown window (last N
     emitted anchor ids). Insertion-ordered; the oldest id is evicted once the
     capacity is exceeded.
+
+    UPG-PROXY-COOLDOWN-NO-TIME-DECAY: an entry may also carry a time-to-
+    live. `ttl_seconds=None` (the historical behaviour, and what every
+    pre-existing direct construction gets) is a pure count ring — an id
+    stays suppressed until `capacity` OTHER distinct ids cycle through,
+    however long that takes. With a TTL, an entry stops suppressing once it
+    is older than the TTL regardless of ring position: under the proxy
+    channel's process-scoped session key (UPG-PROXY-COOLDOWN-SESSION-
+    IDENTITY) "last 30" spans the whole proxy process lifetime, so without
+    a time bound a note that becomes genuinely relevant again hours later
+    stays suppressed until 30 other anchors have cycled. The capacity bound
+    is unchanged and still applies on top of the TTL — the TTL only ever
+    EXPIRES entries early, never extends retention past the ring.
+
+    The clock is injected (`now_fn`) so a test can advance time arbitrarily
+    without sleeping; production uses `time.monotonic()`, which cannot go
+    backwards or jump with wall-clock adjustments — elapsed-time policy
+    must not be sensitive to either.
     """
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        ttl_seconds: float | None = None,
+        now_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._capacity = max(1, capacity)
+        self._ttl_seconds = ttl_seconds
+        self._now_fn = now_fn
         self._ring: deque[str] = deque()
-        self._seen: set[str] = set()
+        # UPG-PROXY-COOLDOWN-NO-TIME-DECAY: set -> dict (anchor_id -> last-
+        # delivery monotonic ts). Membership semantics are unchanged; the
+        # timestamp exists only when a TTL is configured.
+        self._seen: dict[str, float] = {}
+
+    def _expire(self) -> None:
+        """Drop entries older than the TTL. No-op when no TTL is configured.
+        A linear sweep over at most `capacity` entries; the ring is rebuilt
+        only when something actually expired."""
+        if self._ttl_seconds is None or not self._seen:
+            return
+        now = self._now_fn()
+        expired = [aid for aid, ts in self._seen.items() if now - ts >= self._ttl_seconds]
+        if not expired:
+            return
+        for aid in expired:
+            del self._seen[aid]
+        self._ring = deque(aid for aid in self._ring if aid in self._seen)
 
     def seen(self, anchor_id: str) -> bool:
+        self._expire()
         return anchor_id in self._seen
 
     def add(self, anchor_id: str) -> None:
+        self._expire()
         if anchor_id in self._seen:
+            # Refresh: suppression runs from the MOST RECENT delivery of
+            # this anchor, not its first. Also moves the id to the ring's
+            # tail so capacity eviction (oldest-inserted first) evicts the
+            # least-recently-delivered id, matching the refresh semantics.
+            self._seen[anchor_id] = self._now_fn()
+            self._ring.remove(anchor_id)
+            self._ring.append(anchor_id)
             return
         self._ring.append(anchor_id)
-        self._seen.add(anchor_id)
+        self._seen[anchor_id] = self._now_fn()
         while len(self._ring) > self._capacity:
             old = self._ring.popleft()
-            self._seen.discard(old)
+            self._seen.pop(old, None)
 
 
 class LedgerStore:
@@ -121,16 +179,24 @@ class LedgerStore:
     unbounded state; the least-recently-used session's ledger is dropped first.
     """
 
-    def __init__(self, cooldown_items: int, max_sessions: int = 512) -> None:
+    def __init__(
+        self,
+        cooldown_items: int,
+        max_sessions: int = 512,
+        ttl_seconds: float | None = None,
+        now_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._cooldown_items = cooldown_items
         self._max_sessions = max(1, max_sessions)
+        self._ttl_seconds = ttl_seconds
+        self._now_fn = now_fn
         self._ledgers: "OrderedDict[str, SessionLedger]" = OrderedDict()
         self._lock = threading.Lock()
 
     def _ledger_for(self, session_id: str) -> SessionLedger:
         led = self._ledgers.get(session_id)
         if led is None:
-            led = SessionLedger(self._cooldown_items)
+            led = SessionLedger(self._cooldown_items, self._ttl_seconds, self._now_fn)
             self._ledgers[session_id] = led
             while len(self._ledgers) > self._max_sessions:
                 self._ledgers.popitem(last=False)
@@ -188,13 +254,18 @@ class ProactiveGate:
         max_chars_per_event: int,
         cooldown_items: int,
         max_weak_structural_items: int,
+        cooldown_ttl_seconds: float | None = None,
         ledger_store: LedgerStore | None = None,
     ) -> None:
         self._min_similarity = min_similarity
         self._max_items = max(0, max_items_per_event)
         self._max_chars = max(0, max_chars_per_event)
         self._max_weak_structural_items = max(0, max_weak_structural_items)
-        self._ledger = ledger_store or LedgerStore(cooldown_items)
+        # UPG-PROXY-COOLDOWN-NO-TIME-DECAY: threaded into the default ledger
+        # store; an explicitly passed `ledger_store` configures its own TTL.
+        self._ledger = ledger_store or LedgerStore(
+            cooldown_items, ttl_seconds=cooldown_ttl_seconds
+        )
 
     def select(
         self,
@@ -316,15 +387,47 @@ class ProactiveGate:
         if not eligible:
             return InjectionResult.empty()
 
-        # 5. Deterministic order: score desc, provenance rank asc, anchor_id asc.
-        eligible.sort(key=lambda c: (-c.score, c.provenance_rank, c.anchor_id))
+        # 5. Deterministic order: score desc, then — UPG-PROXY-WEAK-TIER-
+        #    TIEBREAK — relevance among EQUAL-score candidates, desc/asc
+        #    respectively, then provenance rank asc, anchor_id asc.
+        #
+        #    Every Tier-D ("weak mention") candidate scores exactly
+        #    `structural_scores.mention`, so before this tie-break the single
+        #    weak item the per-event cap admits was chosen by provenance rank
+        #    + anchor_id — insertion-order luck carrying no relevance signal
+        #    at all (measured: two runs of identical product code over two
+        #    orderings of the same store landed 71.9% vs 100% strict
+        #    precision, with 16 of 20 weak slots going to notes whose subject
+        #    was a DIFFERENT file). The two added terms are structural
+        #    properties of the note-vs-path match computed by the matcher:
+        #    how many times the matched file's basename occurs in the note
+        #    body at a path boundary (more occurrences => more likely the
+        #    note's SUBJECT is this file, not a drive-by name-drop), and how
+        #    early the first occurrence lands (a subject names its file in
+        #    the title/opening; a passing mention sits mid-list). Both
+        #    default inert (0 / unmentioned) for hand-built and non-note
+        #    candidates, so every pre-existing equal-score ordering —
+        #    including the structural-vs-semantic provenance tie-break
+        #    pinned by test_structural_outranks_semantic_on_tie — is
+        #    unchanged. Tuning `structural_scores.mention` itself is NOT
+        #    what happens here: that would change which TIER wins against
+        #    the semantic band, not which Tier-D item wins against another.
+        eligible.sort(
+            key=lambda c: (
+                -c.score,
+                -c.path_mention_count,
+                c.path_mention_first_offset if c.path_mention_first_offset >= 0 else _UNMENTIONED_SORT_KEY,
+                c.provenance_rank,
+                c.anchor_id,
+            )
+        )
 
         # 6. Budget: at most K items and T chars. Each candidate `line` is capped
         #    to T by the matcher, so a single item always fits; stop at the first
         #    item that would overflow the running character total.
         #
         #    UPG-PROXY-INJECT-PRECISION lever 3: at most
-        #    `max_weak_structural_items` Tier-C ("weak mention") structural
+        #    `max_weak_structural_items` Tier-D ("weak mention") structural
         #    candidates are selected per delivery moment — a check against
         #    `Candidate.structural_tier`, a STRUCTURAL PROPERTY of the match
         #    computed by the matcher, never a read of window/query content. A

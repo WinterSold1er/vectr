@@ -6,9 +6,10 @@ Two layers:
     no I/O — covers tie-breaking, revert-of-revert, and the
     audit-only (stale_flagged/promoted) events that never change state.
   - `WorkingContextStore` integration — `contradicts=` on remember(),
-    `revoke_note`/`reinstate_note`, the migration writes for `supersedes`/
-    `promote`, anti-memory rendering, proxy-anchor drift -> `stale_flagged`,
-    and `forget()`'s cascade delete.
+    `revoke_note`/`reinstate_note`, `supersede_note` (post-hoc
+    retirement, UPG-NOTE-RETIRE-POST-HOC), the migration writes for
+    `supersedes`/`promote`, anti-memory rendering, proxy-anchor drift ->
+    `stale_flagged`, and `forget()`'s cascade delete.
 """
 from __future__ import annotations
 
@@ -236,6 +237,176 @@ class TestRevokeReinstate:
         assert states[note_id]["state"] == "active"
 
 
+class TestPostHocSupersede:
+    """UPG-NOTE-RETIRE-POST-HOC: supersession reached against an
+    ALREADY-STORED note — the transition write-time `supersedes=` cannot
+    reach (a replacement written without it, an old note only later
+    discovered to be already-superseded-in-substance). Same lifecycle STATE
+    as write-time `superseded`, but a distinct event KIND
+    (`superseded_post_hoc`) so the audit trail records this was a post-hoc
+    caller judgment rather than born of a write."""
+
+    def _stale_rows(self, store, ws, note_id):
+        with store._conn() as conn:
+            return conn.execute(
+                "SELECT event, actor, reason, payload FROM note_events "
+                "WHERE workspace = ? AND note_id = ? ORDER BY id",
+                (ws, note_id),
+            ).fetchall()
+
+    def test_supersede_appends_post_hoc_event_folding_to_superseded(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "the API returns a list")
+        new_id = store.remember(ws, "the API returns a dict")
+        ok = store.supersede_note(ws, note_id, superseded_by=new_id, reason="recorded without supersedes=", actor="agent")
+        assert ok is True
+        rows = self._stale_rows(store, ws, note_id)
+        last = rows[-1]
+        # Distinct KIND from the write-time path — machine-queryable honesty.
+        assert last["event"] == "superseded_post_hoc"
+        assert last["actor"] == "agent"
+        assert last["reason"] == "recorded without supersedes="
+        assert last["payload"] == str(new_id)
+        states = store.note_event_states(ws, [store.get_note(ws, note_id)])
+        # But the SAME lifecycle state as write-time supersession.
+        assert states[note_id]["state"] == "superseded"
+
+    def test_supersede_sets_the_same_tombstone_columns_as_write_time(self, tmp_path) -> None:
+        """Both retirement paths land in the identical tombstone shape —
+        same columns, same recall behaviour."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        wt_old = store.remember(ws, "old checkpoint")
+        store.remember(ws, "replacement checkpoint", supersedes=wt_old)
+        ph_old = store.remember(ws, "another old note")
+        ph_new = store.remember(ws, "its replacement")
+        store.supersede_note(ws, ph_old, superseded_by=ph_new)
+        for target in (wt_old, ph_old):
+            note = store.get_note(ws, target)
+            assert note.valid_until is not None
+            assert note.superseded_at is not None
+        assert store.get_note(ws, ph_old).superseded_by_note_id == ph_new
+        # And the columns behave the same way recall cares about.
+        active = store.recall(ws)
+        assert all(n.note_id not in (wt_old, ph_old) for n in active)
+        history_ids = {n.note_id for n in store.recall(ws, include_superseded=True)}
+        assert {wt_old, ph_old} <= history_ids
+
+    def test_retired_note_never_fires_again(self, tmp_path) -> None:
+        """evaluate_note keys on valid_until, not the event log — the column
+        write is load-bearing for exclusion from trigger firing too."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(
+            ws, "a fired-at-boot note", kind="directive", triggers=[{"event": "session-start"}],
+        )
+        formatted, fired_before = store.fire_and_format(ws, event="session-start")
+        assert note_id in fired_before
+        store.supersede_note(ws, note_id, reason="moved on")
+        _, fired_after = store.fire_and_format(ws, event="session-start")
+        assert note_id not in fired_after
+
+    def test_retired_note_renders_superseded_badge_never_revoked_deterrent(self, tmp_path) -> None:
+        """The brief's rendering contract: a retired-by-supersession note
+        must be distinguishable from a revoked one — factual badge, raw
+        content intact, no 'Previously believed' framing."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "the deploy script lives in scripts/deploy.sh")
+        new_id = store.remember(ws, "deploy moved to CI")
+        store.supersede_note(ws, note_id, superseded_by=new_id, actor="human", reason="consolidated")
+        rendered = store.format_notes_for_llm([store.get_note(ws, note_id)], detail="full")
+        assert "[REVOKED]" not in rendered
+        assert "Previously believed" not in rendered
+        assert f"[superseded by @note#{new_id}" in rendered
+        assert "the deploy script lives in scripts/deploy.sh" in rendered  # content survives, badged
+
+    def test_supersede_without_successor_renders_unlinked_badge(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "orphaned claim")
+        store.supersede_note(ws, note_id)
+        rendered = store.format_notes_for_llm([store.get_note(ws, note_id)], detail="full")
+        assert "[superseded," in rendered
+        assert "[REVOKED]" not in rendered
+        active = store.recall(ws)
+        assert all(n.note_id != note_id for n in active)
+
+    def test_supersede_nonexistent_note_returns_false(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        assert store.supersede_note(ws, 999999) is False
+
+    def test_missing_successor_rejected_before_any_mutation(self, tmp_path) -> None:
+        """Same half-applied-write guard as remember()'s supersedes path: a
+        bad successor id must leave the target untouched."""
+        import pytest
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "a note")
+        with pytest.raises(ValueError):
+            store.supersede_note(ws, note_id, superseded_by=999999)
+        note = store.get_note(ws, note_id)
+        assert note.valid_until is None  # not tombstoned
+        events = self._stale_rows(store, ws, note_id)
+        assert [e["event"] for e in events] == ["created"]  # nothing appended
+
+    def test_self_successor_rejected(self, tmp_path) -> None:
+        import pytest
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "a note")
+        with pytest.raises(ValueError):
+            store.supersede_note(ws, note_id, superseded_by=note_id)
+
+    def test_supersede_rejects_system_actor(self, tmp_path) -> None:
+        """`system` is reserved for the deterministic transitions — deciding
+        a stored note is already-superseded is always a judgment call."""
+        import pytest
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "a finding")
+        with pytest.raises(ValueError):
+            store.supersede_note(ws, note_id, actor="system")
+
+    def test_human_provenance_write_boundary_guard(self, tmp_path) -> None:
+        """Same inversion hole remember()'s supersedes guard closes: an
+        agent-actor call may not silence a human-provenance note; only a
+        human-actor call may."""
+        import pytest
+        store, ws = _store(tmp_path), str(tmp_path)
+        human_id = store.remember(ws, "a human-recorded rule", provenance="human")
+        with pytest.raises(ValueError):
+            store.supersede_note(ws, human_id, actor="agent")
+        note = store.get_note(ws, human_id)
+        assert note.valid_until is None
+        assert store.supersede_note(ws, human_id, actor="human") is True
+
+    def test_reinstate_reverses_a_post_hoc_supersession(self, tmp_path) -> None:
+        """THE reversal contract: retire then reinstate must put the note
+        back into default recall with its tombstone columns cleared — one
+        appended event, never a rewrite of the retirement."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        note_id = store.remember(ws, "wrongly retired")
+        new_id = store.remember(ws, "its replacement")
+        store.supersede_note(ws, note_id, superseded_by=new_id)
+        assert all(n.note_id != note_id for n in store.recall(ws))
+        assert store.reinstate_note(ws, note_id, reason="retirement was wrong") is True
+        note = store.get_note(ws, note_id)
+        assert note.valid_until is None
+        assert note.superseded_at is None
+        assert note.superseded_by_note_id is None
+        assert any(n.note_id == note_id for n in store.recall(ws))
+        states = store.note_event_states(ws, [note])
+        assert states[note_id]["state"] == "active"
+
+    def test_reinstate_reverses_a_write_time_supersession_too(self, tmp_path) -> None:
+        """Pre-existing gap the post-hoc work closes: reinstate's own docstring
+        always promised 'return to active regardless of which terminal state
+        preceded it', but a write-time-superseded note stayed excluded from
+        default recall because its valid_until column was never cleared."""
+
+        store, ws = _store(tmp_path), str(tmp_path)
+        old_id = store.remember(ws, "old checkpoint")
+        store.remember(ws, "new checkpoint", supersedes=old_id)
+        assert all(n.note_id != old_id for n in store.recall(ws))
+        store.reinstate_note(ws, old_id)
+        assert any(n.note_id == old_id for n in store.recall(ws))
+        assert store.get_note(ws, old_id).valid_until is None
+
+
 class TestSupersedesPromoteMigration:
     def test_supersedes_writes_a_superseded_event(self, tmp_path) -> None:
         store, ws = _store(tmp_path), str(tmp_path)
@@ -315,6 +486,33 @@ class TestAntiMemoryRendering:
         formatted, fired_ids = store.fire_and_format(ws, event="session-start")
         assert note_id in fired_ids
         assert "Previously believed" in formatted
+
+    def test_revoked_note_deterrent_warning_survives_hook_channel_trim(self, tmp_path) -> None:
+        """UPG-DETERRENT-TITLE-ONLY: agent/trigger_engine.py's
+        `_trim_full_text_to_cap()` (the hook full-tier channel's own
+        per-kind cap trim, e.g. gotcha's 100-token/400-char cap) truncates
+        the raw `_format_full_block()` text with no template awareness at
+        all -- unlike the proxy channel, which used to reorder the
+        deterrent clause itself at render time. A long free-text
+        revocation `reason` (unbounded, no cap of its own) could previously
+        push the trim's right-truncation past the entire "Previously
+        believed (...)" clause and lose the "Do not re-derive..." warning
+        entirely -- exactly the silent-caveat-loss the design doc's
+        poisoning-mitigation row forbids ("visible caveat, never silent
+        suppression"). `_ANTI_MEMORY_TEMPLATE` now puts the warning FIRST,
+        so it survives any right-truncation as long as the cap fits the
+        warning sentence alone (~65 chars, far under every configured
+        per-kind cap)."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        long_reason = "this note was wrong because " + "the underlying assumption changed " * 12
+        note_id = store.remember(
+            ws, "a gotcha about retry timeouts", kind="gotcha",
+            triggers=[{"event": "session-start"}],
+        )
+        store.revoke_note(ws, note_id, long_reason)
+        formatted, fired_ids = store.fire_and_format(ws, event="session-start")
+        assert note_id in fired_ids
+        assert "Do not re-derive this from other sources without verification." in formatted
 
 
 class TestProxyAnchorDrift:

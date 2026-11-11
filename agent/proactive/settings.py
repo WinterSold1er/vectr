@@ -5,21 +5,22 @@ Layers deployment/runtime env vars over the bundled `config.yaml` defaults
 product-behaviour defaults live in yaml, runtime toggles in env. Nothing here is
 persisted.
 
-Also owns the localhost-only enforcement (design §10). There are two
-independent gates here, and only one of them is unconditional:
+Also owns the localhost-only enforcement (design §10). It is UNCONDITIONAL:
+`proactive_bind_is_loopback` is the runtime gate inside `proactive_context`,
+consulted before any config/channel check, so a non-loopback bind refuses
+proactive injection for every channel — the proxy channel included — regardless
+of the master switch or a client-supplied `channel` label. Proactive context
+reads the conversation, the most sensitive data on the machine, so this refusal
+cannot be a config toggle a caller can route around.
 
-- `enforce_proactive_bind`/`proactive_enabled` are CONFIG-GATED: they only
-  refuse a non-loopback bind when proactive is explicitly enabled
-  (`config_enabled=True`). A non-loopback bind with proactive left off is a
-  legitimate, supported team/shared-instance posture and must be allowed to
-  start.
-- `proactive_bind_is_loopback` is UNCONDITIONAL: the actual runtime gate
-  inside `proactive_context` consults it before any config/channel check, so
-  a non-loopback bind refuses proactive injection for every channel — the
-  proxy channel included — regardless of the master switch or a client-
-  supplied `channel` label. Proactive context reads the conversation, the
-  most sensitive data on the machine, so this refusal cannot be a config
-  toggle a caller can route around.
+UPG-PROACTIVE-DEAD-GATES removed two CONFIG-GATED siblings that had zero
+production call sites (`enforce_proactive_bind`, `proactive_enabled`, their
+`ProactiveRefused`, and the `proxy.enabled` config surface behind them): with
+the master switch defaulting on they could not distinguish opt-in from
+default-on, and the unconditional check above already enforces the same
+boundary at every runtime seam. A non-loopback bind with proactive left off is
+still a legitimate startup — nothing refuses it; only whether proactive
+context is ever served changes.
 """
 from __future__ import annotations
 
@@ -71,6 +72,18 @@ def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _ttl_or_none(seconds: float) -> float | None:
+    """Normalise the cooldown-TTL knob (UPG-PROXY-COOLDOWN-NO-TIME-DECAY).
+
+    Non-positive means "no time decay" — the historical pure-count cooldown
+    ring — and is normalised to `None` so the gate keeps one canonical
+    disabled representation. (`SessionLedger` treats only `None` as
+    decay-disabled; a literal 0 there would expire every entry instantly,
+    which is a different — and never-intended — behaviour.)
+    """
+    return seconds if seconds > 0 else None
+
+
 @dataclass(frozen=True)
 class ProactiveSettings:
     """Fully-resolved proactive-context settings (env over yaml defaults)."""
@@ -80,12 +93,19 @@ class ProactiveSettings:
     max_items_per_event: int
     max_chars_per_event: int
     cooldown_items: int
+    # UPG-PROXY-COOLDOWN-NO-TIME-DECAY: wall-clock suppression window for the
+    # SessionLedger cooldown ring, in seconds. An anchor stops suppressing once
+    # its last delivery is older than this, instead of staying suppressed until
+    # `cooldown_items` OTHER distinct anchors have cycled through the ring.
+    # None (normalised from any non-positive value) disables the decay entirely
+    # — the historical count-only behaviour. Wired into the gate via
+    # ProactiveGate(cooldown_ttl_seconds=...) in app/service.py.
+    cooldown_ttl_seconds: float | None
 
     matcher_structural_note: bool
     matcher_semantic_note: bool
     matcher_code_search: bool
 
-    proxy_enabled: bool
     proxy_host: str
     proxy_port: int
     proxy_upstream_base_url: str
@@ -134,6 +154,12 @@ class ProactiveSettings:
             cooldown_items=_env_int(
                 "VECTR_PROACTIVE_COOLDOWN", _c.PROACTIVE_COOLDOWN_ITEMS
             ),
+            cooldown_ttl_seconds=_ttl_or_none(
+                _env_float(
+                    "VECTR_PROACTIVE_COOLDOWN_TTL_SECONDS",
+                    _c.PROACTIVE_COOLDOWN_TTL_SECONDS,
+                )
+            ),
             matcher_structural_note=_env_bool(
                 "VECTR_PROACTIVE_MATCH_STRUCTURAL", _c.PROACTIVE_MATCHER_STRUCTURAL_NOTE
             ),
@@ -143,7 +169,6 @@ class ProactiveSettings:
             matcher_code_search=_env_bool(
                 "VECTR_PROACTIVE_MATCH_CODE", _c.PROACTIVE_MATCHER_CODE_SEARCH
             ),
-            proxy_enabled=_env_bool("VECTR_PROACTIVE_PROXY", _c.PROACTIVE_PROXY_ENABLED),
             proxy_host=_env_str("VECTR_PROACTIVE_PROXY_HOST", _c.PROACTIVE_PROXY_HOST),
             proxy_port=_env_int("VECTR_PROACTIVE_PROXY_PORT", _c.PROACTIVE_PROXY_PORT),
             proxy_upstream_base_url=_env_str(
@@ -255,11 +280,6 @@ def derive_provider_timeout_s(settings: ProactiveSettings) -> float:
     return min(derived, budget_s * 0.95)
 
 
-class ProactiveRefused(RuntimeError):
-    """Raised when proactive context is explicitly enabled under a non-loopback
-    (team / shared-instance) bind — a fail-closed refusal, never silent."""
-
-
 def _is_loopback(host: str) -> bool:
     """Loopback check — reuses the daemon's bind-guard helper rather than
     forking a second implementation (imported lazily to avoid an import cycle
@@ -318,45 +338,12 @@ def proactive_bind_is_loopback() -> bool:
     """Unconditional, channel-independent bind check for the proactive
     injection gate (UPG-PROXY-LOOPBACK-BYPASS).
 
-    Unlike `proactive_enabled`/`enforce_proactive_bind` below, this does NOT
-    take a `config_enabled` argument and must never be skipped by one: it is
+    This takes no config argument and must never be skipped by one — it is
     the runtime refusal `proactive_context` consults BEFORE any config or
     `channel` branch, so a non-loopback bind refuses proactive injection —
     including the proxy channel's own launch-is-consent exemption from the
     master switch — for every caller. A non-loopback bind with proactive
-    left off entirely is still a legitimate startup (see
-    `enforce_proactive_bind`'s docstring); this function only governs
-    whether proactive context is ever served, not whether the daemon may
-    start."""
+    left off entirely is still a legitimate startup; this function only
+    governs whether proactive context is ever served, not whether the daemon
+    may start."""
     return _is_loopback(_current_bind_host())
-
-
-def proactive_enabled(bind_host: str, config_enabled: bool, api_key: str | None = None) -> bool:
-    """Two-gate localhost enforcement (design §10). Both gates must pass.
-
-    Gate 1 (bind): a non-loopback bind (team-mode signature) forces proactive
-    OFF regardless of config. Gate 2 (config): proactive runs only when
-    explicitly enabled. `api_key` on a loopback bind (the shared-host hardening
-    model) does NOT by itself disable proactive mode — the deciding factor is
-    the non-loopback bind that defines team mode. Fail-closed: any ambiguity
-    resolves to OFF.
-    """
-    if not config_enabled:
-        return False
-    if not bind_host or not _is_loopback(bind_host):
-        return False
-    return True
-
-
-def enforce_proactive_bind(bind_host: str, config_enabled: bool) -> None:
-    """Fail-closed startup check. If proactive is explicitly enabled but the
-    bind is non-loopback, raise `ProactiveRefused` with an actionable message,
-    naming the conflict — never start proactive under a shared/team posture."""
-    if config_enabled and (not bind_host or not _is_loopback(bind_host)):
-        raise ProactiveRefused(
-            f"Refusing to run Proactive context under a non-loopback bind "
-            f"({bind_host or '<unset>'}). Proactive context reads the local "
-            f"conversation and is a solo/localhost-only feature; it is mutually "
-            f"exclusive with team / shared-instance mode. Either bind to "
-            f"127.0.0.1, or unset VECTR_PROACTIVE / proactive.enabled."
-        )

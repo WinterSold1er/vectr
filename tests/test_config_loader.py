@@ -88,11 +88,17 @@ class TestConfigLoaderRerank:
         assert cfg.RERANK_TOP_K == 40, f"RERANK_TOP_K should be 40, got {cfg.RERANK_TOP_K}"
 
     def test_top_k_unfiltered_default(self) -> None:
-        # UPG-15.7: top_k_unfiltered reverted to 60 (the reranker pool size).
-        # Trivial HTML/TXT flooding is now prevented by the pool-entry filter
-        # (pre_filter_fetch_k over-fetches, drops trivial, trims to top_k_unfiltered).
-        assert cfg.RERANK_TOP_K_UNFILTERED == 60, (
-            f"RERANK_TOP_K_UNFILTERED should be 60 (UPG-15.7), got {cfg.RERANK_TOP_K_UNFILTERED}"
+        # UPG-RERANKER-SWAP-SPIKE (2026-08-19): lowered 60 -> 40 alongside the
+        # reranker swap. This is the knob that governs almost every real query
+        # (top_k covers only the language-filtered branch), and it was swept
+        # across {10,20,30,40,60} against the django acceptance corpus for the
+        # shipped model: 43/57 cases and 5/6 must-pass at 40, versus 44/57 and
+        # 5/6 at 60 for 37% more rerank latency. 40 was chosen over the even
+        # cheaper 20 because must-pass-six is non-monotonic across the sweep
+        # (4/5/4/5/5) — 20 is an isolated peak, 40-60 is a contiguous plateau.
+        assert cfg.RERANK_TOP_K_UNFILTERED == 40, (
+            f"RERANK_TOP_K_UNFILTERED should be 40 (UPG-RERANKER-SWAP-SPIKE), "
+            f"got {cfg.RERANK_TOP_K_UNFILTERED}"
         )
 
     def test_top_k_is_int(self) -> None:
@@ -101,11 +107,42 @@ class TestConfigLoaderRerank:
     def test_top_k_unfiltered_is_int(self) -> None:
         assert isinstance(cfg.RERANK_TOP_K_UNFILTERED, int)
 
-    def test_unfiltered_exceeds_filtered(self) -> None:
-        """Unfiltered pool must be strictly larger than the filtered pool."""
-        assert cfg.RERANK_TOP_K_UNFILTERED > cfg.RERANK_TOP_K, (
-            f"RERANK_TOP_K_UNFILTERED ({cfg.RERANK_TOP_K_UNFILTERED}) must exceed "
-            f"RERANK_TOP_K ({cfg.RERANK_TOP_K})"
+    def test_unfiltered_pool_not_shallower_than_filtered(self) -> None:
+        """The unfiltered path must never get a SHALLOWER rerank pool than the
+        filtered path.
+
+        Relaxed from strict `>` to `>=` by UPG-RERANKER-SWAP-SPIKE (2026-08-19),
+        deliberately and with the reasoning recorded here rather than silently.
+        The original intent is that an unfiltered query, which has no language
+        narrowing and so admits more doc prose, must not be handicapped with a
+        smaller pool than a filtered one. That intent is `>=`; the strictness was
+        incidental to the old pair of values (60 > 40), not a designed margin.
+
+        The measured sweep lowered top_k_unfiltered to 40, which now coincides
+        with top_k. `top_k` was deliberately NOT lowered to restore the strict
+        inequality: it governs only the language-filtered branch, which the
+        acceptance corpus does not exercise at all (0 of 65 django cases set a
+        language filter), so there is no evidence for a value and guessing one
+        would change unmeasured behaviour to satisfy a test.
+        """
+        assert cfg.RERANK_TOP_K_UNFILTERED >= cfg.RERANK_TOP_K, (
+            f"RERANK_TOP_K_UNFILTERED ({cfg.RERANK_TOP_K_UNFILTERED}) must not be "
+            f"smaller than RERANK_TOP_K ({cfg.RERANK_TOP_K})"
+        )
+
+    def test_pre_filter_fetch_k_exceeds_rerank_pool(self) -> None:
+        """The over-fetch depth must leave real room to drop trivial chunks and
+        still fill the rerank pool.
+
+        `test_pre_filter_fetch_k_default` below has asserted only `>= 200` while
+        its own comment claimed "must be strictly larger than top_k_unfiltered" —
+        an invariant described but never checked. Added here (UPG-RERANKER-SWAP-
+        SPIKE) so lowering either knob cannot silently invert the relationship.
+        """
+        assert cfg.RERANK_PRE_FILTER_FETCH_K > cfg.RERANK_TOP_K_UNFILTERED, (
+            f"RERANK_PRE_FILTER_FETCH_K ({cfg.RERANK_PRE_FILTER_FETCH_K}) must exceed "
+            f"RERANK_TOP_K_UNFILTERED ({cfg.RERANK_TOP_K_UNFILTERED}) so the pool-entry "
+            "trivial filter has candidates to spare"
         )
 
     def test_pre_filter_fetch_k_default(self) -> None:
@@ -133,6 +170,44 @@ class TestConfigLoaderRerank:
         assert searcher_mod._RERANK_TOP_K_UNFILTERED is cfg.RERANK_TOP_K_UNFILTERED
         assert searcher_mod._RERANK_PRE_FILTER_FETCH_K is cfg.RERANK_PRE_FILTER_FETCH_K
 
+    def test_max_length_default(self) -> None:
+        # UPG-RERANK-LATENCY-BUDGET: was hardcoded in agent/searcher.py.
+        assert cfg.RERANK_MAX_LENGTH == 512, (
+            f"RERANK_MAX_LENGTH should be 512, got {cfg.RERANK_MAX_LENGTH}"
+        )
+
+    def test_max_length_is_int(self) -> None:
+        assert isinstance(cfg.RERANK_MAX_LENGTH, int)
+
+    def test_batch_size_by_device_is_dict_of_int(self) -> None:
+        assert isinstance(cfg.RERANK_BATCH_SIZE_BY_DEVICE, dict)
+        assert cfg.RERANK_BATCH_SIZE_BY_DEVICE, "batch_size map must not be empty"
+        for device, bs in cfg.RERANK_BATCH_SIZE_BY_DEVICE.items():
+            assert isinstance(device, str)
+            assert isinstance(bs, int) and bs > 0
+
+    def test_batch_size_by_device_has_required_keys(self) -> None:
+        """"default" is the runtime fallback for a resolved torch device
+        the config doesn't name (agent/searcher.py._Reranker._batch_size) —
+        it must always be present, along with the measured mps/cpu entries
+        and the untested cuda entry (UPG-RERANK-LATENCY-BUDGET)."""
+        for key in ("mps", "cpu", "cuda", "default"):
+            assert key in cfg.RERANK_BATCH_SIZE_BY_DEVICE, (
+                f"ranking.rerank.batch_size missing required key {key!r}"
+            )
+
+    def test_cuda_batch_size_preserves_library_default(self) -> None:
+        """No CUDA hardware was available to measure a device-specific value
+        (UPG-RERANK-LATENCY-BUDGET) — cuda must keep sentence_transformers'
+        own unconfigured predict() default (32) rather than guess from the
+        mps/cpu measurements, which were both taken on Apple Silicon."""
+        assert cfg.RERANK_BATCH_SIZE_BY_DEVICE["cuda"] == 32
+
+    def test_searcher_rerank_batch_size_and_max_length_alias_from_config(self) -> None:
+        import agent.searcher as searcher_mod
+        assert searcher_mod._RERANK_MAX_LENGTH is cfg.RERANK_MAX_LENGTH
+        assert searcher_mod._RERANK_BATCH_SIZE_BY_DEVICE is cfg.RERANK_BATCH_SIZE_BY_DEVICE
+
 
 class TestConfigLoaderIndexing:
     """indexing.* values must load correctly from config.yaml (UPG-12.1)."""
@@ -142,6 +217,21 @@ class TestConfigLoaderIndexing:
             f"INDEXING_MAX_CHUNK_LINES should be 150, got {cfg.INDEXING_MAX_CHUNK_LINES}"
         )
 
+    def test_max_chunk_chars_default(self) -> None:
+        """UPG-WINDOW-CHUNK-BYTE-CAP: the character cap must ship with enough
+        headroom that an ordinary full window never hits it — only genuinely
+        oversized content (one giant line / minified one-liner) may be
+        sub-split."""
+        assert cfg.INDEXING_MAX_CHUNK_CHARS == 32000, (
+            f"INDEXING_MAX_CHUNK_CHARS should be 32000, got {cfg.INDEXING_MAX_CHUNK_CHARS}"
+        )
+        # Even an absurdly generous reading of a full window — one line for
+        # every point of max_chunk_lines, each line itself max_chunk_lines
+        # characters long — must stay under the char cap.
+        assert cfg.INDEXING_MAX_CHUNK_CHARS > (
+            cfg.INDEXING_MAX_CHUNK_LINES * cfg.INDEXING_MAX_CHUNK_LINES
+        )
+
     def test_class_header_lines_default(self) -> None:
         assert cfg.INDEXING_CLASS_HEADER_LINES == 40, (
             f"INDEXING_CLASS_HEADER_LINES should be 40, got {cfg.INDEXING_CLASS_HEADER_LINES}"
@@ -149,6 +239,10 @@ class TestConfigLoaderIndexing:
 
     def test_max_chunk_lines_is_int(self) -> None:
         assert isinstance(cfg.INDEXING_MAX_CHUNK_LINES, int)
+
+    def test_max_chunk_chars_is_positive_int(self) -> None:
+        assert isinstance(cfg.INDEXING_MAX_CHUNK_CHARS, int)
+        assert cfg.INDEXING_MAX_CHUNK_CHARS > 0
 
     def test_class_header_lines_is_int(self) -> None:
         assert isinstance(cfg.INDEXING_CLASS_HEADER_LINES, int)
@@ -164,6 +258,7 @@ class TestConfigLoaderIndexing:
         """indexer.py must import chunk line limits from config, not define its own."""
         import agent.indexer as indexer_mod
         assert indexer_mod._MAX_CHUNK_LINES is cfg.INDEXING_MAX_CHUNK_LINES
+        assert indexer_mod._MAX_CHUNK_CHARS is cfg.INDEXING_MAX_CHUNK_CHARS
         assert indexer_mod._CLASS_HEADER_LINES is cfg.INDEXING_CLASS_HEADER_LINES
 
 
@@ -490,5 +585,5 @@ class TestServerDefaultPort:
         import inspect
         from integrations import vscode_bridge
         for fn in (vscode_bridge.configure_cursor, vscode_bridge.configure_claude_code,
-                   vscode_bridge.configure_all):
+                   vscode_bridge.configure_vscode, vscode_bridge.configure_all):
             assert inspect.signature(fn).parameters["port"].default == cfg.DEFAULT_PORT

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.config import EMBEDDING_DEFAULT_MODEL, EMBEDDING_MODEL_ENV
+from agent.config import EMBEDDING_DEFAULT_MODEL
 
 
 @dataclass
@@ -410,7 +410,7 @@ def select_strategy(fp: CodebaseFingerprint) -> RetrievalStrategy:
     # ships empty (see its module-level comment), so `recommended` resolves
     # to the configured default on every real workspace today.
     recommended, embed_reason = resolve_embed_model(
-        fp, explicit_override=os.environ.get(EMBEDDING_MODEL_ENV)
+        fp, explicit_override=os.environ.get("VECTR_EMBED_MODEL")
     )
     reasons.append(embed_reason)
 

@@ -9,9 +9,13 @@ from starlette.concurrency import run_in_threadpool
 
 import agent.config as config
 from agent.chroma_dispatch import dispatch_chroma_async
-from agent.working_context_store import bind_user_quote, resolve_remember_content
+from agent.working_context_store import USER_STATED_PROVENANCE, bind_user_quote, resolve_remember_content
 
 from app.models import (
+    AnchorRequest,
+    AnchorResponse,
+    UnanchorRequest,
+    UnanchorResponse,
     ArcRecord,
     ArcResolveResult,
     ArcsDismissRequest,
@@ -35,6 +39,8 @@ from app.models import (
     LocateResponse,
     MapSaveRequest,
     MapSaveResponse,
+    PinRequest,
+    PinResponse,
     ProactiveRequest,
     ProactiveResponse,
     PromoteRequest,
@@ -47,10 +53,13 @@ from app.models import (
     RememberRequest,
     RememberResponse,
     ResumeResponse,
+    RevokedRelatedNoteModel,
     RevokeRequest,
     RevokeResponse,
     SearchRequest,
     SearchResponse,
+    SupersedeRequest,
+    SupersedeResponse,
     SnapshotRequest,
     SnapshotResponse,
     StatusResponse,
@@ -389,6 +398,7 @@ async def remember(body: RememberRequest, request: Request) -> RememberResponse:
             supersedes=body.supersedes,
             contradicts=body.contradicts,
             user_quote=body.user_quote,
+            pin=body.pin,
         )
     except ValueError as exc:
         # TRIGGER-ENGINE wave 1: malformed triggers, an unrecognised
@@ -398,14 +408,32 @@ async def remember(body: RememberRequest, request: Request) -> RememberResponse:
         # not exist — all caller input errors, never a server fault.
         raise HTTPException(status_code=422, detail={"error": "invalid_memory_object", "detail": str(exc)})
     note_id = outcome.note_id
-    # UPG-MEM-PROVENANCE-USER-STATED: a user_quote that did not bind never
-    # fails the write — it is discarded and the caller is told why, in the
-    # same response, recomputed with the same pure function the store used
-    # (no second write path, no stored rejection state).
+    # UPG-MEM-PROVENANCE-USER-STATED / UPG-PROVENANCE-NEVER-RISES: a
+    # user_quote that did not bind never fails the write — it is discarded
+    # and the caller is told why, in the same response, recomputed with the
+    # same pure function the store used (no second write path, no stored
+    # rejection state). That recompute alone is blind to the harness-driven
+    # auto-bind fallback (tried server-side whenever the explicit quote did
+    # not bind), so the actual stored provenance is checked too — a note can
+    # land at provenance='user-stated' with no body.user_quote at all, or
+    # with one that itself failed to bind, when it was auto-bound instead.
     quote_suffix = ""
-    if body.user_quote:
-        _bound, reason = bind_user_quote(body.content, body.user_quote)
-        quote_suffix = f" {reason}" if reason else " Bound the user_quote: provenance='user-stated'."
+    _bound, reason = bind_user_quote(body.content, body.user_quote) if body.user_quote else ("", "")
+    if _bound:
+        quote_suffix = " Bound the user_quote: provenance='user-stated'."
+    else:
+        note_is_user_stated = False
+        try:
+            note_is_user_stated = svc.get_note(note_id).provenance == USER_STATED_PROVENANCE
+        except Exception:
+            note_is_user_stated = False
+        if note_is_user_stated:
+            quote_suffix = (
+                " No user_quote bound explicitly, but this note auto-bound to the "
+                "most recently captured user turn: provenance='user-stated'."
+            )
+        elif body.user_quote and reason:
+            quote_suffix = f" {reason}"
     distilled = None
     if body.distilled_from:
         # Distillation write-back: the note write
@@ -422,6 +450,7 @@ async def remember(body: RememberRequest, request: Request) -> RememberResponse:
         processing_ms=int((time.monotonic() - t0) * 1000),
         distilled=distilled,
         related=[RelatedNoteModel(**r) for r in outcome.related],
+        revoked_related=[RevokedRelatedNoteModel(**r) for r in outcome.revoked_related],
         proxy_anchor_suggestions=outcome.proxy_anchor_suggestions,
     )
 
@@ -513,6 +542,83 @@ async def promote(body: PromoteRequest, request: Request) -> PromoteResponse:
     )
 
 
+@router.post("/v1/pin", response_model=PinResponse)
+async def pin(body: PinRequest, request: Request) -> PinResponse:
+    """Explicit Tier 0 membership toggle (UPG-RECALL-MISS-FLOOR part (b)):
+    set or clear a note's `pinned` flag. Pinned notes join kind='directive'
+    notes in the unconditional-injection tier of every
+    vectr_recall(query=...) call, up to the configured Tier 0 bound
+    (recall_floor.tier0_max_notes) — never scored against the query, never
+    inferred. Idempotent: pinning an already-pinned note (or unpinning an
+    already-unpinned one) still returns 200."""
+    t0 = time.monotonic()
+    svc = _service(request)
+    if getattr(svc, "search_only", False):
+        from app.service import _SEARCH_ONLY_MSG
+        raise HTTPException(status_code=503, detail={"error": "search_only_mode", "detail": _SEARCH_ONLY_MSG})
+    changed = svc.pin_note(body.note_id, body.pinned)
+    if not changed:
+        raise HTTPException(status_code=404, detail={"error": "note_not_found", "detail": f"Note #{body.note_id} not found."})
+    verb = "pinned" if body.pinned else "unpinned"
+    return PinResponse(
+        note_id=body.note_id,
+        pinned=body.pinned,
+        message=f"Note #{body.note_id} {verb}.",
+        processing_ms=int((time.monotonic() - t0) * 1000),
+    )
+
+
+@router.post("/v1/anchor", response_model=AnchorResponse)
+async def anchor(body: AnchorRequest, request: Request) -> AnchorResponse:
+    """Attach anchor paths to an existing note post-write
+    (UPG-ANCHOR-ATTACH, `vectr_anchor`): the single-call replacement for the
+    re-store-with-supersedes workaround. Anchors are delivery-shaping
+    metadata — check_staleness() compares their write-time hashes against
+    the live files on every check, so drift surfaces as a stale flag, never
+    as a judgment that the note is wrong. Idempotent: paths the note is
+    already anchored to are reported in `already_present`, not duplicated."""
+    t0 = time.monotonic()
+    svc = _service(request)
+    if getattr(svc, "search_only", False):
+        from app.service import _SEARCH_ONLY_MSG
+        raise HTTPException(status_code=503, detail={"error": "search_only_mode", "detail": _SEARCH_ONLY_MSG})
+    result = svc.attach_anchors(body.note_id, body.anchors, session_id=body.session_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "note_not_found", "detail": f"Note #{body.note_id} not found."})
+    return AnchorResponse(
+        note_id=body.note_id,
+        attached=result["attached"],
+        already_present=result["already_present"],
+        message=f"Attached {len(result['attached'])} anchor(s) to note #{body.note_id}.",
+        processing_ms=int((time.monotonic() - t0) * 1000),
+    )
+
+
+@router.post("/v1/unanchor", response_model=UnanchorResponse)
+async def unanchor(body: UnanchorRequest, request: Request) -> UnanchorResponse:
+    """Remove anchor paths from an existing note post-write
+    (UPG-ANCHOR-DETACH, `vectr_unanchor`): the inverse of POST /v1/anchor.
+    Anchors are delivery-shaping metadata — a removed anchor simply stops
+    being a candidate in the next check_staleness() check, never a claim
+    that the note is wrong. Idempotent: paths the note was never anchored
+    to are reported in `not_present`, not treated as failures."""
+    t0 = time.monotonic()
+    svc = _service(request)
+    if getattr(svc, "search_only", False):
+        from app.service import _SEARCH_ONLY_MSG
+        raise HTTPException(status_code=503, detail={"error": "search_only_mode", "detail": _SEARCH_ONLY_MSG})
+    result = svc.detach_anchors(body.note_id, body.anchors)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "note_not_found", "detail": f"Note #{body.note_id} not found."})
+    return UnanchorResponse(
+        note_id=body.note_id,
+        removed=result["removed"],
+        not_present=result["not_present"],
+        message=f"Removed {len(result['removed'])} anchor(s) from note #{body.note_id}.",
+        processing_ms=int((time.monotonic() - t0) * 1000),
+    )
+
+
 @router.post("/v1/revoke", response_model=RevokeResponse)
 async def revoke(body: RevokeRequest, request: Request) -> RevokeResponse:
     """Explicit revocation (UPG-MEMORY-STATE-MACHINE §4.2): caller asserts
@@ -546,9 +652,12 @@ async def revoke(body: RevokeRequest, request: Request) -> RevokeResponse:
 @router.post("/v1/reinstate", response_model=ReinstateResponse)
 async def reinstate(body: ReinstateRequest, request: Request) -> ReinstateResponse:
     """Revert-of-revert (UPG-MEMORY-STATE-MACHINE §4.2): always legal.
-    Reverses a prior `/v1/revoke` (or a `contradicts=` write): the note
-    returns to active state and its raw content, not the anti-memory
-    deterrent block, is rendered again on every surface."""
+    Reverses a prior `/v1/revoke` (or a `contradicts=` write), a TTL
+    expiry, or a supersession (`supersedes=` at write time or
+    `/v1/supersede` post-hoc — the tombstone columns are cleared so the
+    note returns to default recall/fire): the note returns to active state
+    and its raw content, not the anti-memory deterrent block, is rendered
+    again on every surface."""
     t0 = time.monotonic()
     svc = _service(request)
     if getattr(svc, "search_only", False):
@@ -563,6 +672,41 @@ async def reinstate(body: ReinstateRequest, request: Request) -> ReinstateRespon
     return ReinstateResponse(
         note_id=body.note_id,
         message=f"Note #{body.note_id} reinstated.",
+        processing_ms=int((time.monotonic() - t0) * 1000),
+    )
+
+
+@router.post("/v1/supersede", response_model=SupersedeResponse)
+async def supersede(body: SupersedeRequest, request: Request) -> SupersedeResponse:
+    """Post-hoc supersession (UPG-NOTE-RETIRE-POST-HOC): retire an
+    already-stored note as superseded — the transition write-time
+    `supersedes=` cannot reach, for a replacement that was written without
+    it. Zero-inference — vectr never decides a retirement itself; this
+    route only appends the event and returns. The note is not deleted and
+    not revoked: it stops being a default recall/fire candidate and renders
+    with the factual "[superseded ...]" badge (never the anti-memory
+    deterrent — that framing is reserved for /v1/revoke's "this note was
+    WRONG"). Reversible via `/v1/reinstate`.
+
+    Person-operated surface: `actor` defaults to "agent" but accepts
+    "human" explicitly (never "system"). An agent-actor call may not retire
+    a human-provenance note; only actor="human" may."""
+    t0 = time.monotonic()
+    svc = _service(request)
+    if getattr(svc, "search_only", False):
+        from app.service import _SEARCH_ONLY_MSG
+        raise HTTPException(status_code=503, detail={"error": "search_only_mode", "detail": _SEARCH_ONLY_MSG})
+    try:
+        retired = svc.supersede_note(
+            body.note_id, superseded_by=body.superseded_by, reason=body.reason, actor=body.actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_supersedence", "detail": str(exc)})
+    if not retired:
+        raise HTTPException(status_code=404, detail={"error": "note_not_found", "detail": f"Note #{body.note_id} not found."})
+    return SupersedeResponse(
+        note_id=body.note_id,
+        message=f"Note #{body.note_id} retired as superseded.",
         processing_ms=int((time.monotonic() - t0) * 1000),
     )
 

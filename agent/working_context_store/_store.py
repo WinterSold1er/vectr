@@ -7,18 +7,24 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from agent.chroma_dispatch import timed_chroma_call
 from agent.working_context_store._audit import audit
 from agent.working_context_store._encryption import _build_encryptor, _extract_file_paths, _NoteEncryptor
 from agent.working_context_store._events import NOTE_EVENT_ACTORS, NOTE_EVENT_KINDS, fold as _fold_note_events
-from agent.working_context_store._related import RelatedNote, related_active_notes as _related_active_notes
+from agent.working_context_store._related import (
+    RelatedNote,
+    RevokedRelatedNote,
+    related_active_notes as _related_active_notes,
+    revoked_related_notes as _revoked_related_notes,
+)
 from agent.working_context_store._types import (
     DEFAULT_KIND,
     DEFAULT_PROVENANCE,
@@ -33,7 +39,7 @@ from agent.working_context_store._types import (
     SnapshotEntry,
     WorkingNote,
 )
-from agent.working_context_store._user_quote import bind_user_quote
+from agent.working_context_store._user_quote import bind_user_quote, bind_user_quote_auto
 
 logger = logging.getLogger(__name__)
 
@@ -114,31 +120,46 @@ def _actor_for_promotion(to: str) -> str:
 
 def _path_trigger_candidates(workspace_root: str, file_path: str | None) -> tuple[str, ...] | None:
     """The P (path) trigger primitive's candidate forms for one lifecycle
-    file_path: the path exactly as given, plus its workspace-relative form
-    when computable — the SAME resolve()/relative_to() normalization
-    `recall_for_path()` already uses just above. A real hook (every AI code
-    editor) sends an ABSOLUTE file_path, while triggers/anchors are naturally
-    authored workspace-relative (a gotcha's kind-default bundle generates
-    them straight from anchors — `default_bundle_for_kind()`); matching only
-    the as-given form would silently never fire a relatively-anchored
-    trigger against a real hook event. `trigger_engine.py` itself stays free
-    of filesystem/workspace knowledge (its purity invariant) — this
-    normalization lives here, at the `fire()` boundary, which is the one
-    place that already knows the workspace root.
+    file_path: the path exactly as given, plus — each when computable — its
+    workspace-relative form AND its workspace-rooted ABSOLUTE form (the SAME
+    resolve()/relative_to() normalization `recall_for_path()` already uses
+    just above; the absolute form of a relative input is derived from
+    workspace_root, not this process's cwd, so it means the same file
+    regardless of where the daemon happens to have been launched).
+
+    UPG-PROXY-ANCHOR-ABS-REL-NORM: declared anchors/triggers are authored
+    either way (remember()'s own docstring allows both), and so are incoming
+    file_paths — a real hook sends an absolute one, while direct callers of
+    recall_for_path()/fire() legitimately pass workspace-relative ones.
+    Matching only "as-given + relative" covered abs-input-vs-rel-anchor but
+    silently missed the mirror case, rel-input-vs-ABS-anchor: a note whose
+    anchors column holds "/ws/src/auth.py" was invisible to a caller asking
+    for "src/auth.py", falling back to (at best) content-boundary matching.
+    Deriving the third form closes that direction at this single boundary,
+    which both `recall_for_path()` and `fire()`'s live P-primitive share.
 
     A file outside `workspace_root` simply has no relative form — the
-    as-given form is still returned, just without a second candidate, never
+    as-given form is still returned, just without extra candidates, never
     an error. Returns None only when `file_path` itself is None (no path
     this call)."""
     if file_path is None:
         return None
     candidates = [file_path]
+    resolved_root = Path(workspace_root).resolve()
     try:
-        relpath = str(Path(file_path).resolve().relative_to(Path(workspace_root).resolve()))
+        relpath = str(Path(file_path).resolve().relative_to(resolved_root))
     except (ValueError, OSError):
         relpath = None
     if relpath and relpath not in candidates:
         candidates.append(relpath)
+    # The workspace-rooted absolute form only carries information the
+    # as-given form does not when the input was relative. For an absolute
+    # input this join reproduces the input itself (already present), so the
+    # candidate sequence for a real hook event stays exactly two forms.
+    if not Path(file_path).is_absolute():
+        abspath = str((resolved_root / file_path).resolve())
+        if abspath not in candidates:
+            candidates.append(abspath)
     return tuple(candidates)
 
 
@@ -149,6 +170,34 @@ def _is_path_identifier_char(ch: str) -> bool:
     from a longer identifier that merely contains the needle as a
     substring (e.g. "uv_regate.py" contains "gate.py")."""
     return ch.isalnum() or ch in ("_", "-")
+
+
+def _path_boundary_occurrences(text: str, needle: str) -> list[int]:
+    """Every offset in `text` where `needle` (a file basename or relative
+    path) occurs at a genuine path boundary, ascending — the single
+    implementation behind `_path_boundary_match`, `_path_boundary_count`,
+    and `_path_boundary_first` (UPG-PROXY-WEAK-TIER-TIEBREAK), so the
+    boolean, the count, and the position of a mention can never disagree
+    about what counts as one.
+
+    A match only counts when the character immediately before the
+    occurrence is not identifier-class (or the occurrence starts the
+    string) AND the character immediately after is not identifier-class
+    (or the occurrence ends the string) — see `_path_boundary_match`."""
+    if not needle:
+        return []
+    found: list[int] = []
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx == -1:
+            return found
+        before_ok = idx == 0 or not _is_path_identifier_char(text[idx - 1])
+        after_idx = idx + len(needle)
+        after_ok = after_idx >= len(text) or not _is_path_identifier_char(text[after_idx])
+        if before_ok and after_ok:
+            found.append(idx)
+        start = idx + 1
 
 
 def _path_boundary_match(text: str, needle: str) -> bool:
@@ -164,20 +213,32 @@ def _path_boundary_match(text: str, needle: str) -> bool:
     occurrence ends the string). Callers that need a cheap prefilter
     (e.g. a SQL LIKE clause) should treat this function's result as the
     precise filter applied afterward, not a replacement for the prefilter
-    — see `recall_for_path()`."""
-    if not needle:
-        return False
-    start = 0
-    while True:
-        idx = text.find(needle, start)
-        if idx == -1:
-            return False
-        before_ok = idx == 0 or not _is_path_identifier_char(text[idx - 1])
-        after_idx = idx + len(needle)
-        after_ok = after_idx >= len(text) or not _is_path_identifier_char(text[after_idx])
-        if before_ok and after_ok:
-            return True
-        start = idx + 1
+    — see `recall_for_path()`.
+
+    Delegates to `_path_boundary_occurrences()` (same scan, early exit on
+    the first hit) rather than keeping its own copy of the boundary rule —
+    three consumers now share that predicate, and they must never drift."""
+    return bool(_path_boundary_occurrences(text, needle))
+
+
+def _path_boundary_count(text: str, needle: str) -> int:
+    """How many separate path-boundary occurrences `needle` has in `text`
+    (UPG-PROXY-WEAK-TIER-TIEBREAK): a note whose subject is a file tends to
+    name it repeatedly; a note that merely name-drops it in passing names
+    it once. Same boundary predicate as `_path_boundary_match`, which is
+    exactly `count > 0`."""
+    return len(_path_boundary_occurrences(text, needle))
+
+
+def _path_boundary_first(text: str, needle: str) -> int:
+    """The character offset of the FIRST path-boundary occurrence of
+    `needle` in `text`, or -1 when there is none (UPG-PROXY-WEAK-TIER-
+    TIEBREAK): among notes that mention a file equally often, one whose
+    subject is the file tends to name it early (title / opening sentence),
+    where a passing mention lands mid-list. Same boundary predicate as
+    `_path_boundary_match`."""
+    hits = _path_boundary_occurrences(text, needle)
+    return hits[0] if hits else -1
 
 
 def _anchors_exact_match(
@@ -188,8 +249,9 @@ def _anchors_exact_match(
     of a file's candidate path forms EXACTLY — the strongest possible
     signal a note is about that file, independent of whatever its prose
     content happens to mention. `path_candidates` is
-    `_path_trigger_candidates()`'s output (as-given + workspace-relative
-    forms) for the file being recalled."""
+    `_path_trigger_candidates()`'s output — as-given + workspace-relative
+    + (for a relative input) workspace-rooted absolute forms
+    (UPG-PROXY-ANCHOR-ABS-REL-NORM) — for the file being recalled."""
     if not anchors or not path_candidates:
         return False
     declared = {a[0] for a in anchors if a}
@@ -275,7 +337,8 @@ def _scope_filter(
     recall() has no file context, so a path-subtree-scoped note is left
     unfiltered there. `file_path` accepts either a single string or a tuple
     of candidate forms for the same file (as-given plus workspace-relative,
-    same shape `fire()`'s `_path_trigger_candidates()` produces) — a real
+    plus the workspace-rooted absolute form for a relative input — the same
+    shape `fire()`'s `_path_trigger_candidates()` produces) — a real
     hook/tool call sends an ABSOLUTE path while anchors are naturally
     authored workspace-relative, so `recall_for_path()` passes both forms
     to give `scope_permits()`'s path-subtree check a relative form to
@@ -299,6 +362,138 @@ def _scope_filter(
                 continue
         out.append(note)
     return out
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _title_token_set(text: str, min_len: int) -> set[str]:
+    """Lowercased alphanumeric tokens of `text`, dropping anything shorter
+    than `min_len` — the same uniform tokenization applied to a note's own
+    title and to the incoming query text (UPG-RECALL-MISS-FLOOR part (c)),
+    never a fixed vocabulary of interesting/uninteresting words."""
+    return {t.lower() for t in _TOKEN_RE.findall(text) if len(t) >= min_len}
+
+
+def _declared_metadata_match_specificity(note: WorkingNote, query: str) -> tuple[int, int]:
+    """(channels_matched, total_matched_chars) for how strongly `note`'s OWN
+    declared tag/anchor/trigger-symbol/title metadata is found in `query`'s
+    text — deterministic containment tested against this note's stored
+    metadata, never a classification of what kind of query `query` is
+    (UPG-RECALL-MISS-FLOOR part (c); see the no-query-heuristics rail in
+    the module's callers). Every note in a workspace is checked the same
+    uniform way regardless of the query's content — the branches below are
+    channels over one note's declared fields, not a lookup table of query
+    patterns. (0, 0) means no channel matched at all.
+
+    This is used two ways by callers: membership (`channels_matched > 0`,
+    via `_note_matches_declared_metadata()` below) and, once a note has
+    already independently matched, ORDER among matches
+    (`_recall_floor_notes()`'s deterministic channel — UPG-RECALL-MISS-
+    FLOOR F2 fix). channels_matched counts how many of the four distinct
+    declared-metadata FIELDS (tag/anchor/symbol/title) matched at all;
+    total_matched_chars is the combined length of the specific text that
+    matched within those fields — a longer, more specific matched string is
+    less likely to be a coincidental overlap than a short generic one.
+    Both are properties of the NOTE's own metadata and how much of it
+    overlaps `query`, never of the query's content/intent/type on its own.
+    """
+    from agent.config import (
+        RECALL_FLOOR_TITLE_MIN_OVERLAP_TOKENS,
+        RECALL_FLOOR_TITLE_MIN_TOKEN_LEN,
+    )
+
+    q_lower = query.lower()
+    channels_matched = 0
+    total_chars = 0
+
+    # Tag channel: one or more of THIS note's own declared tags appear
+    # verbatim in the query text.
+    tag_hits = []
+    for t in note.tags:
+        norm = (t or "").strip().lower()
+        if norm and norm in q_lower:
+            tag_hits.append(norm)
+    if tag_hits:
+        channels_matched += 1
+        total_chars += sum(len(t) for t in tag_hits)
+
+    # Anchor channel: the basename (no extension) of a file THIS note is
+    # anchored to appears verbatim in the query text.
+    anchor_hits = []
+    for anchor in note.anchors:
+        path = anchor[0] if anchor else ""
+        stem = Path(path).stem.lower() if path else ""
+        if stem and stem in q_lower:
+            anchor_hits.append(stem)
+    if anchor_hits:
+        channels_matched += 1
+        total_chars += sum(len(s) for s in anchor_hits)
+
+    # Symbol channel: a code symbol name THIS note declared via an
+    # explicit trigger's 'symbol' key appears verbatim in the query text.
+    # Case-sensitive: symbol names are code identifiers, not prose.
+    symbol_hits = []
+    for trig in note.triggers or []:
+        sym = trig.get("symbol") if isinstance(trig, dict) else None
+        if sym and sym in query:
+            symbol_hits.append(sym)
+    if symbol_hits:
+        channels_matched += 1
+        total_chars += sum(len(s) for s in symbol_hits)
+
+    # Title channel: THIS note's own title, tokenized the same uniform way
+    # as the query, overlaps the query's tokens by at least the configured
+    # floor.
+    if note.title:
+        title_tokens = _title_token_set(note.title, RECALL_FLOOR_TITLE_MIN_TOKEN_LEN)
+        if title_tokens:
+            query_tokens = _title_token_set(query, RECALL_FLOOR_TITLE_MIN_TOKEN_LEN)
+            overlap = title_tokens & query_tokens
+            if len(overlap) >= RECALL_FLOOR_TITLE_MIN_OVERLAP_TOKENS:
+                channels_matched += 1
+                total_chars += sum(len(t) for t in overlap)
+
+    return channels_matched, total_chars
+
+
+def _note_matches_declared_metadata(note: WorkingNote, query: str) -> bool:
+    """True if `note`'s OWN declared tag, anchor, trigger-symbol, or title
+    metadata is found in `query`'s text at all — see
+    `_declared_metadata_match_specificity()` above for the full channel
+    definitions; this is just its membership test (channels_matched > 0)."""
+    return _declared_metadata_match_specificity(note, query)[0] > 0
+
+
+def _merge_recall_floor(
+    tier0: list[WorkingNote],
+    deterministic: list[WorkingNote],
+    ranked: list[WorkingNote],
+    limit: int,
+) -> list[WorkingNote]:
+    """Compose Tier 0, the deterministic channels, and the ranked
+    (semantic/SQL) result into one de-duplicated list, in that fixed
+    precedence, truncated to `limit` (UPG-RECALL-MISS-FLOOR parts (b)/(c)).
+    Never returns more than `limit` notes — the STEP 0 guard in
+    benchmarks/recall_miss/harness.py depends on that being true by
+    construction here, not by convention at each call site. When neither
+    `tier0` nor `deterministic` contributed anything (the common case —
+    apply_floor=False, a workspace with no pinned notes and the
+    deterministic channel at its shipped default-off, or simply no
+    matching notes), this returns `ranked` unchanged, truncated to
+    `limit` exactly like the pre-existing behavior it replaces."""
+    if not tier0 and not deterministic:
+        return ranked[:limit]
+    combined: list[WorkingNote] = []
+    seen: set[int] = set()
+    for group in (tier0, deterministic, ranked):
+        for note in group:
+            if len(combined) >= limit:
+                return combined
+            if note.note_id not in seen:
+                seen.add(note.note_id)
+                combined.append(note)
+    return combined
 
 
 def _age_str(created_at: float) -> str:
@@ -402,12 +597,43 @@ def _format_index_line(
 # constant rather than in config.yaml (same precedent as trigger_engine.py's
 # _HUMAN_FRAME/_AGENT_FRAME/_AUTO_FRAME provenance-framing templates: fixed
 # text shaping how a fact is PRESENTED, never text that inspects or reroutes
-# on prompt/query content). Field order and wording follow the design doc's
-# literal template.
+# on prompt/query content). Wording is the design doc's literal template
+# (memoization-l1-capture-design.md §4.3); field ORDER is not — the design
+# doc writes the warning last, but every surface that renders this template
+# truncates from the right under a budget (agent/proactive/matcher.py's
+# `_cap()` for the proxy channel; agent/trigger_engine.py's
+# `_trim_full_text_to_cap()` for the hook full-tier channel), so a
+# right-truncation can only ever remove trailing text.
+#
+# UPG-DETERRENT-TITLE-ONLY: the warning clause is placed FIRST so it can
+# never be the thing a tight budget cuts — before this, only the proxy
+# channel protected it, via a runtime `rpartition(". ")` reorder local to
+# `_revoked_summary()`; the hook channel's `_trim_full_text_to_cap()` ran
+# the RAW (unreordered) template through a generic right-truncation with no
+# template awareness at all, so a revoked note routed through a tight
+# per-kind cap (e.g. `gotcha`'s 100-token/400-char cap) could lose the
+# warning clause ENTIRELY while still rendering "Previously believed: ..."
+# — the exact silent-caveat-loss the design doc's poisoning-mitigation row
+# rules out ("visible caveat, never silent suppression"). Putting the
+# warning first in the template itself (rather than reordering it per
+# caller) protects it on every surface uniformly, and lets
+# `_revoked_summary()`'s runtime reorder be deleted as redundant.
+#
+# `reason` is placed second (ahead of the quoted summary) for the same
+# right-truncation reason: `summary` is already a bounded one-line title-or-
+# first-line excerpt (`_note_title()`, <=80 chars, itself the design doc's
+# literal "<one-line content summary>" field — full multi-line content is
+# deliberately never rendered here, see tests/test_note_events.py::
+# TestAntiMemoryRendering::test_revoked_note_renders_deterrent_not_raw_content),
+# while `reason` is free text with no cap of its own — ordering it before
+# the already-small summary means a right-truncation sacrifices the summary
+# first, matching benchmarks/anti_memory/DESIGN.md §13's T0-4 probe (reason
+# must survive verbatim on the proxy surface) by construction instead of by
+# accident of today's generous default budgets.
 _ANTI_MEMORY_TEMPLATE = (
+    'Do not re-derive this from other sources without verification. '
     'Previously believed (recorded {created_date}, revoked {revoked_date}, '
-    'reason: {reason}): "{summary}". Do not re-derive this from other '
-    'sources without verification.'
+    'reason: {reason}): "{summary}".'
 )
 
 
@@ -439,6 +665,22 @@ _EXPIRED_TEMPLATE = (
 # classification, so it lives here as a plain constant rather than in
 # config.yaml.
 _INJECTED_FRAME_TEMPLATE = "Recorded {date} (anchor: {target}, status: {status}): "
+
+# UPG-ANCHOR-UNOBSERVED-BINDING: the unobserved-binding caveat, appended to
+# `_injected_frame()`'s `status` field only when the note's first anchor was
+# declared with observed=False (never on None/unknown — see
+# `_anchor_observed_at_write()`). Same category as _INJECTED_FRAME_TEMPLATE/
+# _ANTI_MEMORY_TEMPLATE/_EXPIRED_TEMPLATE just above: a fixed protocol string
+# shaping how a fact is PRESENTED, not query-classification, so it lives here
+# as a plain constant rather than in config.yaml. Deliberately worded
+# DIFFERENTLY from drift's "changed since — verify": drift means the FILE
+# changed after the anchor hash was recorded and the remedy is re-deriving
+# the note from the current source; this means the WRITING agent never
+# actually opened the file it anchored to and the remedy is a first read —
+# conflating the two into one "stale" phrase would erase that distinction
+# (the acceptance bar this task was written against explicitly rules out
+# merging them).
+_UNOBSERVED_STATUS_SUFFIX = "not verified as read this session — recommend a first read, not re-derivation"
 
 
 def _injected_frame(note: WorkingNote, stale_warnings: dict[int, list[str]]) -> str:
@@ -473,13 +715,29 @@ def _injected_frame(note: WorkingNote, stale_warnings: dict[int, list[str]]) -> 
     unqualified "changed since — verify" a code-anchored note gets) keeps
     the caller from over-trusting a stale environment fact while also not
     under-selling it as a flat contradiction. Non-operational drift and the
-    no-drift branches are completely untouched by this refinement."""
+    no-drift branches are completely untouched by this refinement.
+
+    UPG-ANCHOR-UNOBSERVED-BINDING adds one further, independently-gated,
+    PURELY ADDITIVE suffix: when the note's first anchor was written with
+    observed=False (`note.anchors[0][2]` — the third element `remember()`
+    now stores; see `_anchor_observed_at_write()`), `_UNOBSERVED_STATUS_
+    SUFFIX` is appended to whatever `status` the drift logic above already
+    produced. This is deliberately independent of, and can compose with,
+    the drift branches above (a note can be both drifted AND unobserved —
+    two orthogonal true facts, both worth saying) rather than being folded
+    into the SAME `anchor_drifted` boolean, per this task's own acceptance
+    bar: drift and non-observation are different failure modes with
+    different remedies and must never collapse into one merged "stale"
+    flag. The observed value is read via `len(anchor) >= 3` — an anchor
+    pair written before this wave (or one written by a session with no
+    observation ledger, see the None branch below) has no third element or
+    stores `None`, and BOTH render with no suffix at all: only a literal
+    `False` (never `None`, never a missing element) ever adds the caveat,
+    so this is byte-identical to pre-this-task output for every anchor this
+    task doesn't have positive evidence about."""
     date = _date_str(note.created_at)
-    target = (
-        note.anchors[0][0]
-        if note.anchors and note.anchors[0] and note.anchors[0][0]
-        else "none"
-    )
+    first_anchor = note.anchors[0] if note.anchors and note.anchors[0] else None
+    target = first_anchor[0] if first_anchor and first_anchor[0] else "none"
     stale_files = stale_warnings.get(note.note_id, [])
     anchor_drifted = any(f.endswith("[anchor_changed]") for f in stale_files)
     if anchor_drifted and note.kind == "operational":
@@ -490,6 +748,9 @@ def _injected_frame(note: WorkingNote, stale_warnings: dict[int, list[str]]) -> 
         status = f"last confirmed {date}"
     else:
         status = "matches current state"
+    observed = first_anchor[2] if first_anchor and len(first_anchor) >= 3 else None
+    if observed is False:
+        status = f"{status}; {_UNOBSERVED_STATUS_SUFFIX}"
     return _INJECTED_FRAME_TEMPLATE.format(date=date, target=target, status=status)
 
 
@@ -600,10 +861,18 @@ def _format_full_block(
         sup_by = n.superseded_by or (
             f"note#{n.superseded_by_note_id}" if n.superseded_by_note_id else None
         )
+        import datetime as _dt
+        sup_date = _dt.datetime.fromtimestamp(n.superseded_at or n.valid_until).strftime("%Y-%m-%d")
         if sup_by:
-            import datetime as _dt
-            sup_date = _dt.datetime.fromtimestamp(n.superseded_at or n.valid_until).strftime("%Y-%m-%d")
             superseded_marker = f" [superseded by @{sup_by}, {sup_date}]"
+        else:
+            # UPG-NOTE-RETIRE-POST-HOC: a note retired with no successor
+            # link (`supersede_note(superseded_by=None)` — the only path
+            # that can leave valid_until set with neither identifier).
+            # Factual framing, never blank: an excluded-from-recall note
+            # that renders as if active on the include-superseded surfaces
+            # would mislead exactly the reader who dug it up.
+            superseded_marker = f" [superseded, {sup_date}]"
 
     # Surface the kind when it carries injection semantics (UPG-9.3) —
     # 'finding' is the default and adds no signal, so it's left implicit.
@@ -628,7 +897,12 @@ def _format_full_block(
         # Provenance framing (§5): only a human-provenance directive ever
         # renders as an unhedged imperative; agent-provenance is framed as
         # memory to verify; auto-provenance carries the weakest framing.
-        content_line = f"  {frame_prefix(n.provenance, n.kind)}{n.content}"
+        # UPG-PROVENANCE-AUTOBIND-SPAN: passing user_quote/content lets
+        # frame_prefix distinguish a user-stated note whose bound quote IS
+        # its whole body (unqualified framing, unchanged) from one where the
+        # quote is only a sub-span of a larger agent-authored body (the
+        # qualified span framing) — a no-op for every other provenance.
+        content_line = f"  {frame_prefix(n.provenance, n.kind, user_quote=n.user_quote, content=n.content)}{n.content}"
 
     lines = [
         f"[{n.note_id}] [{n.priority.upper()}]{kind_marker}{provenance_marker}{scope_marker}{tag_str}{author_str}  ({age_str})"
@@ -668,10 +942,54 @@ _NOTES_EMBED_MODEL_KEY = "embed_model"
 # embed_fn per call during a one-time startup migration.
 _NOTES_REEMBED_BATCH_SIZE = 256
 
+
+def _is_embedding_dimension_conflict(exc: BaseException) -> bool:
+    """True when chromadb rejects a write because the vectors' dimensionality
+    does not match what the collection was created with.
+
+    The wording differs by chromadb backend — the local/rust backend says
+    "Collection expecting embedding with dimension of 4, got 6", older Python
+    backends say "embedding dimension mismatch" — and the error arrives as
+    chromadb.errors.InvalidArgumentError. Both wordings put the two words
+    `embedding` and `dimension` in the message, so that is what is matched;
+    the caller only ever applies this to a chromadb error raised by a note
+    vector upsert, where no other failure mode talks about both.
+    """
+    message = str(exc).lower()
+    return "embedding" in message and "dimension" in message
+
 # SQLite busy-wait for a contended write lock (team mode: concurrent clients +
 # the CLI can share one workspace's notes DB). Intentionally NOT in config.yaml
 # — a robustness/timeout knob, same category as the throughput constants above.
 _SQLITE_BUSY_TIMEOUT_S = 5.0
+
+# Over-fetch multiplier behind working_memory_fetch_width(): how many
+# candidates a 'working_memory' vector query fetches per note it intends to
+# render, so that hits consumed by other workspaces' notes don't starve the
+# result. Kept as a named constant so the helper below is the single place
+# the number lives.
+_WORKING_MEMORY_OVERFETCH_MULTIPLIER = 3
+
+
+def working_memory_fetch_width(render_limit: int, col_count: int, *, floor: int = 0) -> int:
+    """How many candidates a 'working_memory' vector query must fetch to be able
+    to render up to `render_limit` notes.
+
+    INVARIANT for every vector-query path against this collection: size
+    n_results through this helper, never with a raw render limit. The
+    'working_memory' collection is GLOBAL — one ChromaDB collection shared by
+    every workspace a daemon serves, queried with no per-workspace `where=`
+    clause — so every filter (other workspaces, valid_until expiry,
+    superseded/folded lifecycle state, similarity cutoffs) runs in SQLite or
+    Python only AFTER the vector search has already chosen its hits. A query
+    sized exactly to its render budget can have every slot taken by other
+    workspaces' notes and legitimately render nothing. Fetching a multiple of
+    the render limit keeps same-workspace survivors likely; `floor` lets a
+    caller demand a deeper pool than the multiplier implies when its contract
+    needs one; capping at `col_count` avoids ChromaDB errors on collections
+    smaller than the ask.
+    """
+    return min(max(render_limit * _WORKING_MEMORY_OVERFETCH_MULTIPLIER, floor), col_count)
 
 
 class WorkingContextStore:
@@ -723,11 +1041,12 @@ class WorkingContextStore:
         self._embed_query_fn = embed_query_fn or embed_fn  # query-mode embed, defaults to embed_fn
         self._embed_model = embed_model  # current model name, for the embed-model stamp/migration
         self._notes_col = None
-        # ChromaDB client that owns `working_memory`, kept so an embed-model swap
-        # to a model of a different vector dimensionality can rebuild that
-        # collection (see _recreate_notes_collection) instead of failing every
-        # upsert against the dimension the old model pinned.
-        self._notes_chroma_client: Any = None
+        # Kept so the embed-model migration can rebuild the collection when a
+        # model change changes vector dimensionality (see
+        # `_recreate_notes_collection`).
+        self._notes_chroma_client = notes_chroma_client
+        # Set by `_reembed_all_notes` when it had to rebuild `working_memory`.
+        self._notes_collection_recreated = False
         # TRIGGER-ENGINE wave 2b — the S (symbol) primitive's resolver. None
         # until attach_symbol_resolver() runs (phase-2 service init, once the
         # code symbol graph is built); a memory-only daemon or a warm-up
@@ -736,6 +1055,32 @@ class WorkingContextStore:
         # docstring, the same "attach after construction" shape as the
         # embedder below.
         self._symbol_resolver = None
+        # UPG-ANCHOR-UNOBSERVED-BINDING: per-session, in-memory ledger of file
+        # paths this session's PreToolUse hook calls have already reported
+        # (`fire()` records into it; `remember()` reads it to mark each
+        # declared anchor observed/unobserved/unknown). Keyed by
+        # (workspace, session_id) -> set of path-candidate strings (both the
+        # as-given and workspace-relative forms `_path_trigger_candidates()`
+        # already computes, so it matches an anchor declared in either form).
+        # Deliberately NEVER persisted to the sqlite DB or any other durable
+        # store: a daemon restart, a stdio transport with no session_id, or a
+        # team-mode bind that never routes hook events through this process
+        # all mean "no record", and the whole point of the tri-state design
+        # (see `_anchor_observed_at_write()`) is that "no record" must read
+        # as unknown, never as a false "never observed" accusation — an
+        # ephemeral, LRU-bounded dict is what makes that distinction free:
+        # a key that was never populated this process's lifetime is simply
+        # absent, the same shape as one deliberately never touched.
+        # LRU-bounded by EVICTION_MAX_TRACKED_SESSIONS, same cap and same
+        # "delete-then-reinsert to touch" eviction shape VectrService already
+        # applies to its own per-session ledgers (_trigger_ledgers/
+        # _turn_ledgers/_session_advisors in app/service.py) — kept here
+        # instead of there because populating it requires the workspace-root
+        # path normalization `_path_trigger_candidates()` performs, and that
+        # normalization is deliberately confined to the fire()/remember()
+        # boundary in this module (trigger_engine.py's filesystem-purity
+        # invariant), not duplicated into the service layer.
+        self._observed_paths: dict[tuple[str, str], set[str]] = {}
         # Guards attach_embedder() (UPG-STDIO-MEMORY-READY): the store can be
         # constructed with embed_fn=None (memory tools live before the
         # embedding model has loaded) and upgraded to a real embedder later,
@@ -746,8 +1091,16 @@ class WorkingContextStore:
         # attach_symbol_resolver() (same idempotent-upgrade shape).
         self._attach_lock = threading.Lock()
         if embed_fn is not None and notes_chroma_client is not None and not self._vectors_disabled():
-            self._notes_chroma_client = notes_chroma_client
             try:
+                # GLOBAL collection: shared by every workspace this daemon
+                # serves, with no per-workspace `where=` scoping — any query
+                # path added against it must over-fetch before filtering (see
+                # working_memory_fetch_width()). Two more contract facts:
+                # `hnsw:space=cosine` is what makes this repo's
+                # `similarity = 1 - distance` arithmetic valid (Chroma's l2
+                # default would make it meaningless), and chroma ids come
+                # from SQLite's GLOBAL INTEGER PRIMARY KEY AUTOINCREMENT, so
+                # ids never collide across workspaces.
                 self._notes_col = notes_chroma_client.get_or_create_collection(
                     name="working_memory",
                     metadata={"hnsw:space": "cosine"},
@@ -827,8 +1180,10 @@ class WorkingContextStore:
                 return  # already attached
             if embed_fn is None or notes_chroma_client is None or self._vectors_disabled():
                 return
-            self._notes_chroma_client = notes_chroma_client
             try:
+                # GLOBAL collection — same invariant as the __init__ creation
+                # site above: query paths must over-fetch before filtering
+                # (working_memory_fetch_width()).
                 notes_col = notes_chroma_client.get_or_create_collection(
                     name="working_memory",
                     metadata={"hnsw:space": "cosine"},
@@ -838,6 +1193,7 @@ class WorkingContextStore:
             self._embed_query_fn = embed_query_fn or embed_fn
             self._embed_model = embed_model
             self._notes_col = notes_col
+            self._notes_chroma_client = notes_chroma_client
             self._embed_fn = embed_fn
 
         if self._embed_model:
@@ -921,7 +1277,8 @@ class WorkingContextStore:
                     valid_until         REAL,
                     code_hash           TEXT NOT NULL DEFAULT '',
                     superseded_by       TEXT,
-                    superseded_at       REAL
+                    superseded_at       REAL,
+                    pinned              INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_notes_workspace ON notes(workspace);
@@ -1029,6 +1386,13 @@ class WorkingContextStore:
                 # alongside content/title when encryption is on (it is by
                 # construction a substring of content).
                 "user_quote":            "TEXT NOT NULL DEFAULT ''",
+                # UPG-RECALL-MISS-FLOOR part (b), round 4: explicit pin — the
+                # SOLE Tier 0 unconditional-injection membership test in
+                # recall() (directive notes were dropped from Tier 0 in
+                # round 4; they still get their own unconditional delivery
+                # via boot_recall(), which is unrelated to this column).
+                # Existing rows default to unpinned (0/False), unchanged behavior.
+                "pinned":                "INTEGER NOT NULL DEFAULT 0",
             }
             for col, typedef in p4_cols.items():
                 if col not in existing_cols:
@@ -1038,6 +1402,7 @@ class WorkingContextStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_code_hash ON notes(code_hash)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_valid ON notes(valid_until)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_pinned ON notes(workspace, pinned)")
 
     # ------------------------------------------------------------------
     # Notes — vectr_remember / vectr_recall / vectr_forget
@@ -1061,8 +1426,20 @@ class WorkingContextStore:
         supersedes: int | None = None,
         contradicts: int | None = None,
         user_quote: str | None = None,
+        recent_user_message: str | None = None,
+        pin: bool = False,
     ) -> int:
         """Store a working note. Returns the note_id.
+
+        `pin` (UPG-RECALL-MISS-FLOOR part (b)): explicit, caller-declared
+        Tier 0 membership at write time — the unconditional-injection
+        guarantee in `recall()`, orthogonal to `kind` (a pinned note keeps
+        its own kind; a task note can be pinned without becoming a
+        directive). As of round 4, pinning is the ONLY way into Tier 0 —
+        directive notes no longer enter it (they already have their own
+        unconditional, uncapped-per-query delivery via `boot_recall()`).
+        Never inferred from content or usage. Use `set_pinned()` to
+        pin/unpin an EXISTING note instead of at write time.
 
         If code_hash is provided and another non-superseded note exists for the
         same workspace + code_hash (same code anchor), the older note is marked
@@ -1108,6 +1485,27 @@ class WorkingContextStore:
         overrides provenance="human" — a person's own endorsement already
         outranks a transcription.
 
+        `recent_user_message` (UPG-PROVENANCE-NEVER-RISES): the harness-layer
+        fallback for the exact same "user-stated" upgrade above, tried ONLY
+        when `user_quote` did not already bind — `user_quote` is an explicit
+        caller claim and always takes priority. `bind_user_quote` requires the
+        WRITING AGENT to remember to pass `user_quote=` on every call; on a
+        live production corpus this voluntary step was essentially never
+        taken, leaving "user-stated" unreachable in practice — the identical
+        adoption gap hook-injected recall was built to close on the read
+        side. This is the write-side counterpart: the caller (`VectrService.
+        remember()`) passes the raw text of the most recently captured
+        `UserPromptSubmit` prompt for this workspace, ALREADY recency-checked
+        against `memory_write.user_quote.auto_bind_max_age_seconds` before it
+        ever reaches here (this method does no clock work of its own — a
+        `None` here just means "no recent-enough turn to compare against,"
+        indistinguishable from one that was never captured). Bound by
+        `_user_quote.bind_user_quote_auto()` — the MIRROR containment check
+        (`content` ⊆ `recent_user_message`, not `user_quote` ⊆ `content`),
+        same whitespace-normalized deterministic substring comparison, same
+        "user-stated" provenance outcome, same never-overrides-"human"
+        ceiling, same discard-on-no-bind behaviour.
+
         `scope`: one of SCOPE_VALUES, or None (the default) to mean OMITTED.
         An explicitly passed scope — including the literal string
         "workspace" — always wins verbatim and is stored as given (raises
@@ -1148,6 +1546,21 @@ class WorkingContextStore:
         mismatch. A path that cannot be read yet (e.g. a file not created
         yet) stores a null hash and is simply never flagged stale until it
         exists.
+
+        UPG-ANCHOR-UNOBSERVED-BINDING: each stored anchor pair also carries a
+        third element, the tri-state OBSERVATION verdict — whether THIS
+        session ever reported reading/touching this exact path before this
+        write (via a real PreToolUse hook call reaching `fire()`; see
+        `_anchor_observed_at_write()`). This is evidence the anchor's file
+        was actually opened by the writing agent, distinct from the content
+        hash above (which only proves what the FILE currently contains, not
+        that anyone read it). True/False only when this session's own
+        observation ledger exists and does/doesn't contain the path; None
+        when no ledger exists for this session at all (no session_id, hooks
+        not wired, stdio transport, team-mode bind, daemon restarted
+        mid-session) — an absent ledger is never treated as proof of
+        non-observation, so it is stored (and later rendered) as unknown,
+        never as a false unobserved accusation.
 
         `supersedes`: the note_id this note explicitly tombstones. The
         target note (looked up in this workspace) has `valid_until`/
@@ -1212,6 +1625,13 @@ class WorkingContextStore:
         # reviewed directive the guard exists to require, not the unreviewed
         # one it exists to reject.
         bound_quote, _ = bind_user_quote(content, user_quote)
+        # UPG-PROVENANCE-NEVER-RISES: the harness-driven fallback, tried only
+        # when the caller made no explicit (and successful) `user_quote`
+        # claim of its own — an explicit claim always wins over the
+        # automatic one, same precedence a caller-declared `title` has over
+        # the content-derived fallback below.
+        if not bound_quote:
+            bound_quote, _ = bind_user_quote_auto(content, recent_user_message)
         if bound_quote and provenance != "human":
             provenance = USER_STATED_PROVENANCE
         if provenance == "auto" and kind == "directive":
@@ -1227,7 +1647,18 @@ class WorkingContextStore:
         triggers_json = json.dumps(triggers_list)
 
         root = Path(workspace)
-        anchor_pairs = [[p, _hash_path_content(root, p)] for p in (anchors or [])]
+        # UPG-ANCHOR-UNOBSERVED-BINDING: third element is the tri-state
+        # observation verdict for this SESSION's writing of THIS note — True
+        # ("this session's own PreToolUse traffic reported this exact
+        # path"), False ("this session has an observation ledger and this
+        # path is not in it"), or None ("no ledger for this session exists
+        # at all — hooks not wired, stdio transport, team-mode bind, or a
+        # daemon restart mid-session — an absent ledger is never treated as
+        # proof of non-observation"). See `_anchor_observed_at_write()`.
+        anchor_pairs = [
+            [p, _hash_path_content(root, p), self._anchor_observed_at_write(workspace, session_id, p)]
+            for p in (anchors or [])
+        ]
         anchors_json = json.dumps(anchor_pairs)
 
         # UPG-TRIGGER-SCOPE-KIND-DEFAULTS: an omitted scope (None) resolves to
@@ -1343,13 +1774,13 @@ class WorkingContextStore:
                                    author_id, author_trust_score, valid_from,
                                    valid_until, code_hash, title,
                                    triggers, provenance, scope, anchors, supersedes, branch,
-                                   user_quote)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, 1.0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   user_quote, pinned)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, 1.0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (workspace, stored_content, tags_json, priority, kind, now, now, session_id,
                  author_id, now, code_hash, stored_title,
                  triggers_json, provenance, scope, anchors_json, supersedes, branch_value,
-                 stored_user_quote),
+                 stored_user_quote, 1 if pin else 0),
             )
             note_id = cur.lastrowid
 
@@ -1495,6 +1926,177 @@ class WorkingContextStore:
         audit("PROMOTE", workspace=workspace, note_id=note_id, provenance=to)
         return True
 
+    def set_pinned(self, workspace: str, note_id: int, pinned: bool) -> bool:
+        """Pin or unpin an existing note (UPG-RECALL-MISS-FLOOR part (b),
+        `vectr_pin`): explicit Tier 0 membership, set/cleared entirely by
+        caller decision — never inferred from content, usage, or query
+        history. As of round 4, a pinned note is the ONLY way into
+        `recall()`'s unconditional-injection Tier 0 (bounded by
+        `recall_floor.tier0_max_notes`, see agent/config.yaml) — directive
+        notes no longer enter this tier; they have their own unconditional,
+        uncapped-per-query delivery via `boot_recall()` instead. Idempotent:
+        pinning an already-pinned note (or unpinning an already-unpinned
+        one) is a no-op write that still returns True. Returns False if the
+        note does not exist in this workspace."""
+        note = self.get_note(workspace, note_id)
+        if note is None:
+            return False
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE notes SET pinned = ? WHERE workspace = ? AND note_id = ?",
+                (1 if pinned else 0, workspace, note_id),
+            )
+        audit("PIN", workspace=workspace, note_id=note_id, pinned=pinned)
+        return True
+
+    def attach_anchors(
+        self,
+        workspace: str,
+        note_id: int,
+        anchors: list[str],
+        session_id: str | None = None,
+    ) -> dict[str, list[str]] | None:
+        """Attach anchor paths to an EXISTING note (UPG-ANCHOR-ATTACH,
+        `vectr_anchor`): first-class post-write anchoring, replacing the
+        re-store-with-supersedes workaround. Like set_pinned()/
+        update_note_fields(), anchors are mutable delivery-shaping metadata,
+        so this is a plain UPDATE plus one audit() call — deliberately NOT a
+        note_events lifecycle event: NOTE_EVENT_KINDS covers the note's
+        content lifecycle, and staleness is re-derived from live anchor
+        hashes on every check_staleness() anyway, so a newly attached anchor
+        participates in the next check with no event required.
+
+        Pair construction mirrors remember(): [path, content_hash_or_None,
+        observed_tri_state] — hash computed NOW via _hash_path_content()
+        (it becomes the baseline the next check_staleness() compares
+        against), observation verdict via _anchor_observed_at_write().
+
+        Idempotent: a requested path already present on the note (exact
+        string match on element 0, same value remember() stored verbatim)
+        is skipped and reported in `already_present`, not duplicated.
+        A fully-idempotent request (nothing new) writes nothing and audits
+        nothing.
+
+        Returns {"attached": [...], "already_present": [...]} — attached
+        lists paths actually added, in request order — or None if the note
+        does not exist in this workspace. Raises ValueError when `anchors`
+        is empty, mirroring update_note_fields()'s
+        require-at-least-one-field contract."""
+        if not anchors:
+            raise ValueError("attach_anchors requires at least one anchor path")
+        note = self.get_note(workspace, note_id)
+        if note is None:
+            return None
+        root = Path(workspace)
+        existing_paths = {a[0] for a in (note.anchors or [])}
+        attached: list[str] = []
+        already_present: list[str] = []
+        new_pairs: list[list] = []
+        for p in anchors:
+            if p in existing_paths:
+                already_present.append(p)
+                continue
+            # Third element is the UPG-ANCHOR-UNOBSERVED-BINDING tri-state —
+            # same semantics as in remember().
+            new_pairs.append(
+                [p, _hash_path_content(root, p), self._anchor_observed_at_write(workspace, session_id, p)]
+            )
+            existing_paths.add(p)
+            attached.append(p)
+        if new_pairs:
+            merged = [list(a) for a in (note.anchors or [])] + new_pairs
+            with self._conn() as conn:
+                conn.execute(
+                    "UPDATE notes SET anchors = ? WHERE workspace = ? AND note_id = ?",
+                    (json.dumps(merged), workspace, note_id),
+                )
+            audit("ANCHOR_ATTACH", workspace=workspace, note_id=note_id, attached=attached)
+        return {"attached": attached, "already_present": already_present}
+
+    def detach_anchors(
+        self,
+        workspace: str,
+        note_id: int,
+        anchors: list[str],
+    ) -> dict[str, list[str]] | None:
+        """Remove anchor paths from an EXISTING note (UPG-ANCHOR-DETACH,
+        `vectr_unanchor`): the inverse of `attach_anchors()`. Like attach,
+        anchors are delivery-shaping metadata, so this is a plain UPDATE
+        plus one `audit()` call — deliberately NOT a note_events lifecycle
+        event: NOTE_EVENT_KINDS covers the note's content lifecycle, and
+        staleness is re-derived from live anchor hashes on every
+        check_staleness() anyway, so a removed anchor drops out of the
+        next check with no event required.
+
+        Path comparison mirrors `attach_anchors()` exactly: exact string
+        equality on element 0 of the pair (the same value `remember()`
+        stored verbatim). A note anchored via one spelling of a path is
+        detachable by that same spelling only — no normalisation, by
+        design, so a deliberate spelling difference stays a deliberate
+        spelling difference.
+
+        Idempotent: a requested path not present on the note is reported
+        in `not_present` (the attach-mirror's name `already_present`
+        would be a lie — the path is not "already" removed, it was never
+        there). A fully-idempotent request (nothing to remove) writes
+        nothing and audits nothing.
+
+        Returns {"removed": [...], "not_present": [...]} — removed lists
+        paths actually dropped, in request order — or None if the note
+        does not exist in this workspace. Raises ValueError when
+        `anchors` is empty, mirroring `attach_anchors()`'s
+        require-at-least-one-field contract.
+
+        When the last anchor is removed, the column is written as `[]` —
+        the same default the schema migration writes for notes that have
+        never had an anchor (TEXT NOT NULL DEFAULT '[]'), so a detached-
+        to-zero note is byte-identical to a never-anchored note on
+        reload. No NULL is ever written.
+        """
+        if not anchors:
+            raise ValueError("detach_anchors requires at least one anchor path")
+        note = self.get_note(workspace, note_id)
+        if note is None:
+            return None
+        existing_pairs = [list(a) for a in (note.anchors or [])]
+        existing_paths = {a[0]: a for a in existing_pairs}
+        removed: list[str] = []
+        not_present: list[str] = []
+        keep_pairs: list[list] = []
+        # Walk the REQUEST list (not the existing pairs) so a duplicate
+        # entry in the request (`['x.py', 'x.py']`) reports as
+        # one-removed + one-dup, mirroring attach_anchors()'s
+        # one-attached + one-already_present. Per-anchor dedup is
+        # responsibility of the caller; the contract is that we report
+        # what each entry of the request resolved to.
+        requested_seen: set[str] = set()
+        for p in anchors:
+            if p in requested_seen:
+                # Duplicate of an earlier request entry — exact
+                # symmetric of attach_anchors()'s `if p in existing_paths`
+                # branch: the path was already removed by the first
+                # occurrence, so report it as a no-op against the now-
+                # empty post-removal state.
+                not_present.append(p)
+                continue
+            requested_seen.add(p)
+            if p in existing_paths:
+                # Drop the existing pair, record the removal.
+                keep_pairs = [a for a in existing_pairs if a[0] != p]
+                existing_pairs = keep_pairs
+                existing_paths.pop(p, None)
+                removed.append(p)
+            else:
+                not_present.append(p)
+        if removed:
+            with self._conn() as conn:
+                conn.execute(
+                    "UPDATE notes SET anchors = ? WHERE workspace = ? AND note_id = ?",
+                    (json.dumps(keep_pairs), workspace, note_id),
+                )
+            audit("ANCHOR_DETACH", workspace=workspace, note_id=note_id, removed=removed)
+        return {"removed": removed, "not_present": not_present}
+
     def revoke_note(
         self,
         workspace: str,
@@ -1542,19 +2144,103 @@ class WorkingContextStore:
         actor: str = "agent",
         reason: str | None = None,
     ) -> bool:
-        """Revert a revocation OR an expiry (UPG-MEMORY-STATE-MACHINE §4.2,
-        UPG-MEMORY-DECAY-KIND-SCOPED; `vectr_reinstate`) — appends a
+        """Revert a revocation OR an expiry OR a supersession
+        (UPG-MEMORY-STATE-MACHINE §4.2, UPG-MEMORY-DECAY-KIND-SCOPED,
+        UPG-NOTE-RETIRE-POST-HOC; `vectr_reinstate`) — appends a
         `reinstated` event, always legal regardless of the note's current
         folded state (a no-op-in-spirit reinstate on an already-active note
         is harmless, same "just append, let the fold decide" philosophy as
-        a repeat revoke). The SAME event kind reverses both terminal states
+        a repeat revoke). The SAME event kind reverses every terminal state
         — `reinstated` means "return to active" regardless of whether the
-        note got there via `revoke_note()` or `purge_expired_notes()`'s
-        automatic TTL expiry, so no separate "un-expire" call is needed.
-        Returns True if the note exists, False if it does not exist in this
-        workspace. Raises ValueError if `actor` is invalid (same restriction
-        as `revoke_note` — reinstatement is always a judgment call, never
-        `actor='system'`).
+        note got there via `revoke_note()`, `purge_expired_notes()`'s
+        automatic TTL expiry, or a supersession (`supersedes=` at write
+        time, `supersede_note()` post-hoc), so no separate un-expire /
+        un-supersede call is needed. Returns True if the note exists, False
+        if it does not exist in this workspace. Raises ValueError if
+        `actor` is invalid (same restriction as `revoke_note` —
+        reinstatement is always a judgment call, never `actor='system'`).
+
+        Supersession additionally tombstones COLUMNS on the note row
+        (`valid_until`/`superseded_at`/`superseded_by_note_id` — recall()'s
+        default exclusion and evaluate_note's never-fire check both read
+        those columns, not the fold), so reversing it also clears them here
+        when the CURRENT folded state is 'superseded'. Revocation and
+        expiry are event-only transitions and need no column reversal; an
+        active-state note gets no column write at all, so reinstating an
+        already-active note stays a pure no-op exactly as before."""
+        if actor not in NOTE_EVENT_ACTORS or actor == "system":
+            raise ValueError(
+                f"actor must be one of: {', '.join(a for a in NOTE_EVENT_ACTORS if a != 'system')}"
+            )
+        note = self.get_note(workspace, note_id)
+        if note is None:
+            return False
+        was_superseded = (
+            self.note_event_states(workspace, [note]).get(note_id, {}).get("state")
+            == "superseded"
+        )
+        with self._conn() as conn:
+            if was_superseded:
+                # UPG-NOTE-RETIRE-POST-HOC: clear the tombstone columns in
+                # the SAME transaction as the event, so a caller can never
+                # observe "folded back to active" while the row is still
+                # excluded from default recall()/fire().
+                conn.execute(
+                    """UPDATE notes SET valid_until = NULL, superseded_at = NULL,
+                       superseded_by_note_id = NULL
+                       WHERE workspace = ? AND note_id = ?""",
+                    (workspace, note_id),
+                )
+            _append_event(conn, workspace, note_id, "reinstated", actor=actor, reason=reason)
+        audit("REINSTATE", workspace=workspace, note_id=note_id, actor=actor)
+        return True
+
+    def supersede_note(
+        self,
+        workspace: str,
+        note_id: int,
+        superseded_by: int | None = None,
+        reason: str | None = None,
+        actor: str = "agent",
+    ) -> bool:
+        """Post-hoc supersession (UPG-NOTE-RETIRE-POST-HOC, `vectr_supersede`)
+        — retire an ALREADY-STORED note as superseded, for the case the
+        write-time `supersedes=` parameter cannot reach: the replacement was
+        written without it, and the old note only later turned out to be
+        already-superseded-in-substance. Appends a `superseded_post_hoc`
+        event — the SAME lifecycle state as write-time `superseded`, but a
+        distinct KIND, so the trail honestly records this link was asserted
+        after the fact by a caller judgment rather than born of a write.
+
+        Sets the exact columns the write-time path sets (`valid_until`,
+        `superseded_at`, `superseded_by_note_id`) so exclusion behaves
+        identically: dropped from default recall()/fire(), retained with its
+        history, rendered with the factual "[superseded ...]" badge — never
+        the revoked deterrent ("this note was WRONG" is `vectr_revoke`'s
+        semantics; a retired note was true when written and the world moved
+        on). Reversible via `reinstate_note()`.
+
+        `superseded_by`: optional note_id of the replacement, which must
+        already exist in this workspace (validated BEFORE any mutation —
+        same half-applied-write guard as remember()'s supersedes path).
+        Omitted, the note retires with no successor link and renders
+        "[superseded, <date>]".
+
+        `reason`: free text recorded on the event (the caller's evidence
+        that the old note's substance lives on elsewhere).
+
+        `actor` must be one of NOTE_EVENT_ACTORS other than 'system'
+        (reserved for the deterministic anchor-drift transition) — deciding
+        a stored note is already-superseded is a judgment call. Same
+        provenance write-boundary guard as remember()'s supersedes path,
+        keyed on the CALLER instead of a new write's provenance (there is
+        no new write here): an agent-actor call may not retire a
+        human-provenance note; only actor='human' may.
+
+        Returns True if the note exists and was retired, False if it does
+        not exist in this workspace. Raises ValueError on an invalid actor,
+        a `superseded_by` equal to `note_id` itself, or a `superseded_by`
+        that does not exist in this workspace.
         """
         if actor not in NOTE_EVENT_ACTORS or actor == "system":
             raise ValueError(
@@ -1563,9 +2249,44 @@ class WorkingContextStore:
         note = self.get_note(workspace, note_id)
         if note is None:
             return False
+        if superseded_by == note_id:
+            raise ValueError("superseded_by must reference a different note than the one being retired")
+        now = time.time()
         with self._conn() as conn:
-            _append_event(conn, workspace, note_id, "reinstated", actor=actor, reason=reason)
-        audit("REINSTATE", workspace=workspace, note_id=note_id, actor=actor)
+            # Validate the successor BEFORE mutating anything, mirroring
+            # remember()'s supersedes pre-insert validation.
+            if superseded_by is not None:
+                target = conn.execute(
+                    "SELECT note_id FROM notes WHERE workspace = ? AND note_id = ?",
+                    (workspace, superseded_by),
+                ).fetchone()
+                if target is None:
+                    raise ValueError(
+                        f"superseded_by references note #{superseded_by}, "
+                        "which does not exist in this workspace"
+                    )
+            # Provenance write-boundary guard (companion to remember()'s
+            # supersedes guard): an agent-actor call may not retire a
+            # human-provenance note — only a human-actor call may.
+            if note.provenance == "human" and actor != "human":
+                raise ValueError(
+                    f"note #{note_id} is provenance='human' -- an agent-actor "
+                    "call may not supersede a human-provenance note (only a "
+                    "human-actor call may)"
+                )
+            conn.execute(
+                """UPDATE notes SET valid_until = ?, superseded_at = ?, superseded_by_note_id = ?
+                   WHERE workspace = ? AND note_id = ?""",
+                (now, now, superseded_by, workspace, note_id),
+            )
+            _append_event(
+                conn, workspace, note_id, "superseded_post_hoc",
+                actor=actor, reason=reason,
+                payload=str(superseded_by) if superseded_by is not None else None,
+                ts=now,
+            )
+        audit("SUPERSEDE", workspace=workspace, note_id=note_id,
+              superseded_by=superseded_by, actor=actor)
         return True
 
     def note_event_states(
@@ -1630,6 +2351,191 @@ class WorkingContextStore:
         states = self._note_event_states_by_ids(workspace, [n.note_id for n in notes])
         return [n for n in notes if states.get(n.note_id, {}).get("state") != "expired"]
 
+    def _floor_candidate_pool(
+        self,
+        workspace: str,
+        tags: list[str] | None,
+        priority: str | None,
+        max_age_days: float | None,
+        session_id: str | None,
+    ) -> list[WorkingNote]:
+        """Every non-superseded, non-expired, scope-eligible note in
+        `workspace` (respecting the same tags/priority/max_age_days filters
+        an ordinary `recall()` call would apply), most-recent-first,
+        capped at `recall_floor.metadata_scan_ceiling` (UPG-RECALL-MISS-
+        FLOOR parts (b)/(c)). This is the candidate pool Tier 0 membership
+        and the deterministic tag/anchor/symbol/title channels are checked
+        against — unlike the ranked result, there is no relevance-ranked
+        shortcut for "does this note's own metadata mention the query", so
+        the whole eligible set (bounded by the ceiling) has to be scanned."""
+        from agent.config import RECALL_FLOOR_METADATA_SCAN_CEILING
+
+        sql = "SELECT * FROM notes WHERE workspace = ? AND valid_until IS NULL"
+        params: list = [workspace]
+        if priority:
+            sql += " AND priority = ?"
+            params.append(priority)
+        if tags:
+            tag_clauses = " OR ".join(["tags LIKE ?" for _ in tags])
+            sql += f" AND ({tag_clauses})"
+            params.extend([f'%"{t}"%' for t in tags])
+        if max_age_days is not None:
+            cutoff = time.time() - max_age_days * 86400
+            sql += " AND created_at >= ?"
+            params.append(cutoff)
+        sql += " ORDER BY created_at DESC, note_id DESC LIMIT ?"
+        params.append(RECALL_FLOOR_METADATA_SCAN_CEILING)
+
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        notes = [self._row_to_note(r) for r in rows]
+        notes = _scope_filter(notes, session_id=session_id)
+        notes = self._exclude_expired(workspace, notes)
+        return notes
+
+    def _recall_floor_notes(
+        self,
+        workspace: str,
+        query: str | None,
+        tags: list[str] | None,
+        priority: str | None,
+        max_age_days: float | None,
+        session_id: str | None,
+        limit: int,
+    ) -> tuple[list[WorkingNote], list[WorkingNote]]:
+        """Tier 0 (pinned notes, unconditional) and deterministic
+        tag/anchor/symbol/title channel hits for `query` (UPG-RECALL-MISS-
+        FLOOR parts (b)/(c), revised round 4). Returns (tier0,
+        deterministic) — `recall()` merges both ahead of the ranked
+        result via `_merge_recall_floor()`. Tier 0 needs no `query` at
+        all (a pin is unconditional by definition); the deterministic
+        channel returns [] when `query` is empty since there is nothing
+        to check containment against, and also returns [] whenever
+        `RECALL_FLOOR_DETERMINISTIC_ENABLED` is false (see below).
+
+        Tier 0 is PINNED-ONLY as of round 4 (it used to also include
+        every `kind == 'directive'` note). Directive notes were dropped
+        from its candidate predicate because `boot_recall()` already
+        returns ALL directive notes unconditionally every session
+        (capped by config.BOOT_MAX_DIRECTIVE_NOTES, default 100) —
+        including them here a second time only charged query budget for
+        a guarantee that already exists on a stronger, dedicated
+        channel. The pin is the only note kind with NO other guaranteed-
+        delivery path, so it is the only kind Tier 0 still carries; the
+        pin-vs-directive priority sort this method used to need is gone
+        along with the directive branch — pinned is now the sole
+        candidate kind, so there is nothing left to choose between.
+
+        Tier 0's cap (UPG-RECALL-MISS-FLOOR F1 fix, revised per review) is
+        `min(tier0_max_notes, max(tier0_guaranteed, floor(limit *
+        tier0_max_share_of_limit)))`, where `tier0_guaranteed = max(1,
+        min(tier0_min_notes, floor(limit * tier0_max_share_of_limit)))` —
+        never 0 for any `limit >= 1` (F1's requirement), but scaled by the
+        same share as the ceiling rather than flat-taxing a tight budget
+        at the full `tier0_min_notes` count. At the production default
+        (limit=10) this yields 2 (room for more than one pinned note to
+        survive at once); at limit=3 or limit=5 it yields 1 (a single
+        guaranteed slot — the most recently pinned note). "A pinned note
+        is returned regardless of query" holds at every limit >= 1; room
+        for a SECOND simultaneous pin only opens up at limit>=10; see
+        agent/config.yaml's recall_floor comments for the exact crossover
+        reasoning.
+
+        The deterministic channel is OFF BY DEFAULT
+        (`RECALL_FLOOR_DETERMINISTIC_ENABLED`, config key
+        `recall_floor.deterministic_enabled`). Measured against the live
+        38-query labeled corpus, its declared-metadata containment
+        predicate is too loose to act as a guarantee (mean ~50 candidate
+        notes matched per query against ~1 labeled-relevant note; a
+        floor-cap sweep showed its effect on measured recall is NOT
+        monotonic in budget — see the config.yaml comment on
+        `deterministic_enabled` for the full numbers). This is evidence-
+        gating, not deletion: the code below, its cap formula (F3 fix),
+        and its match-specificity ordering (F2 fix) are unchanged and
+        still fully tested — a future task can tighten the predicate
+        (e.g. require 2+ matched channels for pool membership, not just
+        to win a tie) and flip the flag back on with fresh evidence.
+
+        The deterministic channel's cap (UPG-RECALL-MISS-FLOOR F3 fix),
+        when enabled, is `min(deterministic_max_notes, floor((limit -
+        len(tier0)) * deterministic_max_share_of_remaining))` — bounded
+        by a share of what Tier 0 did NOT use, not a share of `limit`
+        directly, so it is the direct statement of "the deterministic
+        channel never takes more than the ranked group": at most an
+        equal split of whatever Tier 0 left behind, guaranteeing ranked
+        fill at least as many slots as the deterministic channel claims.
+
+        When more notes match the deterministic channel than fit its cap,
+        the matched set is ranked by its own match specificity (UPG-
+        RECALL-MISS-FLOOR F2 fix — `_declared_metadata_match_specificity()`
+        above) before truncating, so a note matching MORE of its own
+        declared fields, or matching them with a longer/more-specific
+        string, wins a scarce slot over one that merely happens to be the
+        most recently written among dozens of equally-valid matches.
+        """
+        from agent.config import (
+            RECALL_FLOOR_DETERMINISTIC_ENABLED,
+            RECALL_FLOOR_DETERMINISTIC_MAX_NOTES,
+            RECALL_FLOOR_DETERMINISTIC_MAX_SHARE_OF_REMAINING,
+            RECALL_FLOOR_TIER0_MAX_NOTES,
+            RECALL_FLOOR_TIER0_MAX_SHARE_OF_LIMIT,
+            RECALL_FLOOR_TIER0_MIN_NOTES,
+        )
+
+        pool = self._floor_candidate_pool(workspace, tags, priority, max_age_days, session_id)
+
+        tier0_share_cap = int(limit * RECALL_FLOOR_TIER0_MAX_SHARE_OF_LIMIT)
+        # max(1, ...) is F1's guarantee: never truncate to 0 for any
+        # limit >= 1. min(TIER0_MIN_NOTES, share) rather than flat
+        # TIER0_MIN_NOTES: at a tight `limit` the guarantee scales down
+        # to a single slot instead of unconditionally spending
+        # TIER0_MIN_NOTES worth of budget.
+        tier0_guaranteed = max(1, min(RECALL_FLOOR_TIER0_MIN_NOTES, tier0_share_cap))
+        tier0_cap = min(RECALL_FLOOR_TIER0_MAX_NOTES, max(tier0_guaranteed, tier0_share_cap))
+        # `pool` is ordered created_at DESC, note_id DESC (see
+        # _floor_candidate_pool) — slicing to `tier0_cap` here means Tier 0
+        # is, in practice, "the tier0_cap MOST RECENTLY PINNED notes" in
+        # the workspace. A workspace holding more pinned notes than the
+        # cap will never surface an older one via this tier; that is a
+        # deliberate, stated bound of the design (recency is a reasonable
+        # deterministic tie-break for an otherwise-unconditional
+        # guarantee), not an accident of pool order. Pinned-only as of
+        # round 4 (see the docstring above for why directives were
+        # dropped) — no ordering is needed among candidates beyond the
+        # pool's own recency order, since there is only one candidate
+        # kind left.
+        tier0_candidates = [n for n in pool if n.pinned]
+        tier0 = tier0_candidates[:tier0_cap]
+        tier0_ids = {n.note_id for n in tier0}
+
+        deterministic: list[WorkingNote] = []
+        if not RECALL_FLOOR_DETERMINISTIC_ENABLED:
+            return tier0, deterministic
+
+        remaining_after_tier0 = max(limit - len(tier0), 0)
+        det_cap = min(
+            RECALL_FLOOR_DETERMINISTIC_MAX_NOTES,
+            int(remaining_after_tier0 * RECALL_FLOOR_DETERMINISTIC_MAX_SHARE_OF_REMAINING),
+        )
+        if query and det_cap > 0:
+            scored: list[tuple[tuple[int, int], WorkingNote]] = []
+            for n in pool:
+                if n.note_id in tier0_ids:
+                    continue
+                specificity = _declared_metadata_match_specificity(n, query)
+                if specificity[0] > 0:
+                    scored.append((specificity, n))
+            # Order the already-matched set by its own match specificity,
+            # strongest first; Python's sort is stable, so notes tied on
+            # specificity keep the pool's created_at DESC order as the
+            # final, deterministic tie-break. This orders WHICH matches
+            # win a scarce slot — it never decides membership, which
+            # already happened above via containment against each note's
+            # own declared metadata (UPG-RECALL-MISS-FLOOR F2 fix).
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            deterministic = [n for _, n in scored[:det_cap]]
+        return tier0, deterministic
+
     def recall(
         self,
         workspace: str,
@@ -1643,6 +2549,7 @@ class WorkingContextStore:
         max_age_days: float | None = None,
         sort_by: str = "relevance",
         session_id: str | None = None,
+        apply_floor: bool = False,
     ) -> list[WorkingNote]:
         """Retrieve working notes.
 
@@ -1685,7 +2592,59 @@ class WorkingContextStore:
         session_id is omitted here) is excluded from the result. Applied as
         a post-filter after the SQL LIMIT, so it may return fewer than
         `limit` results — the same trade-off min_similarity already accepts.
+
+        apply_floor (UPG-RECALL-MISS-FLOOR parts (b)/(c), revised round
+        4): compose the ordinary ranked result (semantic or SQL, above/
+        below unchanged) with two never-scored guarantees, in this fixed
+        precedence — Tier 0 (every explicitly PINNED note, unconditional;
+        directive notes were dropped from this tier in round 4 — see
+        `_recall_floor_notes()`'s docstring for why: they already have
+        their own unconditional, uncapped-per-query channel in
+        `boot_recall()`) first, then the deterministic tag/anchor/symbol/
+        title channels (`_note_matches_declared_metadata()` — matched
+        against each candidate note's OWN stored metadata, never a
+        classification of `query`, ranked among themselves by match
+        specificity when more match than fit — UPG-RECALL-MISS-FLOOR F2
+        fix; OFF BY DEFAULT as of round 4, see `recall_floor.
+        deterministic_enabled` in agent/config.yaml for the measured
+        evidence gate), then the ranked result fills whatever budget
+        remains. Tier 0 is bounded by a guaranteed MINIMUM (recall_floor.
+        tier0_min_notes — room for more than one simultaneous pin
+        whenever `limit` leaves enough room) with an absolute ceiling
+        (tier0_max_notes) and a share-of-`limit` ceiling
+        (tier0_max_share_of_limit) on top of that minimum; the
+        deterministic channel, when enabled, is bounded by its own
+        absolute ceiling (deterministic_max_notes) and a share of
+        whatever Tier 0 did NOT use (deterministic_max_share_of_remaining
+        — never more than the ranked group gets from what's left). See
+        `_recall_floor_notes()` for the exact formulas. Together these
+        mean the two floor channels combined can never claim the whole
+        budget and displace ranked fill entirely, at any `limit` a caller
+        passes, while Tier 0's own guarantee cannot silently shrink to
+        zero at a small `limit` either. With zero pinned notes in a
+        workspace and the deterministic channel at its shipped default of
+        off, apply_floor=True and apply_floor=False produce byte-
+        identical output — nothing is consumed unconditionally unless a
+        caller actually opted in via a pin. The combined, de-duplicated
+        result is always truncated to `limit` — this method never returns
+        more than `limit` notes regardless of how many candidates the
+        floor and the ranked result each contribute.
+        Ignored (no floor notes computed) when `kind` narrows the query to
+        one specific kind — a caller that explicitly asked for one kind
+        gets exactly that kind, unmodified, same as apply_floor=False.
+        Defaults False, preserving this method's exact pre-existing
+        behavior for every caller that predates this parameter (including
+        every other call site in this codebase); `VectrService._recall_impl
+        ()`'s ordinary query branch — the code path `vectr_recall`/`vectr
+        recall` actually hits for a plain query — passes True.
         """
+        floor_tier0: list[WorkingNote] = []
+        floor_det: list[WorkingNote] = []
+        if apply_floor and kind is None:
+            floor_tier0, floor_det = self._recall_floor_notes(
+                workspace, query, tags, priority, max_age_days, session_id, limit,
+            )
+
         # Semantic path: embed the query, find cosine-nearest notes, then fetch from SQLite.
         if query and self._notes_col is not None and self._embed_fn is not None:
             try:
@@ -1695,7 +2654,7 @@ class WorkingContextStore:
                 )
                 audit("RECALL", workspace=workspace, query=query, notes_returned=len(notes),
                       method="semantic")
-                return notes
+                return _merge_recall_floor(floor_tier0, floor_det, notes, limit)
             except Exception:
                 pass  # fall through to SQL LIKE
 
@@ -1779,7 +2738,7 @@ class WorkingContextStore:
 
         audit("RECALL", workspace=workspace, query=query or "", notes_returned=len(notes),
               method="sql")
-        return notes
+        return _merge_recall_floor(floor_tier0, floor_det, notes, limit)
 
     def recall_scored(
         self,
@@ -1842,17 +2801,42 @@ class WorkingContextStore:
 
         max_age_days: applied as a SQL filter after candidate fetch (UPG-RECALL-HIERARCHY).
         sort_by: 'relevance' preserves semantic order; 'recency'/'priority'/
-        'chronological' each re-sort the candidate set after fetch
-        (UPG-RECALL-HIERARCHY, UPG-DECISION-TIMELINE).
+        'chronological' each re-sort the candidate set after fetch, with a
+        sort-aware SQL prefetch guaranteeing the true top-`limit` rows by
+        that key are present even when they missed the semantic pool
+        (UPG-RECALL-HIERARCHY, UPG-DECISION-TIMELINE,
+        UPG-RECALL-SEMANTIC-POOL-SORT-TRUNCATION).
         session_id: scope="session" enforcement (TRIGGER-ENGINE wave 2a) —
         see recall()'s docstring; the same post-LIMIT trade-off applies.
         """
-        # Cap n_results at collection size to avoid ChromaDB errors on small collections
         with timed_chroma_call("count"):
             col_count = self._notes_col.count()
         if col_count == 0:
             return []
-        n_query = min(limit * 3, col_count)
+        # GLOBAL collection, SQL-filtered only after the vector search:
+        # over-fetch through the canonical width helper (docstring carries
+        # the full invariant; the col_count cap avoids ChromaDB errors on
+        # collections smaller than the ask).
+        #
+        # UPG-SEMANTIC-UNDERFILL: a `kind` filter is a SQL-side predicate
+        # whose selectivity against the same-workspace corpus is unknowable
+        # at fetch time. The base width is `limit * 3`; if 90% of the pool
+        # is the wrong kind, the render still leaves the caller short of
+        # `limit` with no signal that the shortfall is a pool artifact
+        # rather than the store's true answer. `kind` is the one filter
+        # whose selectivity has a rough prior (kind takes one of 7 values,
+        # so even a perfectly-distributed corpus has ~14% of rows passing),
+        # so deepen the pool with `floor=limit*10` only when `kind` is set.
+        # This is a guess, not a measurement: the cost is a single ChromaDB
+        # query at a wider `n_results` (cosine over pre-computed vectors,
+        # the actual embeddings are not recomputed), which the
+        # `working_memory_fetch_width` helper's col_count cap still bounds
+        # for small corpora. min_similarity is intentionally NOT widened
+        # here: it's a cutoff on the score itself, so a query whose whole
+        # pool sits below the floor SHOULD return nothing — that's correct
+        # behavior, not underfill.
+        kind_floor = limit * 10 if kind else 0
+        n_query = working_memory_fetch_width(limit, col_count, floor=kind_floor)
 
         q_vec = self._embed_query_fn([query])[0]
         with timed_chroma_call("query"):
@@ -1882,31 +2866,46 @@ class WorkingContextStore:
             if not candidate_ids:
                 return []
 
-        # Fetch from SQLite by semantic candidate IDs, applying metadata filters
-        placeholders = ",".join("?" * len(candidate_ids))
-        sql = f"SELECT * FROM notes WHERE workspace = ? AND note_id IN ({placeholders})"
-        params: list = [workspace, *candidate_ids]
+        # Metadata filters, built ONCE and shared by two queries: the
+        # semantic-candidate fetch immediately below, and the sort-aware
+        # prefetch in the non-relevance branch further down
+        # (UPG-RECALL-SEMANTIC-POOL-SORT-TRUNCATION). They deliberately
+        # EXCLUDE the `note_id IN (...)` semantic restriction, which is
+        # appended only to the candidate fetch: the prefetch's entire job is
+        # to reach rows that MISSED the semantic pool, so reusing a WHERE
+        # clause that pins membership to that same pool would make it a
+        # no-op.
+        filter_sql = ""
+        filter_params: list = []
 
         if not include_superseded:
-            sql += " AND valid_until IS NULL"
+            filter_sql += " AND valid_until IS NULL"
 
         if priority:
-            sql += " AND priority = ?"
-            params.append(priority)
+            filter_sql += " AND priority = ?"
+            filter_params.append(priority)
 
         if kind:
-            sql += " AND kind = ?"
-            params.append(kind)
+            filter_sql += " AND kind = ?"
+            filter_params.append(kind)
 
         if tags:
             tag_clauses = " OR ".join(["tags LIKE ?" for _ in tags])
-            sql += f" AND ({tag_clauses})"
-            params.extend([f'%"{t}"%' for t in tags])
+            filter_sql += f" AND ({tag_clauses})"
+            filter_params.extend([f'%"{t}"%' for t in tags])
 
         if max_age_days is not None:
             cutoff = time.time() - max_age_days * 86400
-            sql += " AND created_at >= ?"
-            params.append(cutoff)
+            filter_sql += " AND created_at >= ?"
+            filter_params.append(cutoff)
+
+        # Fetch from SQLite by semantic candidate IDs, applying metadata filters
+        placeholders = ",".join("?" * len(candidate_ids))
+        sql = (
+            f"SELECT * FROM notes WHERE workspace = ? AND note_id IN ({placeholders})"
+            + filter_sql
+        )
+        params: list = [workspace, *candidate_ids, *filter_params]
 
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -1914,11 +2913,82 @@ class WorkingContextStore:
         # Preserve semantic rank order by default (ChromaDB returns by ascending distance)
         id_to_row = {r["note_id"]: r for r in rows}
         if sort_by == "relevance":
+            # UPG-SEMANTIC-UNDERFILL: a `kind` filter can leave the
+            # relevance branch under-filled even after the fetch width
+            # deepening above. The pool-deepening is a guess; this prefetch
+            # is the deterministic backstop — it re-runs the same
+            # `kind`/`valid_until`/etc. metadata filters (NO semantic
+            # `note_id IN (...)` clause, otherwise the prefetch would be a
+            # no-op) and unions the survivors into the rank-ordered pool.
+            # Survivors arrive appended to the end of candidate_ids so the
+            # `[:limit]` below keeps the existing rank order for notes that
+            # were in the original pool and only fills the tail with these
+            # additional same-workspace, kind-matching rows. min_similarity
+            # is NOT applied here: it's a vector-score cutoff, not a
+            # selectivity filter, so prefetched rows have no measured score
+            # to compare against. (This mirrors the existing
+            # sort-aware-prefetch in the non-relevance branch below, which
+            # also exempts prefetched rows from min_similarity — see the
+            # UPG-RECALL-SEMANTIC-POOL-SORT-TRUNCATION comment.)
+            if kind:
+                prefetch_sql_kind = (
+                    "SELECT * FROM notes WHERE workspace = ?"
+                    + filter_sql
+                    + " ORDER BY created_at DESC LIMIT ?"
+                )
+                with self._conn() as conn:
+                    rows_kind = conn.execute(
+                        prefetch_sql_kind, [workspace, *filter_params, limit],
+                    ).fetchall()
+                existing_ids = set(id_to_row.keys())
+                for r in rows_kind:
+                    if r["note_id"] not in existing_ids:
+                        id_to_row[r["note_id"]] = r
+                        # Append to candidate_ids so the [:limit] below
+                        # keeps the semantic rank order for pool survivors
+                        # and only fills the tail with the prefetched rows.
+                        candidate_ids.append(r["note_id"])
             ordered = [id_to_row[nid] for nid in candidate_ids if nid in id_to_row][:limit]
             notes = [self._row_to_note(r) for r in ordered]
         else:
+            # UPG-RECALL-SEMANTIC-POOL-SORT-TRUNCATION: the pool holds only
+            # the top `limit * 3` SEMANTIC matches, so when more notes than
+            # that pass the metadata filters above, re-sorting just the pool
+            # can silently drop the true oldest/highest-priority/newest note
+            # (it never made the semantic pool). For an explicit non-relevance
+            # sort, re-run the same METADATA filters (without the semantic
+            # `note_id IN (...)` restriction) with that sort's ORDER BY so the
+            # true top-`limit` rows by the requested key are guaranteed
+            # present, and union them into the pool (setdefault keeps every
+            # semantic-pool row already fetched). Membership deliberately may
+            # ignore query similarity here: a caller naming a sort invokes an
+            # ordering contract over the filtered corpus, not "the nearest few,
+            # reordered". min_similarity does NOT gate these prefetched rows —
+            # cosine similarity is only defined within the measured pool.
+            # Unknown sort_by values get no prefetch, matching recall()'s SQL
+            # path's fall-through-to-default leniency.
+            _SORT_ORDER_SQL = {
+                # ORDER BY fragments mirror recall()'s canonical copies above.
+                "recency": " ORDER BY created_at DESC LIMIT ?",
+                "priority": (
+                    " ORDER BY CASE priority WHEN 'high' THEN 0"
+                    " WHEN 'medium' THEN 1 ELSE 2 END, created_at DESC LIMIT ?"
+                ),
+                "chronological": " ORDER BY created_at ASC, note_id ASC LIMIT ?",
+            }
+            order_sql = _SORT_ORDER_SQL.get(sort_by)
+            if order_sql is not None:
+                prefetch_sql = (
+                    "SELECT * FROM notes WHERE workspace = ?" + filter_sql + order_sql
+                )
+                with self._conn() as conn:
+                    rows_pre = conn.execute(
+                        prefetch_sql, [workspace, *filter_params, limit]
+                    ).fetchall()
+                for r in rows_pre:
+                    id_to_row.setdefault(r["note_id"], r)
             # Convert all candidates to notes, then re-sort.
-            all_notes = [self._row_to_note(r) for r in rows]
+            all_notes = [self._row_to_note(r) for r in id_to_row.values()]
             if sort_by == "recency":
                 all_notes.sort(key=lambda n: n.created_at, reverse=True)
             elif sort_by == "priority":
@@ -2015,6 +3085,13 @@ class WorkingContextStore:
         start = time.time()
         migrated = self._reembed_all_notes()
         self._write_notes_embed_model_stamp()
+        if self._notes_collection_recreated:
+            logger.warning(
+                "vectr: working_memory collection rebuilt for embed model "
+                "switch %r -> %r — note vectors were rebuilt from SQLite "
+                "content; note rows and every other collection are untouched",
+                stamped, self._embed_model,
+            )
         logger.info(
             "vectr: migrated %d working-memory note vector(s) from embed model "
             "%r to %r in %.2fs",
@@ -2030,11 +3107,7 @@ class WorkingContextStore:
         includes superseded notes: they remain queryable via
         `recall(include_superseded=True)`, so their vectors must stay in the
         current embedding space too. Note content, ids, and every other SQL
-        column are untouched; only the vector side is rewritten. When the
-        previous model pinned a different vector dimensionality on the
-        collection the upsert is rejected, so the collection is dropped and
-        rebuilt (see _recreate_notes_collection) and the pass retried — still
-        vectors only, still rebuilt from the SQLite rows.
+        column are untouched; only the vector side is rewritten.
         """
         with self._conn() as conn:
             rows = conn.execute("SELECT note_id, content FROM notes").fetchall()
@@ -2055,54 +3128,66 @@ class WorkingContextStore:
         if not contents:
             return 0
 
+        # chromadb 1.x keeps `errors` off the top-level import (lazy), so this
+        # import sits here rather than at the top of the module.
         from chromadb.errors import ChromaError
 
-        try:
-            self._upsert_note_vectors(ids, contents)
-        except ChromaError as exc:
-            # ChromaDB pins a collection's vector dimensionality at its first
-            # insert, so re-embedding with a model of ANOTHER dimensionality
-            # cannot land in the collection the old model created (verified
-            # against the installed client: the upsert raises
-            # chromadb.errors.InvalidArgumentError). Rebuild the vector side
-            # only and retry the migration once. A failure after the retry
-            # propagates to the caller's warning path, which leaves the SQLite
-            # notes exactly as they were.
-            logger.warning(
-                "vectr: note re-embed upsert failed (%s) — rebuilding the "
-                "working_memory vector collection and retrying once", exc,
-            )
-            self._recreate_notes_collection()
-            self._upsert_note_vectors(ids, contents)
-        return len(contents)
-
-    def _upsert_note_vectors(self, ids: list[str], contents: list[str]) -> None:
-        """One batched pass of note-vector upserts into `working_memory`."""
+        self._notes_collection_recreated = False
         for start in range(0, len(contents), _NOTES_REEMBED_BATCH_SIZE):
             batch_ids = ids[start:start + _NOTES_REEMBED_BATCH_SIZE]
             batch_contents = contents[start:start + _NOTES_REEMBED_BATCH_SIZE]
             vectors = self._embed_fn(batch_contents)
-            with timed_chroma_call("upsert"):
-                self._notes_col.upsert(ids=batch_ids, embeddings=vectors)
+            try:
+                with timed_chroma_call("upsert"):
+                    self._notes_col.upsert(ids=batch_ids, embeddings=vectors)
+            except ChromaError as exc:
+                if not _is_embedding_dimension_conflict(exc):
+                    raise
+                # The collection pinned its vector dimensionality on the first
+                # vector written to it (an older model's output size), so a
+                # model change that lands on a different size can never be
+                # migrated by upsert alone — the vectors are rejected before a
+                # single batch is written. The vectors are derived data: the
+                # SQLite rows are the notes, and this migration rewrites
+                # vectors only. So rebuild the `working_memory` collection only
+                # — never any other chroma collection, never SQLite — and retry
+                # the migration once. A failure after the retry propagates to
+                # the caller's warning path, which leaves the SQLite notes
+                # exactly as they were.
+                logger.warning(
+                    "vectr: note re-embed upsert failed (%s) — rebuilding the "
+                    "working_memory collection and retrying once", exc,
+                )
+                self._recreate_notes_collection()
+                self._notes_collection_recreated = True
+                with timed_chroma_call("upsert"):
+                    self._notes_col.upsert(ids=batch_ids, embeddings=vectors)
+        return len(contents)
 
     def _recreate_notes_collection(self) -> None:
-        """Drop and rebuild the `working_memory` vector collection.
+        """Drop and recreate the `working_memory` chroma collection ONLY.
 
-        Vectors only. That collection holds ids + embeddings and every embedding
-        is reconstructible from its note's SQLite row, while the note itself —
-        content, id, tags, kind, priority, timestamps — lives in
-        working_context.sqlite and is neither read nor written here. A rebuild
-        therefore cannot delete or overwrite a note; the caller re-embeds every
-        note from its row immediately afterwards.
+        Scoped to that one collection: the index/code-symbol collections live
+        in a different chroma client (app/service.py's) and are not touched,
+        and no SQLite statement runs here — note rows, ids and every other
+        column survive a rebuild. `get_or_create_collection` re-applies the
+        same creation metadata (`hnsw:space=cosine`) the startup paths use, so
+        the rebuilt collection has the same contract as a fresh one, and the
+        next vector written re-pins the dimensionality to the CURRENT embed
+        model.
         """
+        self._notes_collection_recreated = True
         if self._notes_chroma_client is None:
-            raise RuntimeError(
-                "cannot rebuild the working_memory collection: its ChromaDB "
-                "client is unavailable"
-            )
-        self._notes_chroma_client.delete_collection("working_memory")
+            self._notes_col = None
+            return
+        try:
+            with timed_chroma_call("delete"):
+                self._notes_chroma_client.delete_collection("working_memory")
+        except Exception:
+            pass  # nothing to delete — create below
         self._notes_col = self._notes_chroma_client.get_or_create_collection(
-            name="working_memory", metadata={"hnsw:space": "cosine"}
+            name="working_memory",
+            metadata={"hnsw:space": "cosine"},
         )
 
     def backfill_missing_vectors(self) -> int:
@@ -2401,6 +3486,118 @@ class WorkingContextStore:
             ).fetchone()
         return self._row_to_note(row) if row is not None else None
 
+    def notes_for_export(self, workspace: str) -> list[WorkingNote]:
+        """Every note still in this workspace's table (not hard-deleted via
+        forget), in a fixed note_id-ascending order — the deterministic
+        source list for `vectr memory export`
+        (UPG-MEMORY-LEGIBLE-FILE-PROJECTION part (a)).
+
+        Unlike recall()/format_notes_for_llm(), this is deliberately
+        unfiltered: it includes superseded and revoked notes (the export
+        mirror is meant to read as a full audit log of what memory learned,
+        not a ranked or narrowed view) and is never relevance-ranked, so
+        calling this twice with no intervening write returns the identical
+        list in the identical order every time — the property the export
+        file's byte-identical-re-export acceptance bar depends on.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notes WHERE workspace = ? ORDER BY note_id ASC",
+                (workspace,),
+            ).fetchall()
+        return [self._row_to_note(r) for r in rows]
+
+    def notes_for_edit(self, workspace: str) -> list[WorkingNote]:
+        """Every note in `workspace` whose folded lifecycle state (UPG-
+        MEMORY-STATE-MACHINE §4.1) is `active` — the candidate set for
+        `vectr memory edit` (UPG-MEMORY-LEGIBLE-FILE-PROJECTION part (b)),
+        in the same note_id-ascending order `notes_for_export()` uses.
+
+        Deliberately NARROWER than `notes_for_export()`, which renders
+        superseded and revoked notes too because the export mirror is a
+        full audit log — an edit buffer must offer only notes a caller
+        could sensibly change: editing a revoked note's anti-memory
+        deterrent text is meaningless, and presenting a superseded note's
+        stale content as "deletable" invites deleting the wrong half of a
+        supersession pair (the supersession itself already IS that note's
+        retirement).
+
+        `valid_until IS NULL` alone is not a sufficient filter here (unlike
+        `_floor_candidate_pool`'s use of it, where a revoked note is fine to
+        include): it excludes superseded notes, but a revoked note keeps
+        `valid_until` NULL too — only the `note_events` fold distinguishes
+        "revoked" from "active". This method's own filtering step below is
+        the same fold `_exclude_expired()` already performs, just inverted
+        to KEEP `active` instead of dropping `expired`.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notes WHERE workspace = ? AND valid_until IS NULL ORDER BY note_id ASC",
+                (workspace,),
+            ).fetchall()
+        notes = [self._row_to_note(r) for r in rows]
+        if not notes:
+            return notes
+        states = self._note_event_states_by_ids(workspace, [n.note_id for n in notes])
+        return [n for n in notes if states.get(n.note_id, {}).get("state", "active") == "active"]
+
+    def update_note_fields(
+        self,
+        workspace: str,
+        note_id: int,
+        kind: str | None = None,
+        priority: str | None = None,
+        tags: list[str] | None = None,
+    ) -> bool:
+        """In-place metadata update for `kind`/`priority`/`tags` — mutable
+        columns, unlike `content` (protected by the append-only lifecycle
+        invariant; a content change is always a `remember(supersedes=...)`
+        write, never a mutation of an existing row — see `remember()`'s
+        docstring). Powers `vectr memory edit`'s field-update mapping
+        (UPG-MEMORY-LEGIBLE-FILE-PROJECTION part (b)): body unchanged,
+        kind/priority/tags changed. Same "plain UPDATE + one `audit()` call,
+        no `note_events` row" shape `set_pinned()` already uses for its own
+        directly-mutable column — kind/priority/tags carry no lifecycle-
+        state meaning of their own, so there is nothing here for the
+        append-only fold to need to reverse.
+
+        Only the fields actually passed (not None) are written; at least
+        one must be given. An unrecognised `kind` falls back to
+        `DEFAULT_KIND`, matching `remember()`'s own silent-fallback
+        behaviour for the same input. Returns False if the note does not
+        exist in this workspace.
+        """
+        if kind is None and priority is None and tags is None:
+            raise ValueError("update_note_fields requires at least one of kind/priority/tags")
+        if kind is not None and kind not in VALID_KINDS:
+            kind = DEFAULT_KIND
+        note = self.get_note(workspace, note_id)
+        if note is None:
+            return False
+        set_clauses: list[str] = []
+        params: list = []
+        if kind is not None:
+            set_clauses.append("kind = ?")
+            params.append(kind)
+        if priority is not None:
+            set_clauses.append("priority = ?")
+            params.append(priority)
+        if tags is not None:
+            set_clauses.append("tags = ?")
+            params.append(json.dumps(tags))
+        params.extend([workspace, note_id])
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE notes SET {', '.join(set_clauses)} WHERE workspace = ? AND note_id = ?",
+                params,
+            )
+        audit(
+            "MEMORY_EDIT_FIELD_UPDATE", workspace=workspace, note_id=note_id,
+            kind=kind or "", priority=priority or "",
+            tags=",".join(tags) if tags is not None else "",
+        )
+        return True
+
     def recall_for_path(
         self,
         workspace: str,
@@ -2466,7 +3663,8 @@ class WorkingContextStore:
         path_candidates = _path_trigger_candidates(workspace, file_path)
         relpath = next((c for c in (path_candidates or ()) if c != file_path), "")
         relpath_or_basename = relpath if relpath else basename
-        # `path_candidates` is only "as-given plus workspace-relative"
+        # `path_candidates` is "as-given plus workspace-relative, plus the
+        # workspace-rooted absolute form for a relative input"
         # (`_path_trigger_candidates()`'s own contract, shared with `fire()`'s
         # live P-primitive evaluation) — it has no bare-basename form of its
         # own unless the file happens to sit directly at the workspace root
@@ -2670,33 +3868,85 @@ class WorkingContextStore:
         never mutates or expires anything itself.
 
         A note counts as "live" here the same way recall() treats it by
-        default: valid_until IS NULL (an explicit tombstone via supersedes
-        excludes a note from ever firing again, so it must not double-count
-        toward staleness pressure). Oldest is by created_at ASC, note_id ASC
-        tie-break, matching the ordering convention used elsewhere in this
-        store.
+        default: a `valid_until IS NULL` row AND a folded event state of
+        `active`. `valid_until IS NULL` alone is the original (pre-UPG-
+        STALE-TASK-SUMMARY-COUNTS-DEAD-STATES) predicate — it caught the
+        supersede tombstone (an explicit `valid_until` write) but missed
+        two EVENT-fold terminal states the same store can leave a row in
+        with `valid_until` still NULL:
+          - REVOKED (`revoke_note()` never sets `valid_until` by the
+            anti-memory contract — a revoked note stays a default recall()/
+            fire() candidate so its deterrent rendering can substitute for
+            the raw content; tombstoning it would silently hide exactly
+            the wrongness the caller flagged).
+          - EXPIRED (`purge_expired_notes()` appends the `expired` event
+            and deliberately leaves the columns NULL, per
+            UPG-MEMORY-DECAY-KIND-SCOPED's append-only invariant; the row
+            stays visible via get_note() so a caller can still inspect
+            what expired, only the default listing surfaces exclude it).
+        Consequence before this fix: a stale-task nudge would recommend
+        "consider supersedes=<old id>" for notes the system itself had
+        already retired (expired) or the user had already judged wrong
+        (revoked) — wrong-footed rather than harmful, but exactly the
+        noise UPG-HYGIENE-THRESHOLD-RETUNE is trying to measure. The fix
+        consults the event fold (UPG-MEMORY-STATE-MACHINE §4.1) for the
+        candidate task-note set and drops every note whose folded state
+        is not `active`. Notes with no events at all (pre-migration
+        rows) fold to `active` by `fold()`'s own default — the same
+        state a brand-new `created` event would produce, so old notes
+        keep counting exactly as before.
+
+        Cost profile change: the old shape was one SQL round trip
+        returning `(count, oldest_id)`; the new shape is one SQL round
+        trip for the candidate set, one batched `note_events` fetch +
+        Python fold for those candidate IDs, and a final min() over the
+        filtered list. The `note_events` fetch is bounded by the size of
+        the candidate task-note set (not the whole workspace), so the
+        added work is O(N) over the at-risk note population, not O(N)
+        over the workspace. The derived-column alternative (cache the
+        folded state on the row) would buy the same correctness at a
+        schema-migration cost; rejected for the same reason
+        `_exclude_expired()` chose the fold — a column duplicating
+        something the append-only log already authoritatively says would
+        be a permanent two-writer-update consistency hazard (every
+        `revoke_note` / `reinstate_note` / `purge_expired_notes` call
+        would have to remember to update the cache alongside the event
+        write, or the cache would silently disagree with the fold).
+
+        Oldest is by created_at ASC, note_id ASC tie-break, matching
+        the ordering convention used elsewhere in this store.
         """
         cutoff = time.time() - min_age_days * 86400
         with self._conn() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT COUNT(*), (
-                    SELECT note_id FROM notes
-                    WHERE workspace = ? AND kind = 'task' AND valid_until IS NULL
-                          AND created_at < ?
-                    ORDER BY created_at ASC, note_id ASC LIMIT 1
-                )
-                FROM notes
+                SELECT note_id, created_at FROM notes
                 WHERE workspace = ? AND kind = 'task' AND valid_until IS NULL
                       AND created_at < ?
                 """,
-                (workspace, cutoff, workspace, cutoff),
-            ).fetchone()
-        if not row:
+                (workspace, cutoff),
+            ).fetchall()
+        if not rows:
             return 0, None
-        count = row[0] or 0
-        oldest_id = row[1] if row[1] is not None else None
-        return count, oldest_id
+        # Fold the candidate set: `valid_until IS NULL` already excludes
+        # the supersede tombstone (which DOES set `valid_until`), so the
+        # remaining candidates can only be in EVENT-fold terminal states
+        # `revoked` or `expired` (both leave `valid_until` NULL by their
+        # contracts above). A note with no events folds to `active` —
+        # the pre-migration default, preserved here.
+        candidate_ids = [r["note_id"] for r in rows]
+        states = self._note_event_states_by_ids(workspace, candidate_ids)
+        live = [
+            r for r in rows
+            if states.get(r["note_id"], {}).get("state", "active") == "active"
+        ]
+        if not live:
+            return 0, None
+        # Oldest is the same ORDER BY rule the old SQL used: created_at
+        # ASC, note_id ASC tie-break. min() with that key tuple gives the
+        # same row the previous LIMIT 1 subquery did.
+        oldest = min(live, key=lambda r: (r["created_at"], r["note_id"]))
+        return len(live), oldest["note_id"]
 
     def forget_all(self, workspace: str) -> int:
         """Clear all notes AND snapshots for a workspace.
@@ -3212,6 +4462,76 @@ class WorkingContextStore:
                     continue
                 _append_event(conn, workspace, nid, "stale_flagged", actor="system", payload=sig, ts=now)
 
+    def _record_observation(
+        self, workspace: str, session_id: str | None, path_candidates: "tuple[str, ...] | None"
+    ) -> None:
+        """UPG-ANCHOR-UNOBSERVED-BINDING: record that this session's own
+        PreToolUse hook call reported `path_candidates` (the SAME
+        as-given-plus-workspace-relative tuple `fire()` just computed via
+        `_path_trigger_candidates()` for its own P-primitive matching, never
+        recomputed or re-derived here) — the caller (the editor's PreToolUse
+        hook, forwarding whatever `tool_input.file_path` it already resolved
+        for a Read/Edit/Write/MultiEdit/NotebookEdit call) is the entire
+        source of this fact; nothing here parses prompt or note content.
+
+        A no-op when `session_id` or `path_candidates` is None/empty — a
+        stdio transport or a caller that never supplies a session_id simply
+        never gets a ledger entry, which is exactly the "no record exists"
+        state `_anchor_observed_at_write()` reads back as unknown, not as a
+        false negative.
+
+        Same LRU-bounded, delete-then-reinsert-to-touch eviction shape as
+        `VectrService._ledger_for`/`_turn_ledger_for` (app/service.py) — see
+        `self._observed_paths`'s own comment in `__init__` for why the bound
+        lives on this dict rather than being unbounded."""
+        if session_id is None or not path_candidates:
+            return
+        from agent.config import EVICTION_MAX_TRACKED_SESSIONS
+
+        key = (workspace, session_id)
+        observed = self._observed_paths.get(key)
+        if observed is None:
+            if len(self._observed_paths) >= EVICTION_MAX_TRACKED_SESSIONS:
+                oldest_key = next(iter(self._observed_paths))
+                del self._observed_paths[oldest_key]
+            observed = set()
+        else:
+            del self._observed_paths[key]
+        observed.update(path_candidates)
+        self._observed_paths[key] = observed
+
+    def _anchor_observed_at_write(
+        self, workspace: str, session_id: str | None, anchor_path: str
+    ) -> bool | None:
+        """UPG-ANCHOR-UNOBSERVED-BINDING: three-valued observation verdict
+        for one declared anchor path, read by `remember()` at write time —
+        True (this session's own PreToolUse traffic reported this exact
+        path, in either candidate form), False (this session HAS a ledger
+        entry — at least one path was observed — but this particular path is
+        not in it), or None/unknown (no ledger entry exists for this
+        session at all: no session_id, hooks never wired, stdio transport,
+        team-mode bind, or a daemon restart lost the in-memory ledger since
+        this session started).
+
+        The None branch is the load-bearing one (THE CRITICAL CONSTRAINT):
+        an absent ledger is NOT evidence of non-observation, so this
+        deliberately returns None rather than False whenever the ledger key
+        itself is missing — only a PRESENT ledger with a PRESENT-but-
+        non-matching entry ever earns a real `False`. Never widen the first
+        branch below into `if session_id is None or key not in ...: return
+        False` — that would collapse the required three states into two and
+        manufacture a false "never observed" accusation on every session
+        that simply has no ledger, which is worse than saying nothing."""
+        if session_id is None:
+            return None
+        observed = self._observed_paths.get((workspace, session_id))
+        if observed is None:
+            return None
+        candidates = _path_trigger_candidates(workspace, anchor_path)
+        if not candidates:
+            return False
+        return any(c in observed for c in candidates)
+
     def fire(
         self,
         workspace: str,
@@ -3245,8 +4565,8 @@ class WorkingContextStore:
         `record_fires` (wave 3, §5.3 — closes the "session ledger burns a
         trigger on a non-delivery" finding), when True (the default),
         records a fresh match into `ledger` before returning — the original,
-        still-correct contract for a caller like `VectrService.fire_triggers()`
-        whose every returned `FireResult` IS the delivery (no further
+        still-correct contract for any caller whose every returned
+        `FireResult` IS the delivery (no further
         packing/dedup happens downstream). `fire_and_format()` below passes
         `record_fires=False` instead: it calls `fire()` once per event in an
         OR list and then still has to survive turn-ledger cross-surface
@@ -3315,6 +4635,14 @@ class WorkingContextStore:
 
         branch = _current_git_branch(Path(workspace))
         path_candidates = _path_trigger_candidates(workspace, file_path)
+        # UPG-ANCHOR-UNOBSERVED-BINDING: this IS the read signal — every
+        # PreToolUse call with a file_path (Read/Edit/Write/MultiEdit/
+        # NotebookEdit; app/service.py's `_recall_impl` file_path branch
+        # always reaches here via fire_and_format()) reports the caller's
+        # own already-resolved path, unconditionally, regardless of whether
+        # any note ends up matching it below — a later remember() in this
+        # same session can then mark an anchor to this path observed=true.
+        self._record_observation(workspace, session_id, path_candidates)
 
         with self._conn() as conn:
             rows = conn.execute(
@@ -3680,6 +5008,8 @@ class WorkingContextStore:
             branch=row["branch"] if "branch" in keys and row["branch"] else "",
             # UPG-MEM-PROVENANCE-USER-STATED — guarded for pre-migration DBs.
             user_quote=user_quote or "",
+            # UPG-RECALL-MISS-FLOOR part (b) — guarded for pre-migration DBs.
+            pinned=bool(row["pinned"]) if "pinned" in keys and row["pinned"] is not None else False,
         )
 
     def format_notes_for_llm(
@@ -3789,5 +5119,24 @@ class WorkingContextStore:
         asserts a contradiction, never mutates anything, and never raises).
         """
         return _related_active_notes(
+            self, workspace, note_id, limit=limit, min_similarity=min_similarity,
+        )
+
+    def revoked_related_notes(
+        self,
+        workspace: str,
+        note_id: int,
+        *,
+        limit: int,
+        min_similarity: float,
+    ) -> list[RevokedRelatedNote]:
+        """Write-time deterrent lookup (UPG-RELATED-REVOKED-DETERRENT) — the
+        `limit` nearest EXISTING notes to `note_id` whose folded lifecycle
+        state is `revoked`, above `min_similarity`. Thin delegate to
+        `agent.working_context_store._related` (see that module's docstring
+        for the full contract and why this is a separate function from
+        `related_active_notes` rather than a filter change to it).
+        """
+        return _revoked_related_notes(
             self, workspace, note_id, limit=limit, min_similarity=min_similarity,
         )

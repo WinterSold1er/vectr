@@ -52,9 +52,26 @@ _SYMBOL_TYPES: dict[str, dict[str, str]] = {
     },
     "java": {
         "method_declaration": "method",
+        # UPG-ENUM-CONTAINER-NONMETHOD-COVERAGE: a constructor is a member
+        # function like any other method — kind "method" keeps it consistent
+        # with method_declaration, and _KIND_RANK still ranks the class itself
+        # (0) above its constructor (1) when both share the class's name.
+        "constructor_declaration": "method",
         "class_declaration": "class",
         "interface_declaration": "interface",
         "enum_declaration": "enum",
+        # UPG-JAVA-ENUM-CONSTANTS-NO-L2-SYMBOLS: enum constants and class
+        # fields are members of a type's namespace, parallel to methods —
+        # tree-sitter-java separates `field_declaration` (class/enum body
+        # members) from `local_variable_declaration` (method body locals) at
+        # the grammar level, so the enclosing-kind gate the Zig case
+        # required isn't needed here: locals never appear as a
+        # `field_declaration` node, so adding this entry cannot leak
+        # method-locals into the graph. Kinds rank at 1 alongside "method"
+        # so the enum/class that contains them (rank 0) is still the
+        # canonical answer to "where is X defined" when both share a name.
+        "enum_constant": "enum_constant",
+        "field_declaration": "field",
     },
     "zig": {
         "function_declaration": "function",
@@ -135,7 +152,7 @@ SYMBOL_LANGUAGES: frozenset[str] = frozenset(_SYMBOL_TYPES)
 # name resolution). Combined with the parser-language set + embed model into the
 # toolchain fingerprint (UPG-8.7) so a vectr upgrade is detectable and the graph
 # is rebuilt rather than silently serving partial/old results.
-SYMBOL_SCHEMA_VERSION = 12  # 1: base · 2: C/C++ + per-def trace (UPG-3.2/4.x) · 3: Rust uses-edges (UPG-4.4) · 4: module-level constants (UPG-10.3) · 5: .txt/.rst prose docs indexed (UPG-11.3) · 6: symbol_importance table added (ARCH-1a) · 7: Flow-typed .js routed to tsx grammar + keyword/ERROR-node symbol rejection (UPG-JSFLOW-SYMBOLS) · 8: class_importance table added (ARCH-2) · 9: name-node-scoped error check (a locally-erroring construct no longer erases a symbol whose own name token is clean) + isolated-reparse error-recovery for catastrophically desynced subtrees (UPG-REACT-TSX-FUNCTION-DECL-DROP) · 10: class_importance seeded from all type-definition kinds (struct/enum/interface/type, not just class) plus module-level functions, and normalized with log(1+count)/log(1+max) instead of linear (UPG-SIBLING-TYPEDEF-CROWDING) · 11: Java method name via `name` field not return-type child-scan (UPG-JAVA-METHOD-NAME-EXTRACTION); C/C++ declarator-scoped error check so macro-body functions/typedef structs survive (UPG-C-STRUCT-TYPEDEF-LOCATE/UPG-C-MACRO-ADJACENT-DROP); Zig variable_declaration kind resolved by RHS, locals/mutations/imports no longer indexed as [struct] (UPG-ZIG-SYMBOL-EXTRACTION); TS type_alias_declaration/enum_declaration added to symbol graph (UPG-TS-SYMBOLGRAPH-TYPEDEF) · 12: Zig struct/enum-scoped const/var extracted as locatable namespace members (function-locals still excluded) — enclosing symbol kind threaded through the walker (UPG-ZIG-STRUCT-CONST-LOCATE)
+SYMBOL_SCHEMA_VERSION = 15  # 1: base · 2: C/C++ + per-def trace (UPG-3.2/4.x) · 3: Rust uses-edges (UPG-4.4) · 4: module-level constants (UPG-10.3) · 5: .txt/.rst prose docs indexed (UPG-11.3) · 6: symbol_importance table added (ARCH-1a) · 7: Flow-typed .js routed to tsx grammar + keyword/ERROR-node symbol rejection (UPG-JSFLOW-SYMBOLS) · 8: class_importance table added (ARCH-2) · 9: name-node-scoped error check (a locally-erroring construct no longer erases a symbol whose own name token is clean) + isolated-reparse error-recovery for catastrophically desynced subtrees (UPG-REACT-TSX-FUNCTION-DECL-DROP) · 10: class_importance seeded from all type-definition kinds (struct/enum/interface/type, not just class) plus module-level functions, and normalized with log(1+count)/log(1+max) instead of linear (UPG-SIBLING-TYPEDEF-CROWDING) · 11: Java method name via `name` field not return-type child-scan (UPG-JAVA-METHOD-NAME-EXTRACTION); C/C++ declarator-scoped error check so macro-body functions/typedef structs survive (UPG-C-STRUCT-TYPEDEF-LOCATE/UPG-C-MACRO-ADJACENT-DROP); Zig variable_declaration kind resolved by RHS, locals/mutations/imports no longer indexed as [struct] (UPG-ZIG-SYMBOL-EXTRACTION); TS type_alias_declaration/enum_declaration added to symbol graph (UPG-TS-SYMBOLGRAPH-TYPEDEF) · 12: Zig struct/enum-scoped const/var extracted as locatable namespace members (function-locals still excluded) — enclosing symbol kind threaded through the walker (UPG-ZIG-STRUCT-CONST-LOCATE) · 13: Rust impl_item name via grammar `type` field not positional child-scan — `impl Trait for Type { }` indexed under the TYPE, never the trait (UPG-RUST-IMPL-SYMBOL-NAME-TRAIT-VS-TYPE); Java constructor_declaration extracted as a method-kind symbol so constructors are locatable and call-attributable like any member function (UPG-ENUM-CONTAINER-NONMETHOD-COVERAGE) · 14: Java enum_constant and field_declaration extracted as symbols so `locate` finds enum values and class fields the L3 search already covers — tree-sitter-java separates `field_declaration` (class/enum body members) from `local_variable_declaration` (method body locals) at the grammar level, so no enclosing-kind gate is needed (UPG-JAVA-ENUM-CONSTANTS-NO-L2-SYMBOLS); Rust impl_item parse-error check now scoped to the implemented type's `type_identifier` node (one shared walk with the string resolver, not the whole impl block) so an impl containing a locally-erroring construct keeps its symbol identity the way an equivalent function does (UPG-IMPL-SYMBOL-NAME-NODE-GAP) · 15: same-file class-base override edges of edge_type="overrides" recorded at index time; SymbolGraph.overrides_of / SymbolGraph.overridden_by expose the read API (UPG-BASE-METHOD-OVERRIDE-FLOOD). Same-file scope only — see LANE-REPORT for the precision/recall tradeoff and the explicit rejection of cross-file inference here
 
 
 def grammar_available(language: str) -> bool:
@@ -222,6 +239,11 @@ def supports_symbols(language: str) -> bool:
 _KIND_RANK: dict[str, int] = {
     "class": 0, "struct": 0, "enum": 0, "interface": 0, "trait": 0,
     "function": 1, "method": 1,
+    # UPG-JAVA-ENUM-CONSTANTS-NO-L2-SYMBOLS: enum constants and class
+    # fields are members of a type's namespace, ranked like "method" — a
+    # class/enum that contains them (rank 0) is the canonical answer when
+    # both share a name.
+    "field": 1, "enum_constant": 1,
     "route": 2,
     "macro": 3, "variable": 3,
     "impl": 4, "alias": 4, "import": 4,

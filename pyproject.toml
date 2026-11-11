@@ -15,7 +15,7 @@ agent = ["config.yaml", "markers.yaml", "proxy_anchors.yaml", "data/*.txt", "tem
 
 [project]
 name = "vectr"
-version = "1.9.0"
+version = "1.12.0"
 description = "Semantic codebase search + persistent working memory for AI code editors. Local, zero-config, MCP. No API key."
 readme = "README.md"
 license = { text = "MIT" }

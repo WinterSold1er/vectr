@@ -4,12 +4,9 @@ from __future__ import annotations
 import pytest
 
 from agent.proactive.settings import (
-    ProactiveRefused,
     ProactiveSettings,
     derive_provider_timeout_s,
-    enforce_proactive_bind,
     proactive_bind_is_loopback,
-    proactive_enabled,
 )
 
 
@@ -53,23 +50,32 @@ def test_bad_env_falls_back(monkeypatch):
     assert s.max_items_per_event == 3  # bundled default, not a crash
 
 
-def test_proactive_enabled_two_gates():
-    # Gate 1: loopback required. Gate 2: config enabled.
-    assert proactive_enabled("127.0.0.1", True) is True
-    assert proactive_enabled("localhost", True) is True
-    assert proactive_enabled("0.0.0.0", True) is False   # non-loopback bind
-    assert proactive_enabled("10.0.0.5", True) is False
-    assert proactive_enabled("127.0.0.1", False) is False  # config off
-    # An API key on a loopback bind does NOT disable it.
-    assert proactive_enabled("127.0.0.1", True, api_key="secret") is True
+def test_cooldown_ttl_default_and_normalisation(monkeypatch):
+    # UPG-PROXY-COOLDOWN-NO-TIME-DECAY: the shipped default enables one hour of
+    # wall-clock decay on top of the count ring; a non-positive value means
+    # "no time decay" and normalises to None (the SessionLedger's canonical
+    # disabled sentinel — a literal 0 there would expire every entry
+    # instantly, which is NOT the intended meaning of disabling).
+    for k in list(__import__("os").environ):
+        if k.startswith("VECTR_PROACTIVE"):
+            monkeypatch.delenv(k, raising=False)
+    s = ProactiveSettings.from_env()
+    assert s.cooldown_ttl_seconds == 3600.0
+
+    monkeypatch.setenv("VECTR_PROACTIVE_COOLDOWN_TTL_SECONDS", "120")
+    assert ProactiveSettings.from_env().cooldown_ttl_seconds == 120.0
+
+    for disabled in ("0", "-5"):
+        monkeypatch.setenv("VECTR_PROACTIVE_COOLDOWN_TTL_SECONDS", disabled)
+        assert ProactiveSettings.from_env().cooldown_ttl_seconds is None
 
 
-def test_enforce_refuses_non_loopback_when_enabled():
-    with pytest.raises(ProactiveRefused):
-        enforce_proactive_bind("0.0.0.0", True)
-    # Loopback is fine; config-off is fine even on non-loopback (nothing to refuse).
-    enforce_proactive_bind("127.0.0.1", True)
-    enforce_proactive_bind("0.0.0.0", False)
+def test_cooldown_ttl_bad_env_falls_back_to_default(monkeypatch):
+    for k in list(__import__("os").environ):
+        if k.startswith("VECTR_PROACTIVE"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("VECTR_PROACTIVE_COOLDOWN_TTL_SECONDS", "not-a-number")
+    assert ProactiveSettings.from_env().cooldown_ttl_seconds == 3600.0
 
 
 # -- unconditional bind check (UPG-PROXY-LOOPBACK-BYPASS) -------------------
@@ -96,9 +102,8 @@ def test_bind_is_loopback_defaults_to_loopback_when_unset(monkeypatch):
 
 
 def test_bind_is_loopback_is_unconditional_no_config_argument():
-    # Unlike proactive_enabled/enforce_proactive_bind, this check takes no
-    # config_enabled argument at all — it cannot be skipped by a config
-    # toggle, which is exactly the point (UPG-PROXY-LOOPBACK-BYPASS).
+    # This check takes no config argument at all — it cannot be skipped by a
+    # config toggle, which is exactly the point (UPG-PROXY-LOOPBACK-BYPASS).
     import inspect
 
     sig = inspect.signature(proactive_bind_is_loopback)

@@ -278,6 +278,205 @@ class TestChunkFileContainerRecursion:
         assert "class_declaration" in node_types
         assert {"add", "subtract"} <= names
 
+    # -----------------------------------------------------------------------
+    # UPG-RUST-IMPL-SYMBOL-NAME-TRAIT-VS-TYPE (chunk side): the impl_item's
+    # resolved name feeds `class_context`, so with the positional-scan bug
+    # every member chunk of a trait impl carried `# class: <trait>` — the
+    # wrong type — into its embedding text.
+    # -----------------------------------------------------------------------
+
+    def _rust_trait_impl_source(self, n_padding_methods: int) -> str:
+        lines = ["struct Widget { value: i32 }", "", "impl Measurable for Widget {"]
+        lines.append("    fn early_method(&self) -> i32 {")
+        lines.append("        self.value")
+        lines.append("    }")
+        lines.append("")
+        for i in range(n_padding_methods):
+            lines.append(f"    fn padding_method_{i}(&self) -> i32 {{")
+            lines.append(f"        self.value + {i}")
+            lines.append("    }")
+            lines.append("")
+        lines.append("    fn late_method(&self) -> i32 {")
+        lines.append("        self.value * 2")
+        lines.append("    }")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    def test_rust_trait_impl_members_carry_type_class_context(self, tmp_path) -> None:
+        p = tmp_path / "widget.rs"
+        p.write_text(self._rust_trait_impl_source(n_padding_methods=40))
+        from agent.indexer import chunk_file
+        chunks = chunk_file(str(p))
+
+        impl_chunks = [c for c in chunks if c.node_type == "impl_item"]
+        assert impl_chunks and impl_chunks[0].symbol_name == "Widget", (
+            f"impl chunk named after the trait, not the type: {impl_chunks[0].symbol_name!r}"
+        )
+        joined = "\n".join(c.content for c in chunks)
+        assert "# class: Widget" in joined
+        assert "# class: Measurable" not in joined, (
+            "member chunks must never carry the TRAIT as their '# class:' context"
+        )
+
+    def test_java_constructor_gets_its_own_definition_chunk(self, tmp_path) -> None:
+        # UPG-ENUM-CONTAINER-NONMETHOD-COVERAGE (constructor half): with the
+        # bug, constructors existed only as lines inside the capped class
+        # chunk; now each is its own definition chunk like the methods are.
+        p = tmp_path / "Gauge.java"
+        p.write_text(textwrap.dedent("""\
+            public class Gauge {
+                private int ticks;
+                public Gauge() { this.ticks = 0; }
+                public Gauge(int t) { this.ticks = t; }
+                public int read() { return ticks; }
+            }
+        """))
+        from agent.indexer import chunk_file
+        chunks = chunk_file(str(p))
+
+        ctor_chunks = [c for c in chunks if c.node_type == "constructor_declaration"]
+        assert len(ctor_chunks) == 2, (
+            f"expected both constructor overloads chunked, got {[c.node_type for c in chunks]}"
+        )
+        assert all(c.symbol_name == "Gauge" for c in ctor_chunks)
+        assert any("this.ticks = t" in c.content for c in ctor_chunks)
+
+    # -----------------------------------------------------------------------
+    # UPG-ENUM-CONTAINER-NONMETHOD-COVERAGE (overflow half): header-capping a
+    # container used to DROP whatever past-cap content no member chunk carried
+    # (fields, static initializers, enum constants); an over-long LEAF lost
+    # its whole tail. Both remainders are now re-emitted as bounded
+    # "overflow" continuation chunks with honest sub-spans.
+    # -----------------------------------------------------------------------
+
+    def _java_constants_only_enum_source(self, n_constants: int) -> str:
+        lines = ["public enum Status {"]
+        for i in range(n_constants - 1):
+            lines.append(f"    STATUS_CODE_{i},")
+        lines.append(f"    STATUS_CODE_{n_constants - 1};")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    def test_constants_only_java_enum_tail_is_re_emitted(self, tmp_path) -> None:
+        # 160 one-line constants ≈ 163 lines and NO methods, so the enum never
+        # counts as a member container and is leaf-capped at max_chunk_lines
+        # (150). Before the overflow path, everything past line 150 — including
+        # the final constant — was silently dropped from the index.
+        p = tmp_path / "Status.java"
+        p.write_text(self._java_constants_only_enum_source(160))
+        from agent.config import INDEXING_MAX_CHUNK_LINES
+        from agent.indexer import chunk_file
+        chunks = chunk_file(str(p))
+
+        enum_chunks = [c for c in chunks if c.node_type == "enum_declaration"]
+        assert len(enum_chunks) == 1
+        # The cap itself is untouched — the enum's own chunk stays bounded.
+        assert len(enum_chunks[0].content.splitlines()) <= INDEXING_MAX_CHUNK_LINES
+
+        joined = "\n".join(c.content for c in chunks)
+        assert "STATUS_CODE_159;" in joined, "final constant past the cap vanished"
+        assert "STATUS_CODE_150" in joined
+
+        overflows = [c for c in chunks if c.node_type == "overflow"]
+        assert overflows, "expected overflow continuation chunks past the cap"
+        # Honest sub-spans: each continuation piece is a verbatim 1:1 slice of
+        # the file lines its recorded span names.
+        src_lines = p.read_text().splitlines()
+        for oc in overflows:
+            assert oc.start_line <= oc.end_line
+            assert oc.content.splitlines() == src_lines[oc.start_line - 1:oc.end_line], (
+                f"{oc.chunk_id}: content does not match its recorded span"
+            )
+
+    def _java_methods_then_fields_class_source(self, n_methods: int, n_fields: int) -> str:
+        lines = ["public class Registry {"]
+        lines.append("    public int earlyMethod() {")
+        lines.append("        return 1;")
+        lines.append("    }")
+        lines.append("")
+        for i in range(n_methods):
+            lines.append(f"    public int paddingMethod{i}() {{")
+            lines.append(f"        return {i};")
+            lines.append("    }")
+            lines.append("")
+        for j in range(n_fields):
+            lines.append(f'    public static final String TAIL_CONSTANT_{j} = "v{j}";')
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    def test_container_tail_fields_past_header_cap_are_re_emitted(self, tmp_path) -> None:
+        # ~45 padding methods push everything past line 40 (class_header cap).
+        # The tail constants are field_declarations — not chunk targets — so
+        # no member chunk carries them; before the overflow path they were
+        # unreachable by search AND absent from the symbol graph.
+        p = tmp_path / "Registry.java"
+        p.write_text(self._java_methods_then_fields_class_source(45, 30))
+        from agent.indexer import chunk_file
+        chunks = chunk_file(str(p))
+
+        joined = "\n".join(c.content for c in chunks)
+        assert 'TAIL_CONSTANT_0 = "v0"' in joined, "first tail constant vanished"
+        assert 'TAIL_CONSTANT_29 = "v29"' in joined, "last tail constant vanished"
+
+        # Context inheritance: the tail continues the container's MEMBER set,
+        # so each piece leads with the same '# class:' line its member chunks
+        # carry. (A LEAF's tail instead inherits the leaf's own context — none
+        # at top level — staying a verbatim file slice; see the enum test.)
+        overflows = [c for c in chunks if c.node_type == "overflow"]
+        assert overflows, "expected overflow continuation chunks past the cap"
+        for oc in overflows:
+            assert oc.content.startswith("# class: Registry\n"), (
+                f"{oc.chunk_id}: overflow piece lost the container context line"
+            )
+
+        # No-duplication guarantee of the uncovered-range design: a member's
+        # body appears in exactly ONE chunk (its own) — never again inside a
+        # continuation piece. Naively re-emitting everything past the cap
+        # would duplicate every past-cap method body here.
+        dup_hits = [c for c in chunks if "return 44;" in c.content]
+        assert len(dup_hits) == 1, (
+            f"paddingMethod44's body must appear in exactly one chunk, got {len(dup_hits)}"
+        )
+
+    def test_overlong_leaf_function_tail_is_re_emitted(self, tmp_path) -> None:
+        # A leaf (no nested members) is capped at max_chunk_lines and nothing
+        # else carries its tail — the overflow path closes that loss too,
+        # under the same invariant: truncation re-emits, never discards.
+        from agent.config import INDEXING_MAX_CHUNK_LINES
+        lines = ["def big_fn() -> None:"]
+        for i in range(290):
+            lines.append(f"    x{i} = {i}")
+        lines.append("    tail_marker = 'end'")
+        p = tmp_path / "big.py"
+        p.write_text("\n".join(lines) + "\n")
+
+        from agent.indexer import chunk_file
+        chunks = chunk_file(str(p))
+
+        fn_chunks = [c for c in chunks if c.symbol_name == "big_fn"]
+        assert len(fn_chunks) == 1
+        assert len(fn_chunks[0].content.splitlines()) <= INDEXING_MAX_CHUNK_LINES
+
+        joined = "\n".join(c.content for c in chunks)
+        assert "tail_marker" in joined, "function tail past max_chunk_lines vanished"
+        assert any(c.node_type == "overflow" for c in chunks)
+
+    def test_no_overflow_chunks_when_nothing_truncates(self, tmp_path) -> None:
+        # Files under every cap produce byte-identical output to before this
+        # change — the overflow path only ever fires on actual truncation.
+        p = tmp_path / "Small.java"
+        p.write_text(textwrap.dedent("""\
+            public class Small {
+                public int once() { return 1; }
+                public int twice() { return 2; }
+            }
+        """))
+        from agent.indexer import chunk_file
+        chunks = chunk_file(str(p))
+        assert not any(c.node_type == "overflow" for c in chunks)
+        names = {c.symbol_name for c in chunks}
+        assert {"once", "twice"} <= names
+
     def test_js_closure_callback_still_does_not_trigger_container_recursion(self, tmp_path) -> None:
         # Guards the exact false-positive class this fix must not reintroduce:
         # an anonymous function passed as a call argument sits several hops

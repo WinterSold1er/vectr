@@ -9,17 +9,19 @@ from agent.config import (
     MEMORY_HYGIENE_STALE_TASK_WARN_COUNT,
     MEMORY_HYGIENE_STALE_TASK_WARN_AGE_DAYS,
     SCORE_ORDER_EXPLAIN_ENABLED,
-    SCORE_ORDER_EXPLAIN_MARGIN_RATIO,
+    SCORE_ORDER_EXPLAIN_MIN_HEADROOM_RATIO,
     POINTER_MODE_RETAIN_ENABLED,
     POINTER_MODE_RETAIN_MIN_RELEVANCE,
     POINTER_MODE_RETAIN_EXCERPT_LINES,
     POINTER_MODE_RETAIN_LABEL,
+    POINTER_MODE_RETAIN_RANK1_ALWAYS,
+    POINTER_MODE_RETAIN_RANK1_LABEL,
     EPISODES_DISTILL_MAX_ARCS_RENDERED,
     EPISODES_DISTILL_RENDER_TOKEN_CAP,
 )
 from agent.chroma_dispatch import dispatch_chroma_sync
 from agent.render_paths import workspace_relpath
-from agent.working_context_store import USER_STATED_PROVENANCE, bind_user_quote, resolve_remember_content
+from agent.working_context_store import SORT_BY_VALUES, USER_STATED_PROVENANCE, bind_user_quote, resolve_remember_content
 
 
 def _service_ws_root(service) -> str:
@@ -80,9 +82,18 @@ def _symbol_name_arg(arguments: dict) -> str:
 def handle_tools_list(session_id: str | None = None, service: Any = None) -> dict:
     """Return tools appropriate for this session.
 
-    Always shown: exploration tools + vectr_remember + vectr_evict_hint.
-    Gated on notes existing: vectr_recall, vectr_forget, vectr_promote, vectr_revoke,
-    vectr_reinstate, vectr_snapshot, vectr_snapshot_list.
+    Always shown: the exploration tools (vectr_search, vectr_fetch,
+    vectr_status, vectr_map, vectr_map_save, vectr_locate, vectr_trace),
+    the memory-write tools (vectr_remember, vectr_evict_hint,
+    vectr_distill), and the utility tool (vectr_ingest_traces). Gated on
+    notes existing: every _MEMORY_TOOLS member (vectr_recall,
+    vectr_snapshot, vectr_snapshot_list, vectr_resume, vectr_forget,
+    vectr_promote, vectr_revoke, vectr_reinstate, vectr_supersede,
+    vectr_pin, vectr_anchor, vectr_unanchor). The grouped lists above
+    are kept in sync with _EXPLORATION_TOOLS / _MEMORY_WRITE_TOOLS /
+    _UTILITY_TOOLS / _MEMORY_TOOLS in integrations/mcp_server/_schemas.py
+    — re-derive them from those constants when changing tool membership,
+    rather than hand-editing.
     """
     # Hosted/registry deployments (e.g. a catalog's containerised inspector)
     # start with an empty note store but must still advertise the complete
@@ -355,6 +366,7 @@ def handle_tools_call(
             f"  Mode           : {mode}",
             f"  Indexed files  : {status['indexed_files']}",
             f"  Total chunks   : {status['total_chunks']}",
+            f"  Purpose vectors: {status.get('total_purpose_chunks', 0)}",
             f"  Symbols indexed: {status.get('symbol_count', 'n/a')}",
             f"  Prior notes    : {notes_count}{recall_hint}",
             f"  Episodes       : {episodes_count}",
@@ -407,6 +419,26 @@ def handle_tools_call(
                 "finishes — no action needed, this clears automatically"
             )
 
+        # UPG-PURPOSE-RESUME-HOLE: an explicit warning rather than leaving
+        # the reader to divide "Total chunks" by "Purpose vectors" (a ratio
+        # that is ALWAYS < 1 even when nothing is wrong — only symbol-
+        # bearing chunks get a purpose vector at all). This count is instead
+        # the exact number of files the most recent index run found with
+        # current body content but a purpose-vector gap — e.g. a deferred
+        # purpose pass interrupted by a daemon stop/crash. Fires only while
+        # a gap was actually detected and its backfill dispatch is still
+        # pending; a dispatched-but-still-running backfill is already
+        # covered by the purpose_vectors_pending line above.
+        purpose_gap_files = status.get("purpose_backfill_pending_files", 0)
+        if purpose_gap_files > 0:
+            lines.append(
+                f"  WARNING        : {purpose_gap_files} file(s) have body "
+                "content indexed but incomplete purpose vectors — search "
+                "ranking for their symbols may be body-similarity-only until "
+                "this backfills; the next index run closes this "
+                "automatically, no action needed"
+            )
+
         # UPG-NOTES-EMBED-MIGRATION: surfaces a mid-failure state only — the
         # migration that keeps note vectors and the configured embed model in
         # sync runs synchronously at startup, so this is normally absent.
@@ -419,20 +451,24 @@ def handle_tools_call(
                 "migration completes on the next restart"
             )
 
-        # UPG-TASK-SUPERSEDES-HYGIENE: a nudge, not a lifecycle change — task
-        # notes never decay or auto-expire, so a stale checkpoint left
-        # un-superseded keeps firing at every future session-start forever.
-        # Purely additive/state-based: fires once the live (non-superseded)
-        # count of aged kind="task" notes clears the config threshold.
+        # UPG-TASK-SUPERSEDES-HYGIENE / UPG-STATUS-AGE-ONLY-FORGET-NUDGE: a
+        # neutral inventory line, not a WARNING. Age alone is not a
+        # deterministic staleness signal — a 10-day-old checkpoint may be
+        # exactly current work — so this never alarms and never nominates
+        # vectr_forget (the one destructive verb, whose product thesis
+        # forbids removal on an age threshold). The only remediation it
+        # names is supersession: recording what happened to the work via a
+        # successor checkpoint is a caller judgment about STATE, which is
+        # precisely the remediation kind="task" notes admit.
         stale_task_count = status.get("stale_task_count", 0)
         if stale_task_count >= MEMORY_HYGIENE_STALE_TASK_WARN_COUNT:
             oldest_id = status.get("stale_task_oldest_id")
             lines.append(
-                f"  WARNING        : {stale_task_count} task note(s) are older than "
-                f"{MEMORY_HYGIENE_STALE_TASK_WARN_AGE_DAYS} days and still active "
-                f"(oldest: #{oldest_id}) — consider vectr_remember(kind=\"task\", "
-                "supersedes=<old id>) if the work moved on, or vectr_forget(note_id=...) "
-                "if it's done"
+                f"  Task notes     : {stale_task_count} checkpoint(s) older than "
+                f"{MEMORY_HYGIENE_STALE_TASK_WARN_AGE_DAYS} days are still active "
+                f"(oldest: #{oldest_id}) — age alone never retires a note. When one "
+                "describes finished or moved-on work, record that with "
+                "vectr_remember(kind=\"task\", priority=\"high\", supersedes=<old id>)"
             )
 
         # Per-language coverage + symbol availability (UPG-3.3). Tells the agent
@@ -723,6 +759,10 @@ def handle_tools_call(
                 contradicts = int(contradicts)
             except (TypeError, ValueError):
                 return _mcp_error("contradicts must be an integer note_id")
+        # UPG-RECALL-MISS-FLOOR part (b): pin this note into Tier 0 at write
+        # time — equivalent to a separate vectr_pin call right after this
+        # write. Default false changes nothing about existing callers.
+        pin = bool(arguments.get("pin", False))
         try:
             outcome = dispatch_chroma_sync(
                 service,
@@ -730,7 +770,7 @@ def handle_tools_call(
                 content=content, tags=tags, priority=priority, kind=kind, title=title, agent=agent,
                 triggers=triggers, provenance=provenance, scope=scope, anchors=anchors,
                 supersedes=supersedes, contradicts=contradicts, session_id=session_id,
-                user_quote=user_quote,
+                user_quote=user_quote, pin=pin,
             )
         except ValueError as exc:
             # Malformed triggers, an unrecognised provenance/scope, a
@@ -810,19 +850,35 @@ def handle_tools_call(
                 parts.append(f"first line: {first_line}")
             if parts:
                 echo = "\n  Stored — " + " · ".join(parts)
-        # UPG-MEM-PROVENANCE-USER-STATED: report what the binding check
-        # decided, in the same response as the write. A failed bind is not a
-        # failed write (the note is stored at its ordinary provenance), so the
-        # reason has to be surfaced here or the caller would silently believe
-        # it recorded a user statement. Recomputed with the same pure function
-        # the store used — no rejection state is persisted anywhere.
+        # UPG-MEM-PROVENANCE-USER-STATED / UPG-PROVENANCE-NEVER-RISES: report
+        # what the binding check decided, in the same response as the write.
+        # A failed bind is not a failed write (the note is stored at its
+        # ordinary provenance), so the reason has to be surfaced here or the
+        # caller would silently believe it recorded a user statement.
+        # `_bound_quote`/`quote_reason` are recomputed with the same pure
+        # function the store used for the EXPLICIT `user_quote` argument (no
+        # rejection state is persisted anywhere) — but that recompute alone
+        # is blind to the harness-driven auto-bind fallback
+        # (`bind_user_quote_auto`, tried server-side whenever the explicit
+        # quote did not bind), so the actual STORED provenance is checked too:
+        # a note may land at provenance='user-stated' with no `user_quote`
+        # argument at all, or with one that itself failed to bind, when it
+        # was auto-bound instead — this must still be surfaced, or the
+        # calling LLM would have no way to learn its note's real trust class
+        # without a separate vectr_recall round trip.
         quote_suffix = ""
-        if user_quote:
-            _bound_quote, quote_reason = bind_user_quote(content, user_quote)
+        _bound_quote, quote_reason = bind_user_quote(content, user_quote) if user_quote else ("", "")
+        note_is_user_stated = stored_note is not None and stored_note.provenance == USER_STATED_PROVENANCE
+        if _bound_quote:
+            quote_suffix = f"\n  user_quote bound — stored as provenance='{USER_STATED_PROVENANCE}'."
+        elif note_is_user_stated:
             quote_suffix = (
-                f"\n  {quote_reason}" if quote_reason
-                else f"\n  user_quote bound — stored as provenance='{USER_STATED_PROVENANCE}'."
+                "\n  No user_quote argument bound, but this note auto-bound to the "
+                f"most recently captured user turn — stored as provenance="
+                f"'{USER_STATED_PROVENANCE}'."
             )
+        elif user_quote and quote_reason:
+            quote_suffix = f"\n  {quote_reason}"
         # Write-time related-notes offer (agent/working_context_store/_related.py):
         # nearest-by-similarity only, never a contradiction verdict — the caller
         # LLM judges whether one is now stale. Empty unless `outcome.related` is
@@ -840,20 +896,64 @@ def handle_tools_call(
                 f"judgment): {', '.join(rendered)}. If one is now wrong, pass "
                 "supersedes=<id> on a corrected note or call vectr_revoke."
             )
+        # Write-time REVOKED-related offer (UPG-RELATED-REVOKED-DETERRENT,
+        # agent/working_context_store/_related.py::revoked_related_notes) —
+        # deliberately distinct from `related_suffix` above: this is a
+        # deterrent, not a similarity nudge, and the caller LLM is writing
+        # something similar to a note the user already marked wrong, right
+        # now. Never repeats the revoked note's raw content, only its
+        # bounded title plus the revocation's own date/reason. Empty unless
+        # `outcome.revoked_related` is non-empty (config-gated in
+        # remember_with_extras).
+        revoked_suffix = ""
+        if outcome.revoked_related:
+            rendered = []
+            for r in outcome.revoked_related:
+                revoked_title = r["title"]
+                if len(revoked_title) > 60:
+                    revoked_title = revoked_title[:57] + "..."
+                rendered.append(
+                    f"#{r['note_id']} \"{revoked_title}\" (similarity {r['similarity']:.2f}, "
+                    f"revoked {r['revoked_date']}, reason: {r['reason']})"
+                )
+            revoked_suffix = (
+                "\nDETERRENT — an existing note like this one was already revoked: "
+                f"{'; '.join(rendered)}. Do not re-derive or restate it without "
+                "verification; if this write repeats what was revoked, reconsider "
+                "before storing."
+            )
         # Write-time proxy-anchor offer (agent/proxy_anchors.py): glob presence
         # only, never a claim that the note is stale. Empty unless
         # `outcome.proxy_anchor_suggestions` is non-empty (config- and
         # kind/anchors-gated in remember_with_extras).
         proxy_suffix = ""
         if outcome.proxy_anchor_suggestions:
+            # UPG-ANCHOR-ATTACH: advertise the single-call vectr_anchor
+            # primitive instead of the old re-store-with-supersedes workaround.
             proxy_suffix = (
                 f"\nProcess files present here: {', '.join(outcome.proxy_anchor_suggestions)}. "
-                "To anchor this note to one, re-store it with anchors=[...] and "
-                "supersedes=<note_id>. A changed anchor means the process MAY have "
-                "changed, never that the note is wrong."
+                "To anchor this note to one, call vectr_anchor(note_id=<this note>, "
+                "anchors=[<path>]) — no re-store needed. A changed anchor means the "
+                "process MAY have changed, never that the note is wrong."
+            )
+        # UPG-RESUME-TASK-PRIORITY-VISIBILITY: session-start boot injection and
+        # the resume surface show only priority='high' task notes (the shared
+        # _boot_task_notes() query), while 'medium' is the default — so a
+        # checkpoint saved without an explicit priority would never appear at
+        # resume, silently. Surface that fact in the SAME confirmation as the
+        # write, and only when the caller let the default stand (an explicitly
+        # chosen lower priority is an intentional ranking decision, not an
+        # oversight to nag about).
+        priority_hint = ""
+        if kind == "task" and arguments.get("priority") is None:
+            priority_hint = (
+                "\n  Note: session-start/resume surfaces show only priority='high' task "
+                "checkpoints — this one stored as 'medium'. If it should be picked up at "
+                "resume, re-store it with priority=\"high\" (and supersedes=<this id> when "
+                "it replaces an older checkpoint)."
             )
         return {
-            "content": [{"type": "text", "text": f"Stored note #{note_id}{scope_suffix}. Recall with vectr_recall — <50ms, verbatim, any time.{echo}{quote_suffix}{distill_suffix}{related_suffix}{proxy_suffix}"}],
+            "content": [{"type": "text", "text": f"Stored note #{note_id}{scope_suffix}. Recall with vectr_recall — <50ms, verbatim, any time.{echo}{quote_suffix}{distill_suffix}{related_suffix}{revoked_suffix}{proxy_suffix}{priority_hint}"}],
             "isError": False,
         }
 
@@ -872,18 +972,52 @@ def handle_tools_call(
         limit = int(arguments.get("limit", 10))
         detail = arguments.get("detail", "index") or "index"
         sort_by = arguments.get("sort_by", "relevance") or "relevance"
+        # UPG-MCP-SORTBY-PASSTHROUGH: the store used to silently treat any
+        # unknown sort_by as 'relevance', which masks a caller typo as
+        # "results just look different". Validate at the dispatch boundary
+        # with the same vocabulary and the same "must be one of" error
+        # shape as REST (app/models.py::RecallRequest.validate_sort_by,
+        # UPG-REST-SORTBY-UNVALIDATED) — the schema enum constrains
+        # well-behaved clients, this guards everything else.
+        # UPG-SORTBY-SHARED-VOCAB: the vocabulary itself is the shared
+        # SORT_BY_VALUES constant from agent.working_context_store so a
+        # fifth sort mode added at the source automatically tightens this
+        # guard, the REST validator, the MCP schema enum, and the CLI
+        # argparse choices — adding it at one place and forgetting another
+        # is the drift this change exists to eliminate.
+        if sort_by not in SORT_BY_VALUES:
+            return _mcp_error(
+                f"sort_by must be one of: {', '.join(SORT_BY_VALUES)}"
+            )
         max_age_days = arguments.get("max_age_days") or None
         if max_age_days is not None:
             try:
                 max_age_days = float(max_age_days)
             except (TypeError, ValueError):
                 max_age_days = None
-        note_id_arg = arguments.get("note_id") or None
+        # UPG-RECALL-NOTE-ID-NO-EXPAND: note_id= is a LOOKUP of one stored
+        # note, not a retrieval — a malformed id must say so explicitly
+        # instead of silently degrading to the generic ranked/index path.
+        # The reported live symptom: a caller passing "#581" (copied from
+        # the [#N] prefix in index output) failed int(), became None here,
+        # and got the whole index listing back instead of note #581's body.
+        # Bool is rejected first because JSON true/false are int subclasses
+        # (int(True) == 1 would silently expand an unrelated note), matching
+        # the distilled_from handler's bool exclusion above.
+        note_id_arg = arguments.get("note_id")
+        if isinstance(note_id_arg, bool):
+            return _mcp_error(
+                "note_id must be an integer note id (the [#N] shown by "
+                f"vectr_recall); got {note_id_arg!r}. Nothing was recalled."
+            )
         if note_id_arg is not None:
             try:
                 note_id_arg = int(note_id_arg)
             except (TypeError, ValueError):
-                note_id_arg = None
+                return _mcp_error(
+                    "note_id must be an integer note id (the [#N] shown by "
+                    f"vectr_recall); got {note_id_arg!r}. Nothing was recalled."
+                )
         text = dispatch_chroma_sync(
             service,
             service.recall,
@@ -997,6 +1131,15 @@ def handle_tools_call(
 
         note_id = arguments.get("note_id")
         if note_id is not None:
+            # UPG-MCP-NOTEID-BOOL-GUARDS: JSON true/false are int subclasses
+            # and int(True) == 1 would silently delete note #1 — same guard
+            # vectr_recall/vectr_anchor already carry. The destructive failure
+            # mode is the reason this item leads the lane.
+            if isinstance(note_id, bool):
+                return _mcp_error(
+                    "note_id must be an integer (the [#N] id shown by "
+                    f"vectr_recall); got {note_id!r}. Nothing was deleted."
+                )
             try:
                 nid = int(note_id)
             except (TypeError, ValueError):
@@ -1032,6 +1175,14 @@ def handle_tools_call(
         to = arguments.get("to", "")
         if note_id is None:
             return _mcp_error("note_id is required (the [#N] id shown by vectr_recall)")
+        # UPG-MCP-NOTEID-BOOL-GUARDS: JSON true/false are int subclasses and
+        # int(True) == 1 would promote an unrelated note — same guard
+        # vectr_recall/vectr_anchor already carry.
+        if isinstance(note_id, bool):
+            return _mcp_error(
+                "note_id must be an integer (the [#N] id shown by "
+                f"vectr_recall); got {note_id!r}. Nothing was promoted."
+            )
         try:
             nid = int(note_id)
         except (TypeError, ValueError):
@@ -1076,6 +1227,14 @@ def handle_tools_call(
         reason = (arguments.get("reason") or "").strip()
         if note_id is None:
             return _mcp_error("note_id is required (the [#N] id shown by vectr_recall)")
+        # UPG-MCP-NOTEID-BOOL-GUARDS: JSON true/false are int subclasses and
+        # int(True) == 1 would revoke an unrelated note — same guard
+        # vectr_recall/vectr_anchor already carry.
+        if isinstance(note_id, bool):
+            return _mcp_error(
+                "note_id must be an integer (the [#N] id shown by "
+                f"vectr_recall); got {note_id!r}. Nothing was revoked."
+            )
         try:
             nid = int(note_id)
         except (TypeError, ValueError):
@@ -1108,6 +1267,14 @@ def handle_tools_call(
         reason = arguments.get("reason") or None
         if note_id is None:
             return _mcp_error("note_id is required (the [#N] id shown by vectr_recall)")
+        # UPG-MCP-NOTEID-BOOL-GUARDS: JSON true/false are int subclasses and
+        # int(True) == 1 would reinstate an unrelated note — same guard
+        # vectr_recall/vectr_anchor already carry.
+        if isinstance(note_id, bool):
+            return _mcp_error(
+                "note_id must be an integer (the [#N] id shown by "
+                f"vectr_recall); got {note_id!r}. Nothing was reinstated."
+            )
         try:
             nid = int(note_id)
         except (TypeError, ValueError):
@@ -1120,6 +1287,174 @@ def handle_tools_call(
             return _mcp_error(f"Note #{nid} not found.")
         return {
             "content": [{"type": "text", "text": f"Reinstated note #{nid}. Its original content will surface again."}],
+            "isError": False,
+        }
+
+    # ---- vectr_supersede ----
+    if tool_name == "vectr_supersede":
+        # Search-only mode: the working-memory layer is disabled for this workspace
+        if getattr(service, "search_only", False):
+            from app.service import _SEARCH_ONLY_MSG
+            return {"content": [{"type": "text", "text": _SEARCH_ONLY_MSG}], "isError": False}
+
+        note_id = arguments.get("note_id")
+        # Bool rejected up front: JSON true/false are int subclasses and
+        # int(True) == 1 would retire an unrelated note.
+        if note_id is None or isinstance(note_id, bool):
+            return _mcp_error("note_id is required as an integer (the [#N] id shown by vectr_recall)")
+        try:
+            nid = int(note_id)
+        except (TypeError, ValueError):
+            return _mcp_error("note_id must be an integer (the [#N] id shown by vectr_recall)")
+        superseded_by = arguments.get("superseded_by")
+        if superseded_by is not None:
+            if isinstance(superseded_by, bool):
+                return _mcp_error("superseded_by must be an integer note id")
+            try:
+                superseded_by = int(superseded_by)
+            except (TypeError, ValueError):
+                return _mcp_error("superseded_by must be an integer note id")
+        reason = arguments.get("reason") or None
+        # UPG-MEMORY-STATE-MACHINE §4.2 convention (same as vectr_revoke):
+        # MCP is the AI's own surface, so actor is hardcoded here (never a
+        # caller argument) — only the REST /v1/supersede route a person's
+        # own CLI/UI calls can attribute the retirement to actor="human".
+        try:
+            retired = service.supersede_note(nid, superseded_by=superseded_by, reason=reason, actor="agent")
+        except ValueError as exc:
+            return _mcp_error(str(exc))
+        if not retired:
+            return _mcp_error(f"Note #{nid} not found.")
+        successor_str = (
+            f" Its replacement is #{superseded_by}." if superseded_by is not None else ""
+        )
+        return {
+            "content": [{"type": "text", "text": (
+                f"Retired note #{nid} as superseded. It will no longer surface in "
+                f"default recall/session-start and renders with the factual "
+                f"'[superseded ...]' badge — not the revoked deterrent.{successor_str} "
+                "Reverse with vectr_reinstate if this was wrong."
+            )}],
+            "isError": False,
+        }
+
+    # ---- vectr_pin ----
+    if tool_name == "vectr_pin":
+        # Search-only mode: the working-memory layer is disabled for this workspace
+        if getattr(service, "search_only", False):
+            from app.service import _SEARCH_ONLY_MSG
+            return {"content": [{"type": "text", "text": _SEARCH_ONLY_MSG}], "isError": False}
+
+        note_id = arguments.get("note_id")
+        pinned = arguments.get("pinned", True)
+        if note_id is None:
+            return _mcp_error("note_id is required (the [#N] id shown by vectr_recall)")
+        # UPG-MCP-NOTEID-BOOL-GUARDS: JSON true/false are int subclasses and
+        # int(True) == 1 would pin an unrelated note — same guard
+        # vectr_recall/vectr_anchor already carry.
+        if isinstance(note_id, bool):
+            return _mcp_error(
+                "note_id must be an integer (the [#N] id shown by "
+                f"vectr_recall); got {note_id!r}. Nothing was pinned."
+            )
+        try:
+            nid = int(note_id)
+        except (TypeError, ValueError):
+            return _mcp_error("note_id must be an integer (the [#N] id shown by vectr_recall)")
+        changed = service.pin_note(nid, bool(pinned))
+        if not changed:
+            return _mcp_error(f"Note #{nid} not found.")
+        verb = "Pinned" if pinned else "Unpinned"
+        return {
+            "content": [{"type": "text", "text": f"{verb} note #{nid}. " + (
+                "It will now be injected on every vectr_recall(query=...) call, regardless of the query."
+                if pinned else
+                "It will no longer be injected unconditionally — it now recalls the same as any other note."
+            )}],
+            "isError": False,
+        }
+
+    # ---- vectr_anchor ----
+    if tool_name == "vectr_anchor":
+        # Search-only mode: the working-memory layer is disabled for this workspace
+        if getattr(service, "search_only", False):
+            from app.service import _SEARCH_ONLY_MSG
+            return {"content": [{"type": "text", "text": _SEARCH_ONLY_MSG}], "isError": False}
+
+        # UPG-ANCHOR-ATTACH: post-write anchoring without a re-store.
+        note_id = arguments.get("note_id")
+        # Bool rejected up front: JSON true/false are int subclasses and
+        # int(True) == 1 would silently mutate an unrelated note.
+        if note_id is None or isinstance(note_id, bool):
+            return _mcp_error("note_id is required as an integer (the [#N] id shown by vectr_recall)")
+        try:
+            nid = int(note_id)
+        except (TypeError, ValueError):
+            return _mcp_error("note_id must be an integer (the [#N] id shown by vectr_recall)")
+        anchors_arg = arguments.get("anchors")
+        # `not anchors_arg` is load-bearing: all() over an empty list is
+        # True, so an explicit anchors=[] would otherwise pass a check
+        # whose own message promises a non-empty list. REST enforces the
+        # same floor with min_length=1 and the CLI with nargs="+".
+        if not isinstance(anchors_arg, list) or not anchors_arg or not all(
+            isinstance(a, str) and a.strip() for a in anchors_arg
+        ):
+            return _mcp_error("anchors must be a non-empty list of file paths")
+        try:
+            # Transport-level session identity only (same convention as
+            # vectr_remember): the UPG-ANCHOR-UNOBSERVED-BINDING tri-state
+            # verdict describes THIS harness session's own observation
+            # ledger, so the calling LLM never gets to declare one.
+            result = service.attach_anchors(
+                note_id=nid, anchors=anchors_arg, session_id=session_id,
+            )
+        except ValueError as exc:
+            return _mcp_error(str(exc))
+        if result is None:
+            return _mcp_error(f"Note #{nid} not found.")
+        parts = [f"Attached {len(result['attached'])} anchor(s) to note #{nid}."]
+        if result["already_present"]:
+            parts.append(f"Already anchored (no-op): {', '.join(result['already_present'])}.")
+        parts.append("A changed anchor means the process MAY have changed, never that the note is wrong.")
+        return {
+            "content": [{"type": "text", "text": " ".join(parts)}],
+            "isError": False,
+        }
+
+    # ---- vectr_unanchor ----
+    if tool_name == "vectr_unanchor":
+        # UPG-ANCHOR-DETACH: post-write de-anchoring without a re-store.
+        if getattr(service, "search_only", False):
+            from app.service import _SEARCH_ONLY_MSG
+            return {"content": [{"type": "text", "text": _SEARCH_ONLY_MSG}], "isError": False}
+
+        note_id = arguments.get("note_id")
+        # Bool rejected up front: same guard as vectr_anchor (JSON true/false
+        # are int subclasses, so int(True) == 1 would silently mutate note #1).
+        if note_id is None or isinstance(note_id, bool):
+            return _mcp_error("note_id is required as an integer (the [#N] id shown by vectr_recall)")
+        try:
+            nid = int(note_id)
+        except (TypeError, ValueError):
+            return _mcp_error("note_id must be an integer (the [#N] id shown by vectr_recall)")
+        anchors_arg = arguments.get("anchors")
+        # Same non-empty-list guard as vectr_anchor (see comment there on
+        # why `not anchors_arg` is load-bearing, not `not all(...)`).
+        if not isinstance(anchors_arg, list) or not anchors_arg or not all(
+            isinstance(a, str) and a.strip() for a in anchors_arg
+        ):
+            return _mcp_error("anchors must be a non-empty list of file paths")
+        try:
+            result = service.detach_anchors(note_id=nid, anchors=anchors_arg)
+        except ValueError as exc:
+            return _mcp_error(str(exc))
+        if result is None:
+            return _mcp_error(f"Note #{nid} not found.")
+        parts = [f"Removed {len(result['removed'])} anchor(s) from note #{nid}."]
+        if result["not_present"]:
+            parts.append(f"Not anchored (no-op): {', '.join(result['not_present'])}.")
+        return {
+            "content": [{"type": "text", "text": " ".join(parts)}],
             "isError": False,
         }
 
@@ -1212,7 +1547,24 @@ def _format_search_results(
     # (per result) so both the header wording and the per-result render below
     # agree on which results are retained. See agent/config.py
     # POINTER_MODE_RETAIN_* / config.yaml ranking.pointer_mode_retain.
-    retain_body = [
+    #
+    # UPG-BANNER-CALIBRATION: two independent exemptions, tracked separately
+    # so the render below can label each correctly. (1) rank1_retained — the
+    # set's composite-top result, exempted purely by RANK, never by score
+    # (mirrors result_floor's "always keep the top result" precedent). This
+    # is the fix for the case an absolute floor structurally cannot reach:
+    # when low_confidence fired because rank-1's own ce_relevance is below
+    # notfound_floor.min_top_relevance, no retain floor >= that same bar can
+    # ever pass for rank-1 (F47: rank-1 correct, ce_relevance 0.024, banner
+    # fired, zero code delivered). (2) floor_retained — any result (including
+    # rank-1) whose own ce_relevance clears the independently-calibrated
+    # POINTER_MODE_RETAIN_MIN_RELEVANCE bar, unchanged in mechanism from
+    # before this fix, just decoupled in value.
+    rank1_retained = [
+        bool(low_conf and i == 0 and POINTER_MODE_RETAIN_ENABLED and POINTER_MODE_RETAIN_RANK1_ALWAYS)
+        for i in range(len(results))
+    ]
+    floor_retained = [
         bool(
             low_conf
             and POINTER_MODE_RETAIN_ENABLED
@@ -1221,11 +1573,18 @@ def _format_search_results(
         )
         for r in results
     ]
+    retain_body = [a or b for a, b in zip(rank1_retained, floor_retained)]
     header = f"Found {len(results)} results for '{query}' ({query_ms}ms, {chunks_searched} chunks searched)"
     if low_conf:
         header += " — low confidence: pointers only (vectr_fetch(ids=[...]) to expand)"
         if any(retain_body):
-            header += f"; {sum(retain_body)} result(s) individually clear the confidence floor and keep an excerpt below"
+            if any(rank1_retained):
+                extra = sum(floor_retained[1:])
+                header += "; the top-ranked result below keeps an excerpt as a best guess"
+                if extra:
+                    header += f", plus {extra} more that individually clear the confidence floor"
+            else:
+                header += f"; {sum(retain_body)} result(s) individually clear the confidence floor and keep an excerpt below"
     # UPG-RELATIVE-PATH-RENDER: print the absolute workspace root ONCE here; every
     # path/chunk-id below is rendered relative to it, so the ~21-token absolute
     # prefix stops riding every result line. vectr_fetch accepts the relative ids.
@@ -1244,16 +1603,33 @@ def _format_search_results(
         # score_source uniform within a response.
         src = getattr(r, "score_source", "") or ""
         src_label = f" ({src})" if src else ""
-        # UPG-SCORE-ORDER-EXPLAIN: a below-rank-1 result whose relevance clears
-        # the divergence margin gets a one-phrase reason for its lower rank.
+        # UPG-SCORE-ORDER-EXPLAIN, reformulated by UPG-GATE-V4-MINORS: a
+        # below-rank-1 result whose displayed relevance exceeds rank 1's by a
+        # large share of the score range still available ABOVE rank 1 gets a
+        # one-phrase reason for its lower rank. Headroom share, not a fixed
+        # multiple: displayed scores are bounded in [0, 1], so the old ratio
+        # rule (r.score >= 1.5 * top_score) was structurally unsatisfiable on
+        # confident queries — once top_score reached 2/3, no inversion however
+        # large could ever be annotated (measured gate witness: rank-1 0.864
+        # vs a rank-5 0.969). The headroom form shrinks the required gap as
+        # rank-1 approaches the ceiling: gap >= MIN_HEADROOM_RATIO * (1 -
+        # top_score), i.e. the inversion must consume that share of what's
+        # left of the range (calibration in config.yaml; no division, so
+        # top_score == 1.0 needs no guard — r.score > top_score cannot hold).
+        # UPG-GATE-V4-MINORS (a): an EMPTY quality_reason means this chunk
+        # carries no quality demotion at all, so its lower rank came from
+        # rank-1-side priors or pool order — nothing observable from this
+        # chunk alone. The old "composite ranking prior" fallback named a
+        # mechanism without explaining anything; silence is the honest state.
         rank_note = ""
+        reason = getattr(r, "quality_reason", "")
         if (
             SCORE_ORDER_EXPLAIN_ENABLED
             and i > 1
-            and top_score > 0
-            and r.score >= SCORE_ORDER_EXPLAIN_MARGIN_RATIO * top_score
+            and reason
+            and r.score > top_score
+            and (r.score - top_score) >= SCORE_ORDER_EXPLAIN_MIN_HEADROOM_RATIO * (1.0 - top_score)
         ):
-            reason = getattr(r, "quality_reason", "") or "composite ranking prior"
             rank_note = f"  (ranked lower: {reason})"
         lines.append(f"[{i}] {chunk_id}  score {r.score:.3f}{src_label}{dup}{rank_note}")
         if r.symbol_name:
@@ -1272,12 +1648,19 @@ def _format_search_results(
             lines.append("")
             continue
         if low_conf:
-            # UPG-POINTER-MODE-UNIFORM-STRIP: this result's own ce_relevance
-            # clears the retention floor even though the SET is flagged low
-            # confidence — keep a bounded excerpt (never the full body) and
-            # say why, so the caller can trust this one entry without a
-            # vectr_fetch round trip first.
-            lines.append(f"    ({POINTER_MODE_RETAIN_LABEL}: ce_relevance {r.ce_relevance:.3f})")
+            # UPG-POINTER-MODE-UNIFORM-STRIP / UPG-BANNER-CALIBRATION: this
+            # result kept a bounded excerpt (never the full body) for one of
+            # two independent reasons — say which, so the caller can weigh
+            # trust correctly. floor_retained: its own ce_relevance clears
+            # the (now decoupled) retention floor. rank1_retained-only: it is
+            # simply the set's top-ranked guess, exempted by rank alone, and
+            # may have no ce_relevance at all (reranking may not have run).
+            if floor_retained[i - 1]:
+                lines.append(f"    ({POINTER_MODE_RETAIN_LABEL}: ce_relevance {r.ce_relevance:.3f})")
+            elif r.ce_relevance is not None:
+                lines.append(f"    ({POINTER_MODE_RETAIN_RANK1_LABEL}; ce_relevance {r.ce_relevance:.3f})")
+            else:
+                lines.append(f"    ({POINTER_MODE_RETAIN_RANK1_LABEL})")
             lines.append("")
             # UPG-POINTER-RETAIN-STORAGE-CAP-HONESTY: same storage-cap check
             # the full-body path below applies — a retained excerpt can ALSO

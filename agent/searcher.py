@@ -19,12 +19,16 @@ from agent.chunk_quality import (
     is_type_definition_chunk,
     is_module_level_function_chunk,
     leading_docstring_key,
+    _strip_leading_docstring_block,
+    _is_templated_body_difference,
 )
 from agent.config import (
     RERANK_MODEL as _RERANK_MODEL,
     RERANK_TOP_K as _RERANK_TOP_K,
     RERANK_TOP_K_UNFILTERED as _RERANK_TOP_K_UNFILTERED,
     RERANK_PRE_FILTER_FETCH_K as _RERANK_PRE_FILTER_FETCH_K,
+    RERANK_MAX_LENGTH as _RERANK_MAX_LENGTH,
+    RERANK_BATCH_SIZE_BY_DEVICE as _RERANK_BATCH_SIZE_BY_DEVICE,
     IMPORTANCE_PRIOR_LAMBDA as _IMPORTANCE_PRIOR_LAMBDA,
     CLASS_IMPORTANCE_PRIOR_LAMBDA as _CLASS_IMPORTANCE_PRIOR_LAMBDA,
     PURPOSE_RANK_PRIOR_LAMBDA as _PURPOSE_RANK_PRIOR_LAMBDA,
@@ -38,13 +42,20 @@ from agent.config import (
     NOTFOUND_FLOOR_MIN_ZERO_DF_TOKENS as _NOTFOUND_FLOOR_MIN_ZERO_DF_TOKENS,
     NOTFOUND_FLOOR_MIN_TOP_RELEVANCE as _NOTFOUND_FLOOR_MIN_TOP_RELEVANCE,
     NOTFOUND_FLOOR_CE_OVERRIDE_MIN_RELEVANCE as _NOTFOUND_FLOOR_CE_OVERRIDE_MIN_RELEVANCE,
+    RELATIVE_CLIFF_ENABLED as _RELATIVE_CLIFF_ENABLED,
+    RELATIVE_CLIFF_MIN_TOP as _RELATIVE_CLIFF_MIN_TOP,
+    RELATIVE_CLIFF_MIN_DROP as _RELATIVE_CLIFF_MIN_DROP,
     RESULT_FLOOR_ENABLED as _RESULT_FLOOR_ENABLED,
     RESULT_FLOOR_MIN_RELEVANCE as _RESULT_FLOOR_MIN_RELEVANCE,
     DOCSTRING_DEDUP_BODY_SIMILARITY_MIN as _DOCSTRING_DEDUP_BODY_SIMILARITY_MIN,
     DOCSTRING_DEDUP_MAX_REPS_COMPARED as _DOCSTRING_DEDUP_MAX_REPS_COMPARED,
+    NEAR_DUP_BODY_ENABLED as _NEAR_DUP_BODY_ENABLED,
+    NEAR_DUP_BODY_SIMILARITY_MIN as _NEAR_DUP_BODY_SIMILARITY_MIN,
+    NEAR_DUP_BODY_MAX_REPS_COMPARED as _NEAR_DUP_BODY_MAX_REPS_COMPARED,
     vectr_cache_root as _vectr_cache_root,
 )
 from agent.indexer import CodeIndexer
+from agent.ranking_cliff import relative_cliff_fires as _relative_cliff_fires
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +161,7 @@ class _Reranker:
             self._model = load_with_offline_preference(
                 lambda local_only: CrossEncoder(
                     self._model_name,
-                    max_length=512,
+                    max_length=_RERANK_MAX_LENGTH,
                     automodel_args={"ignore_mismatched_sizes": True},
                     cache_folder=cache_dir,
                     local_files_only=local_only,
@@ -160,6 +171,19 @@ class _Reranker:
             )
         except Exception:
             self._failed = True
+
+    def _batch_size(self) -> int:
+        """predict() batch_size, keyed by the reranker's own resolved torch
+        device (UPG-RERANK-LATENCY-BUDGET). ``CrossEncoder.device`` is the
+        same attribute sentence_transformers itself populates when no device
+        is given — this reads it rather than re-detecting hardware. Falls
+        back to the config's "default" entry for a device this hasn't been
+        measured on, or for a test stub exposing no ``.device`` at all.
+        batch_size only changes wall-clock latency; it never changes rank
+        order (see TestRerankerBatchSize).
+        """
+        device_type = getattr(getattr(self._model, "device", None), "type", None)
+        return _RERANK_BATCH_SIZE_BY_DEVICE.get(device_type, _RERANK_BATCH_SIZE_BY_DEVICE["default"])
 
     def rerank(self, query: str, candidates: list[tuple[str, object]]) -> list[object]:
         """Score (query, doc) pairs, stamp each candidate's ``ce_relevance`` with
@@ -177,7 +201,7 @@ class _Reranker:
         if self._model is None or not candidates:
             return [c for _, c in candidates]
         pairs = [(query, doc) for doc, _ in candidates]
-        raw_scores = self._model.predict(pairs)
+        raw_scores = self._model.predict(pairs, batch_size=self._batch_size())
         scores = self._normalize_scores(raw_scores)
         for score, (_, c) in zip(scores, candidates):
             c.ce_relevance = score
@@ -321,10 +345,126 @@ def _is_near_duplicate_body(a: SearchResult, b: SearchResult) -> bool:
     """
     if a.node_type and b.node_type and a.node_type != b.node_type:
         return False
+    # UPG-DEDUP-AUTOJUNK-DEFC: this call KNOWINGLY keeps difflib's default
+    # autojunk, which understates similarity on some content. The trigger needs
+    # BOTH conditions, not just length: autojunk engages at 200+ elements AND
+    # only bites when specific elements repeat heavily. Measured:
+    #     repetitive body, 392 chars   0.166 default   0.995 corrected
+    #     varied body,      251 chars   0.996 default   0.996 corrected
+    #     repetitive,       150 chars   0.993 default   0.993 corrected
+    # So on ordinary varied code it changes nothing, and on heavily repetitive
+    # code it is catastrophic.
+    #
+    # That distribution is the whole problem. The content it distorts is
+    # repetitive text, which is exactly templated code, which is also this
+    # key's false-collapse hazard. The broken metric has therefore been acting
+    # as an ACCIDENTAL templated-code guard, and removing it without a real
+    # guard is what produces the measured 50-results-to-1 collapse.
+    #
+    # It is not corrected in place because DEF-C SHIPS ENABLED and its 0.75
+    # threshold was calibrated through this same distorted metric. Fixing the
+    # metric alone makes a live feature far more aggressive with no evidence
+    # behind the new behaviour: measured, 50 templated accessors differing
+    # only in an index collapse from 50 results to 1. The correct fix pairs
+    # autojunk=False with a threshold recalibrated against the corpora, in one
+    # change. The disabled near_dup_body key below already uses the correct
+    # parameter, because changing it there ships no behaviour.
+    # The templated-body guard is deliberately NOT consulted here, and the
+    # reason is a result rather than an oversight. Wiring it in was tried and
+    # reverted: it breaks DEF-C's own witness case.
+    #
+    # DEF-C exists because three scripts named resolve_pdm.py, resolve_poetry.py
+    # and resolve_uv.py, sharing one copied docstring, crowded the canonical
+    # Lock definition out of the top results. Those three differ ONLY in an
+    # identifier. So does accessor_0 against accessor_1, which must never
+    # collapse. The two classes are structurally identical, and no rule
+    # operating on the characters of the two bodies can tell them apart:
+    # DEF-C's must-collapse witness and near_dup_body's must-not-collapse
+    # hazard are the same shape.
+    #
+    # The consequence for UPG-DEDUP-AUTOJUNK-DEFC: the guard does NOT make
+    # correcting autojunk here safe. Separating these cases needs a signal
+    # this layer does not have, such as whether the containing symbols are
+    # distinct definitions rather than copies, and that is a different item.
     ratio = difflib.SequenceMatcher(
         None, normalized_content(a.content), normalized_content(b.content),
     ).ratio()
     return ratio >= _DOCSTRING_DEDUP_BODY_SIMILARITY_MIN
+
+
+def _is_content_near_duplicate(a: SearchResult, b: SearchResult) -> bool:
+    """True near-duplicate-content guard for the LANE-NEARDUP-DEDUP third
+    dedup key (alongside the byte-identical content key UPG-2.2 and the
+    docstring-keyed near-duplicate key DEF-C). DEF-C requires a SHARED
+    leading docstring before it will check body similarity; this helper
+    catches the case DEF-C cannot reach — chunks whose leading docstrings
+    differ but whose bodies are still near-verbatim restatements of each
+    other (two functions with different one-liner summaries that landed on
+    essentially the same implementation; two thin wrapper modules whose
+    headers share no token yet whose bodies are byte-near-identical).
+
+    Three content-only gates run before a candidate is allowed to collapse
+    into an existing representative — all pure chunk PROPERTIES, never the
+    query:
+
+    Gate 1 — structural: when both chunks carry a recorded ``node_type`` and
+    the two differ (e.g. ``trait_item`` vs ``impl_item``), never collapse —
+    a chunk of one AST definition kind is categorically not a near-duplicate
+    of a chunk of a different kind, independent of any similarity
+    threshold. A no-op when either side's node_type is unknown/empty
+    (nothing to categorically compare). This is the SAME structural gate
+    DEF-C applies, kept here so the two mechanisms behave consistently.
+
+    Gate 2 — templated-body guard: bodies that are identical except for
+    token-like slot values (the ``handler_0``/``handler_1``,
+    ``compute_0``/``compute_1``, ``get_name``/``get_email``,
+    ``&str``/``&Path``, ``"foo"``/``"bar"`` shape common in generated
+    clients, dispatch tables, field accessors, enum handlers and
+    parameterised tests) clear the SequenceMatcher.ratio threshold
+    while representing genuinely distinct symbols. Reusing
+    ``_is_templated_body_difference`` from chunk_quality to detect
+    that shape (every non-equal SequenceMatcher opcode's spans are
+    token-only — ASCII letters, digits, underscores) keeps them apart.
+    A no-op for bodies that differ in non-token content (operator
+    swaps, paren changes, comment differences, string literals with
+    embedded punctuation) — those are the cases the key is meant to
+    collapse, or that the SequenceMatcher ratio gate already rejects.
+
+    Gate 3 — content: require the two chunks' STRIPPED bodies
+    (leading docstring/comment block removed via
+    ``_strip_leading_docstring_block``, the inverse of
+    ``leading_docstring_key``'s docstring detection) to be at least
+    ``_NEAR_DUP_BODY_SIMILARITY_MIN`` alike per
+    difflib.SequenceMatcher.ratio. The previous implementation compared
+    whole content INCLUDING the leading docstring, which dragged the
+    ratio below the threshold for the very case this key exists for
+    (chunks with different docstrings, near-verbatim bodies): the
+    differing docstrings were inside the comparison. With the docstring
+    stripped, every comparison gets more similar (the most-varying
+    part of the text is gone), but the key is now actually able to
+    fire on its target case. The 0.95 threshold is set well above the
+    trait/impl + overload body similarity measured for DEF-C
+    (~0.857, ~0.53) so this lane is for the OPPOSITE failure mode
+    (truly-near-identical content) and stays out of DEF-C's territory.
+    A chunk at 0.94 stripped with an already-kept representative is
+    left as its own result — the wasted slot is the pre-existing
+    defect this lane exists to reduce, never a false collapse.
+    """
+    if a.node_type and b.node_type and a.node_type != b.node_type:
+        return False
+    a_body = _strip_leading_docstring_block(a.content, a.language)
+    b_body = _strip_leading_docstring_block(b.content, b.language)
+    if _is_templated_body_difference(a_body, b_body):
+        return False
+    # autojunk=False for the same reason as the whole-content site above:
+    # difflib's default treats common characters in a 200+ element sequence as
+    # junk, which collapses the ratio on ordinary code. 0.158 against 0.995 on
+    # two bodies differing by one word.
+    ratio = difflib.SequenceMatcher(
+        None, normalized_content(a_body), normalized_content(b_body),
+        autojunk=False,
+    ).ratio()
+    return ratio >= _NEAR_DUP_BODY_SIMILARITY_MIN
 
 
 # ---------------------------------------------------------------------------
@@ -770,12 +910,39 @@ class CodeSearcher:
             and not ce_override
         )
 
+        # UPG-BANNER-CALIBRATION Phase 3: a third, independent low-confidence
+        # sub-signal — the rank-1-to-rank-2 cross-encoder relevance cliff. A
+        # set whose top result decisively leads the next is a set built on a
+        # real best guess; a set where the two are essentially tied on a
+        # shared weak base is not, even when the absolute low_top_relevance
+        # sub-signal above does not trip. Gated on ranking.relative_cliff
+        # .enabled; with the shipped default (false) the entire sub-signal
+        # is bypassed before relative_cliff_fires is called, so behaviour is
+        # byte-identical to the pre-this-feature path. The cliff function
+        # itself is a pure-Python comparison of two already-computed
+        # ce_relevance values in agent.ranking_cliff; no query-text
+        # classification enters here.
+        #
+        # ce_relevance at rank 0 / rank 1 is None when reranking didn't run
+        # (rerank=False, the reranker model failed to load, or — post-backfill
+        # in the rare straggler case — a candidate that fell outside the
+        # rerank pool). relative_cliff_fires is itself a no-op on None at
+        # either position (see agent/ranking_cliff.py), so the cliff sub-
+        # signal correctly stays silent in that case, matching the
+        # low_top_relevance sub-signal's own "reranking didn't run => silent"
+        # contract.
+        cliff_trigger = bool(final) and _RELATIVE_CLIFF_ENABLED and _relative_cliff_fires(
+            [r.ce_relevance for r in final[:2]],
+            min_top=_RELATIVE_CLIFF_MIN_TOP,
+            min_drop=_RELATIVE_CLIFF_MIN_DROP,
+        )
+
         # low_confidence: only meaningful when there is something to lead with —
         # an empty result set has its own "no results" message downstream.
         final.low_confidence = (
             _NOTFOUND_FLOOR_ENABLED
             and bool(final)
-            and (zero_df_trigger or low_top_relevance)
+            and (zero_df_trigger or low_top_relevance or cliff_trigger)
         )
         return final, elapsed_ms
 
@@ -842,11 +1009,16 @@ class CodeSearcher:
 
         Relevance is taken from the candidates' current (post-rerank) order; a
         per-chunk quality prior then demotes trivial / navigational / generated /
-        heading-only / test chunks (UPG-2.1, 2.3). Byte-identical chunks collapse
-        to a single representative with a duplicate count so boilerplate can't flood
-        the top-N (UPG-2.2); a second collapse key on the normalized leading
-        docstring/comment block catches near-duplicate boilerplate headers that
-        the byte-identical key misses (UPG-RUST-DEF-EVICTION / DEF-C).
+        heading-only / test chunks (UPG-2.1, 2.3). Three independent dedup keys
+        then collapse redundant copies from the surviving result list — the
+        byte-identical full-content key (UPG-2.2), the docstring-keyed near-
+        duplicate key (UPG-RUST-DEF-EVICTION / DEF-C, catches the
+        shared-leading-docstring case), and the LANE-NEARDUP-DEDUP content-only
+        near-duplicate key (catches near-verbatim full-content restatements
+        whose leading docstrings differ — the case DEF-C cannot reach by
+        design). Each surviving representative keeps a dup_count of how many
+        later candidates collapsed into it, so the caller can see that a slot
+        was freed by dedup rather than a retrieval miss.
 
         UPG-SCORE-DISPLAY-FLAT: `final_score` (the composite above) is an
         ORDERING KEY ONLY — it decides sort order and dedup precedence and is
@@ -1029,6 +1201,26 @@ class CodeSearcher:
                 reps = seen_docstring.get(doc_key, [])
                 for rep_idx in reps[:_DOCSTRING_DEDUP_MAX_REPS_COMPARED]:
                     if _is_near_duplicate_body(r, out[rep_idx]):
+                        existing_idx = rep_idx
+                        break
+            # LANE-NEARDUP-DEDUP: third, independent dedup key — content-only
+            # near-duplicate (no docstring key required). DEF-C above only
+            # fires when a docstring key matches; this catches the case
+            # DEF-C cannot reach, where leading docstrings differ but bodies
+            # are still near-verbatim restatements. Compared only against
+            # the first NEAR_DUP_BODY_MAX_REPS_COMPARED already-kept
+            # representatives (the best-ranked, since `out` is built in
+            # `scored`'s deterministic best-first order) — O(n*k) instead of
+            # O(n^2) SequenceMatcher calls in the pathological case. Same
+            # safe-failure direction as DEF-C's max_reps_compared: a
+            # candidate past the cap is never falsely collapsed, only left
+            # as an extra separate result. Only runs when the two prior keys
+            # have NOT already collapsed this candidate (a duplicate caught
+            # by the byte-identical content key is already accounted for;
+            # checking content-similarity on top would be wasted work).
+            if existing_idx is None and _NEAR_DUP_BODY_ENABLED:
+                for rep_idx in range(min(_NEAR_DUP_BODY_MAX_REPS_COMPARED, len(out))):
+                    if _is_content_near_duplicate(r, out[rep_idx]):
                         existing_idx = rep_idx
                         break
             if existing_idx is not None:

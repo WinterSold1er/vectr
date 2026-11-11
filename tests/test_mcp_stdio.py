@@ -415,6 +415,7 @@ class TestConfigureIdeOptOut:
         .claude/settings.json anyway. VECTR_CONFIGURE_IDE=0 closes that gap."""
         import main as main_module
         from agent.instance_registry import workspace_hash
+        from pathlib import Path as _Path
 
         ws = str(tmp_path)
         captured_env: dict = {}
@@ -425,9 +426,21 @@ class TestConfigureIdeOptOut:
             proc.pid = 99999
             return proc
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
+        # UPG-TEST-HOME-DIR-WRITES-FROM-UNIT-SUITE: redirect Path.home so
+        # _do_start's secure_dir(Path.home() / ".vectr") and the matching
+        # .../.vectr/logs mkdir live in tmp_path, not the developer's home.
+        # The call is still exercised end-to-end — a real crash in
+        # secure_dir would still surface here, just at a tmp_path.
         with patch("subprocess.Popen", side_effect=_fake_popen), \
              patch("main.InstanceRegistry") as mock_registry_cls, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
+             patch("pathlib.Path.home", lambda: _Path(tmp_path)), \
              patch("builtins.open", MagicMock()):
             mock_registry_cls.return_value.register = MagicMock()
             main_module._do_start(ws, 8765, workspace_hash(ws), no_ide_config=True)
@@ -437,6 +450,7 @@ class TestConfigureIdeOptOut:
     def test_do_start_omits_configure_ide_env_by_default(self, tmp_path) -> None:
         import main as main_module
         from agent.instance_registry import workspace_hash
+        from pathlib import Path as _Path
 
         ws = str(tmp_path)
         captured_env: dict = {}
@@ -447,9 +461,18 @@ class TestConfigureIdeOptOut:
             proc.pid = 99999
             return proc
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
+        # UPG-TEST-HOME-DIR-WRITES-FROM-UNIT-SUITE: see the comment in the
+        # companion test above.
         with patch("subprocess.Popen", side_effect=_fake_popen), \
              patch("main.InstanceRegistry") as mock_registry_cls, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
+             patch("pathlib.Path.home", lambda: _Path(tmp_path)), \
              patch("builtins.open", MagicMock()):
             mock_registry_cls.return_value.register = MagicMock()
             main_module._do_start(ws, 8765, workspace_hash(ws))
@@ -474,6 +497,20 @@ def _spawn_mcp_stdio(tmp_path: Path, extra_env: dict | None = None) -> subproces
     env.pop("VECTR_MCP_ALL_TOOLS", None)
     if extra_env:
         env.update(extra_env)
+    # UPG-TEST-REAL-EMBEDDER-DOWNLOAD-GUARD: this child's background
+    # VectrService construction may build a real LocalEmbedProvider (the
+    # in-process guard can't see a subprocess). Unless the run explicitly
+    # opted into real models, pin HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE so any
+    # accidental hub access fails fast and LOCALLY inside the child instead
+    # of reaching huggingface.co (CI hit real HTTP 429s). Safe by
+    # construction: every assertion in this file holds whether the background
+    # service finished loading or errored into "Vectr failed to start" —
+    # initialize/tools-list responses are independent of service health, and
+    # the reranker is already disabled via the inherited empty
+    # VECTR_RERANKER_MODEL.
+    if env.get("VECTR_TEST_ALLOW_REAL_NETWORK") != "1":
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
     return subprocess.Popen(
         [py, str(_MAIN_PY), "mcp-stdio", str(tmp_path)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

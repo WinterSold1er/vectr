@@ -24,43 +24,72 @@ plus `extra_roots`, e.g. a multi-root IDE workspace) — a file the caller
 wants to read may live under any of them, not only the primary, so
 containment is checked against every served root (see
 `resolve_content_file_path`'s docstring for the exact relative-path rule).
+
+UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL: an operator may also opt in to a
+configured set of ADDITIONAL roots via
+`MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS` (config-only, set at
+daemon startup, not per call). When that tuple is non-empty, paths resolving
+under any of those roots are accepted in addition to the served workspace
+roots — same symlink-following, same containment check, same refusal
+wording. The trust decision is the operator's, made once; a calling agent
+cannot widen containment per call.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from agent.config import MEMORY_WRITE_CONTENT_FILE_MAX_BYTES
+from agent.config import (
+    MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS,
+    MEMORY_WRITE_CONTENT_FILE_MAX_BYTES,
+)
 
 
 def resolve_content_file_path(
     workspace_root: str,
     raw_path: str,
     extra_roots: list[str] | None = None,
+    additional_readable_roots: list[str] | None = None,
 ) -> Path:
     """Resolve `raw_path` to an absolute `Path` inside a served workspace
-    root — `workspace_root` (the PRIMARY root) or any of `extra_roots` (the
+    root — `workspace_root` (the PRIMARY root), any of `extra_roots` (the
     additional roots a multi-root vectr instance serves alongside it, e.g.
-    the other folders of a multi-root IDE workspace).
+    the other folders of a multi-root IDE workspace), or any of
+    `additional_readable_roots` (UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL —
+    the operator-configured extra readable roots).
 
     Relative-path rule: a relative `raw_path` is always resolved relative to
     `workspace_root` (the primary root) only — it is never trial-resolved
-    against each of `extra_roots` in turn, so a relative path never becomes
-    an implicit search across every served root. `extra_roots` exist so an
-    ABSOLUTE path that already lives inside another served root is accepted,
-    not so a relative path can name a file by searching for it.
+    against each of `extra_roots` or `additional_readable_roots` in turn,
+    so a relative path never becomes an implicit search across every served
+    root. `extra_roots` and `additional_readable_roots` exist so an
+    ABSOLUTE path that already lives inside another accepted root is
+    accepted, not so a relative path can name a file by searching for it.
 
-    Either way, the RESOLVED path must land inside `workspace_root` or one
-    of `extra_roots`; a `..` escape, or a symlink that resolves outside
-    every served root, raises `ValueError` naming the original argument,
-    the path it resolved to, and every root that was checked — never
-    silently reading a file outside the served workspace (e.g.
-    `/etc/passwd`, another project's tree). Resolution (which follows
-    symlinks) always happens before this containment check, so a symlink
-    inside a served root that points outside every served root is still
-    rejected.
+    Either way, the RESOLVED path must land inside `workspace_root`,
+    `extra_roots`, or `additional_readable_roots`; a `..` escape, or a
+    symlink that resolves outside every accepted root, raises `ValueError`
+    naming the original argument, the path it resolved to, and every root
+    that was checked — never silently reading a file outside the accepted
+    set (e.g. `/etc/passwd`, another project's tree). Resolution (which
+    follows symlinks) always happens before this containment check, so a
+    symlink inside an accepted root that points outside every accepted
+    root is still rejected.
+
+    `additional_readable_roots=None` (the default) means "use the
+    operator-configured default"
+    (`MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS` from
+    agent.config). Pass an explicit list to override the configured default
+    for one call (e.g. a test pinning the off-by-default behaviour without
+    mutating the config singleton).
     """
     root = Path(workspace_root).resolve()
     served_roots = [root] + [Path(r).resolve() for r in (extra_roots or [])]
+    if additional_readable_roots is None:
+        additional_readable_roots = list(
+            MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS
+        )
+    for r in additional_readable_roots:
+        served_roots.append(Path(r).resolve())
     candidate = Path(raw_path)
     unresolved = candidate if candidate.is_absolute() else (root / candidate)
     try:
@@ -92,14 +121,15 @@ def read_content_file(
     workspace_root: str,
     raw_path: str,
     extra_roots: list[str] | None = None,
+    additional_readable_roots: list[str] | None = None,
 ) -> str:
     """Read and UTF-8-decode the note body at `raw_path`, resolved against
-    `workspace_root` or any of `extra_roots` (see `resolve_content_file_path`
-    for the exact multi-root resolution rule).
+    `workspace_root`, `extra_roots`, or `additional_readable_roots` (see
+    `resolve_content_file_path` for the exact multi-root resolution rule).
 
     Raises `ValueError` — never a raw `OSError`/`UnicodeDecodeError` — on
     each distinct failure, always naming the resolved path:
-      - the path escapes every served workspace root
+      - the path escapes every accepted root
       - the resolved path does not exist, or is not a regular file
       - the file is larger than `MEMORY_WRITE_CONTENT_FILE_MAX_BYTES`
       - the file's bytes are not valid UTF-8
@@ -112,7 +142,9 @@ def read_content_file(
     does not), so `content_file` behaves identically to `content` at each
     surface rather than introducing a third, file-specific convention.
     """
-    resolved = resolve_content_file_path(workspace_root, raw_path, extra_roots)
+    resolved = resolve_content_file_path(
+        workspace_root, raw_path, extra_roots, additional_readable_roots,
+    )
     if not resolved.exists():
         raise ValueError(
             f"content_file '{raw_path}' does not exist (resolved to "
@@ -166,15 +198,16 @@ def resolve_remember_content(
     content: str | None,
     content_file: str | None,
     extra_roots: list[str] | None = None,
+    additional_readable_roots: list[str] | None = None,
 ) -> str:
     """Resolve the note body for one `vectr_remember` call from exactly one
     of `content` (the literal body) or `content_file` (a path to read it
-    from, resolved against `workspace_root` or any of `extra_roots` — see
-    `resolve_content_file_path` for the multi-root rule). Mutually
-    exclusive, exactly one required — both present or both absent raise
-    `ValueError` with an actionable message. Shared by the MCP
-    `vectr_remember` tool and the REST `/v1/remember` route so both enforce
-    the identical rule.
+    from, resolved against `workspace_root`, `extra_roots`, or
+    `additional_readable_roots` — see `resolve_content_file_path` for the
+    multi-root rule). Mutually exclusive, exactly one required — both
+    present or both absent raise `ValueError` with an actionable message.
+    Shared by the MCP `vectr_remember` tool and the REST `/v1/remember`
+    route so both enforce the identical rule.
 
     Returns the raw resolved body unmodified (no stripping) either way — see
     `read_content_file`'s docstring for why that is the caller's job, not
@@ -188,7 +221,12 @@ def resolve_remember_content(
             "exactly one, not both."
         )
     if has_content_file:
-        return read_content_file(workspace_root, content_file.strip(), extra_roots)
+        return read_content_file(
+            workspace_root,
+            content_file.strip(),
+            extra_roots,
+            additional_readable_roots,
+        )
     if has_content:
         return content
     raise ValueError(

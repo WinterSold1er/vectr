@@ -134,12 +134,16 @@ class TestBoundaryPrecompactRenderer:
     def test_tiny_cap_drops_arc_sentence_keeps_base_text(self, real_service, monkeypatch):
         """When the combined (base + arc sentence) text would not fit the
         configured cap, the arc sentence is dropped entirely — the base
-        text alone is returned unmodified, never truncated mid-sentence."""
+        text alone is returned unmodified, never truncated mid-sentence.
+
+        UPG-L3-CONFIG-READ-TIME: the renderer reads the cap at request time
+        through `agent.config`, so that module attribute (not any importer's
+        by-value binding) is the override point."""
         from app.service import _BOUNDARY_PRECOMPACT_BASE_TEXT
 
         _insert_pending_arc(real_service)
         base_tokens = token_estimate(_BOUNDARY_PRECOMPACT_BASE_TEXT)
-        monkeypatch.setattr("app.service.BOUNDARY_PRECOMPACT_TOKEN_CAP", base_tokens)
+        monkeypatch.setattr("agent.config.BOUNDARY_PRECOMPACT_TOKEN_CAP", base_tokens)
 
         text = real_service._boundary_precompact_text()
         assert text == _BOUNDARY_PRECOMPACT_BASE_TEXT
@@ -147,8 +151,20 @@ class TestBoundaryPrecompactRenderer:
 
     def test_disabled_config_returns_empty_string_even_with_pending_arcs(self, real_service, monkeypatch):
         _insert_pending_arc(real_service)
-        monkeypatch.setattr("app.service.BOUNDARY_PRECOMPACT_ENABLED", False)
+        monkeypatch.setattr("agent.config.BOUNDARY_PRECOMPACT_ENABLED", False)
         assert real_service._boundary_precompact_text() == ""
+
+    def test_constants_are_not_rebound_into_app_service(self):
+        """UPG-L3-CONFIG-READ-TIME tripwire: app.service must NOT re-bind
+        BOUNDARY_PRECOMPACT_* as its own module attributes. If these names
+        reappear there, the monkeypatch.setattr("agent.config.…") overrides
+        above silently stop reaching the renderer while still passing — the
+        exact dual-patch-point trap this reconciliation removed. Reverting
+        the service-side change must fail THIS test loudly, not just the
+        ones above quietly testing nothing."""
+        import app.service
+        assert not hasattr(app.service, "BOUNDARY_PRECOMPACT_ENABLED")
+        assert not hasattr(app.service, "BOUNDARY_PRECOMPACT_TOKEN_CAP")
 
     def test_no_note_content_or_ids_in_text(self, real_service):
         """Notes already survive compaction via the separate SessionStart
@@ -237,7 +253,9 @@ class TestBoundaryPrecompactRestRoute:
 
     def test_disabled_config_returns_empty_text_still_200(self, real_client, monkeypatch):
         client, svc = real_client
-        monkeypatch.setattr("app.service.BOUNDARY_PRECOMPACT_ENABLED", False)
+        # UPG-L3-CONFIG-READ-TIME: overridden at the config module — honored
+        # end-to-end through the service's request-time read.
+        monkeypatch.setattr("agent.config.BOUNDARY_PRECOMPACT_ENABLED", False)
         resp = client.get("/v1/boundary/precompact")
         assert resp.status_code == 200
         assert resp.json()["text"] == ""

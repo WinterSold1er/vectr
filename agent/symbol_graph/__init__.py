@@ -65,6 +65,14 @@ from agent.symbol_graph._extraction import (
     _collect_symbols_and_calls,
     _record_rust_type,
     _rust_call_type_head,
+    # UPG-BASE-METHOD-OVERRIDE-FLOOD: same-file override-edge extraction.
+    # Re-exported so test modules can import it the same way they import
+    # the other internal helpers, instead of reaching into
+    # agent.symbol_graph._extraction directly.
+    _extract_overrides,
+    _collect_methods_by_class,
+    _python_class_bases,
+    _js_class_bases,
 )
 
 from agent.symbol_graph._graph import (
@@ -113,6 +121,12 @@ __all__ = [
     "_collect_symbols_and_calls",
     "_record_rust_type",
     "_rust_call_type_head",
+    # UPG-BASE-METHOD-OVERRIDE-FLOOD: same-file override extraction
+    # and base-list helpers.
+    "_extract_overrides",
+    "_collect_methods_by_class",
+    "_python_class_bases",
+    "_js_class_bases",
     "_SYMBOL_TYPES",
     "_MODULE_BINDING_TYPES",
     "_CALL_TYPES",

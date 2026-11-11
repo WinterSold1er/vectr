@@ -16,6 +16,7 @@ import logging
 import logging.handlers
 import os
 import threading
+import time
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -80,7 +81,20 @@ def _init_audit_logger(log: logging.Logger) -> logging.Logger:
     handler = logging.handlers.RotatingFileHandler(
         str(log_path), maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
     )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ"))
+    # UPG-AUDIT-LOCAL-TIME-Z: the trailing "Z" in the datefmt means UTC, but
+    # logging.Formatter stamps LOCAL time unless told otherwise — so the
+    # file carried local wall-clock under a Z that claimed otherwise
+    # (observed 03:12:39Z for a true 21:42:44Z), silently skewing any
+    # audit-to-transcript correlation by the host's UTC offset. Pin the
+    # formatter's converter to gmtime so the stamp is true UTC and the
+    # suffix is honest. Lines written before this fix in a still-rotating
+    # pre-existing audit file are local time despite their Z; rotation
+    # (10 MB x 3 backups) ages them out, and per-run harness audit logs are
+    # always fresh artifacts, so no format change or marker scheme is
+    # warranted.
+    formatter = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ")
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
     log.addHandler(handler)
     log.setLevel(logging.INFO)
     log.propagate = False

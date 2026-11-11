@@ -13,7 +13,7 @@ import pytest
 from agent.searcher import SearchResult, SearchResultList
 
 
-def _service(tmp_path, monkeypatch, **env):
+def _service(tmp_path, monkeypatch, proactive_now_fn=None, **env):
     from agent import indexer as idx_module
     from tests.conftest import _DummyEmbedProvider
 
@@ -24,7 +24,9 @@ def _service(tmp_path, monkeypatch, **env):
          patch("integrations.workspace_detect.find_workspace_root", return_value=str(tmp_path)), \
          patch.dict("os.environ", {"VECTR_DB_DIR": str(tmp_path / "db")}):
         from app.service import VectrService
-        return VectrService(workspace_root=str(tmp_path), memory_only=True)
+        return VectrService(
+            workspace_root=str(tmp_path), memory_only=True, proactive_now_fn=proactive_now_fn,
+        )
 
 
 # -- proactive_context ------------------------------------------------------
@@ -104,6 +106,41 @@ def test_proactive_dedup_cooldown_across_calls(tmp_path, monkeypatch):
     second = svc.proactive_context(file_paths=["/x/resolver.py"], session_id="sess")
     assert first["item_count"] == 1
     assert second["item_count"] == 0  # cooldown suppresses the repeat
+
+
+def test_proactive_cooldown_ttl_expires_via_injected_clock(tmp_path, monkeypatch):
+    """UPG-GATE-NOWFN-PLUMBING end to end at service level: the clock
+    injected into VectrService reaches the proxy channel's cooldown
+    LedgerStore (SessionLedger's now_fn seam, previously unreachable from
+    above app/service.py), so TTL expiry is provable without sleeping.
+
+    Frozen inside the TTL window, a repeat delivery stays suppressed; once
+    the injected clock passes cooldown_ttl_seconds the same note is
+    re-admitted. If the plumbing regresses and the service builds its
+    LedgerStore without now_fn, real time.monotonic never advances between
+    the calls and the final call still sees the suppression — the last
+    assertion fails."""
+    clock = {"t": 1000.0}
+    svc = _service(
+        tmp_path, monkeypatch,
+        VECTR_PROACTIVE="1",
+        VECTR_PROACTIVE_COOLDOWN_TTL_SECONDS="3600",
+        proactive_now_fn=lambda: clock["t"],
+    )
+    svc.remember("resolver.py holds the lock", kind="gotcha")
+    first = svc.proactive_context(file_paths=["/x/resolver.py"], session_id="sess")
+    assert first["item_count"] == 1
+    # Direct seam pin (ledger is built lazily on the first gate pass): OUR
+    # clock is what the ledger reads, not time.monotonic.
+    assert svc._proactive_ledger is not None
+    assert svc._proactive_ledger._now_fn() == 1000.0
+
+    second = svc.proactive_context(file_paths=["/x/resolver.py"], session_id="sess")
+    assert second["item_count"] == 0  # cooldown suppresses within the TTL...
+
+    clock["t"] += 3600.0  # ...and stops suppressing once the TTL has elapsed
+    third = svc.proactive_context(file_paths=["/x/resolver.py"], session_id="sess")
+    assert third["item_count"] == 1
 
 
 def test_proactive_declared_anchor_note_survives_reads_and_retires_on_edit(tmp_path, monkeypatch):

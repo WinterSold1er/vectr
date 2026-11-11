@@ -114,9 +114,11 @@ class Candidate:
                           # retirement (agent/proactive/gate.py's `select()`)
                           # to test membership against a request's
                           # `edited_file_paths` — never for display; the
-                          # rendered `line`'s anchor label is always the
-                          # basename computed in matcher.py, independent of
-                          # this field.
+                          # rendered `line`'s anchor label comes from
+                          # matcher.py independently of this field (since
+                          # UPG-MATCHER-RELATIVE-ANCHOR-LABEL it names the
+                          # form that actually matched — declared anchor
+                          # string or glob — not necessarily a basename).
     note_provenance: str | None = None  # `WorkingNote.provenance` (UPG-PROXY-
                           # INJECT-ROLE-PROVENANCE), one of PROVENANCE_VALUES
                           # ("human" | "agent" | "auto") for a note-backed
@@ -132,6 +134,28 @@ class Candidate:
                           # display — the per-line provenance marker in
                           # `line` is independent of this field and always
                           # present regardless of whether the gate reads it.
+    path_mention_count: int = 0  # UPG-PROXY-WEAK-TIER-TIEBREAK: how many times
+                          # the matched file's basename occurs in the note's
+                          # content at a genuine path boundary (the SAME
+                          # predicate `_path_boundary_match` applies). Populated
+                          # only by matcher.py for `note_structural` candidates;
+                          # every other candidate (and any hand-built one) keeps
+                          # the inert default. Read ONLY by the gate's step-5
+                          # sort as a tie-break among EQUAL-score candidates —
+                          # never compared against the similarity floor and
+                          # never added into `score` (moving a value there would
+                          # change which TIER wins against the semantic band,
+                          # which is explicitly out of scope).
+    path_mention_first_offset: int = -1  # UPG-PROXY-WEAK-TIER-TIEBREAK:
+                          # character offset of the FIRST such boundary
+                          # occurrence in the note's content, -1 when never
+                          # computed / no mention (the default every non-
+                          # structural candidate keeps; the gate sorts -1 after
+                          # every real offset). Same population scope and same
+                          # tie-break-only reader as `path_mention_count`
+                          # above: among notes mentioning the file equally
+                          # often, one whose SUBJECT is the file tends to name
+                          # it early rather than mid-list.
 
     @property
     def provenance_rank(self) -> int:

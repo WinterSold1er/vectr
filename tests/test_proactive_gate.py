@@ -12,10 +12,12 @@ from agent.proactive.types import (
 
 
 def _cand(kind, line, score, anchor, structural, state="active", structural_tier=None,
-          anchor_path=None):
+          anchor_path=None, path_mention_count=0, path_mention_first_offset=-1):
     return Candidate(
         kind=kind, line=line, score=score, anchor_id=anchor, is_structural=structural,
         state=state, structural_tier=structural_tier, anchor_path=anchor_path,
+        path_mention_count=path_mention_count,
+        path_mention_first_offset=path_mention_first_offset,
     )
 
 
@@ -421,3 +423,217 @@ def test_event_anchored_exempt_item_still_claimed_in_turn_ledger_same_turn():
     assert turn_ledger.eligible(11) is False  # still claimed this turn
     assert turn_ledger.eligible(99) is True  # kind-filtered by lever 1 (never
                                               # even a Candidate): NEVER claimed
+
+
+# -- UPG-PROXY-WEAK-TIER-TIEBREAK: relevance-bearing equal-score tie-break ---
+#
+# Every Tier-C candidate carries the SAME score (structural_scores.mention),
+# so the per-event weak-item cap admitted whichever equal-score candidate the
+# previous tie-break chain (provenance rank, then anchor_id — both irrelevant
+# to aboutness) happened to surface; measured 16/20 off-topic, with two input
+# orderings producing 71.9% vs 100% strict precision. The gate's step-5 sort
+# now breaks EQUAL scores by how hard each note talks about its file (basename
+# path-boundary mentions), then by where the first mention lands — subjects
+# name their file repeatedly and early; passing references don't.
+
+def test_weak_cap_tiebreak_prefers_the_candidate_that_mentions_its_file_more():
+    cands = [
+        _cand("note_structural", "passing mention", 0.60, "note:1", True,
+              structural_tier=STRUCTURAL_TIER_MENTION,
+              path_mention_count=1, path_mention_first_offset=40),
+        _cand("note_structural", "subject note", 0.60, "note:2", True,
+              structural_tier=STRUCTURAL_TIER_MENTION,
+              path_mention_count=3, path_mention_first_offset=0),
+    ]
+    out = _gate(max_items_per_event=5, max_weak_structural_items=1).select(
+        list(cands), session_id=""
+    )
+    # Equal scores: the count signal decides, NOT anchor_id order.
+    assert out.anchor_ids == ("note:2",)
+
+
+def test_weak_cap_tiebreak_at_equal_count_prefers_the_earlier_first_mention():
+    cands = [
+        _cand("note_structural", "mid-list mention", 0.60, "note:1", True,
+              structural_tier=STRUCTURAL_TIER_MENTION,
+              path_mention_count=1, path_mention_first_offset=31),
+        _cand("note_structural", "opens with the file", 0.60, "note:2", True,
+              structural_tier=STRUCTURAL_TIER_MENTION,
+              path_mention_count=1, path_mention_first_offset=13),
+    ]
+    out = _gate(max_items_per_event=5, max_weak_structural_items=1).select(
+        list(cands), session_id=""
+    )
+    assert out.anchor_ids == ("note:2",)
+
+
+def test_weak_cap_tiebreak_is_input_order_independent():
+    """The measured failure mode itself: two ORDERINGS of the same candidates
+    used to select different items (71.9% vs 100% strict precision). The
+    selection must now be a pure function of the candidate SET."""
+    def cand(note_id, count, offset):
+        return _cand("note_structural", f"weak {note_id}", 0.60, f"note:{note_id}",
+                     True, structural_tier=STRUCTURAL_TIER_MENTION,
+                     path_mention_count=count, path_mention_first_offset=offset)
+
+    one_way = [cand(1, 1, 31), cand(2, 1, 13), cand(3, 2, 8)]
+    other_way = list(reversed(one_way))
+    kw = dict(max_items_per_event=5, max_weak_structural_items=1)
+    a = _gate(**kw).select(list(one_way), session_id="")
+    b = _gate(**kw).select(list(other_way), session_id="")
+    assert a.anchor_ids == b.anchor_ids == ("note:3",)
+
+
+def test_tiebreak_signals_are_inert_for_handbuilt_candidates():
+    """Backward-compat guard: every pre-existing caller/test builds Candidates
+    without the new fields (defaults count=0 / offset=-1). Those constants
+    fall every equal-score comparison through to provenance rank then
+    anchor_id — byte-identical to the pre-change ordering."""
+    cands = [
+        _cand("note_structural", "b", 0.60, "note:2", True,
+              structural_tier=STRUCTURAL_TIER_MENTION),
+        _cand("note_structural", "a", 0.60, "note:1", True,
+              structural_tier=STRUCTURAL_TIER_MENTION),
+    ]
+    out = _gate(max_items_per_event=5, max_weak_structural_items=2).select(
+        list(cands), session_id=""
+    )
+    assert out.anchor_ids == ("note:1", "note:2")  # anchor_id tie-break, as before
+
+
+def test_tiebreak_never_promotes_a_lower_scored_candidate():
+    """The signals are tie-breaks ONLY: they never compare against the floor
+    and never fold into score, so a higher-scoring candidate from ANY tier
+    still outranks a more-mentioning weaker one."""
+    cands = [
+        _cand("note_structural", "weak but chatty", 0.60, "note:1", True,
+              structural_tier=STRUCTURAL_TIER_MENTION,
+              path_mention_count=9, path_mention_first_offset=0),
+        _cand("note_semantic", "semantic", 0.61, "note:2", False),
+    ]
+    out = _gate(max_items_per_event=5, max_weak_structural_items=1).select(
+        list(cands), session_id=""
+    )
+    assert out.anchor_ids == ("note:2", "note:1")
+
+
+# -- UPG-PROXY-COOLDOWN-NO-TIME-DECAY: TTL on the cooldown ring --------------
+#
+# The proxy channel's session key is process-scoped (UPG-PROXY-COOLDOWN-
+# SESSION-IDENTITY), so "last 30" spans the whole process lifetime and a note
+# that becomes genuinely relevant again hours later stays suppressed until 30
+# OTHER anchors cycle through. Entries can now expire after a wall-clock TTL.
+# All clocks here are injected fakes — no test sleeps.
+
+
+class _FakeClock:
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_session_ledger_ttl_expires_entry_after_window():
+    clock = _FakeClock()
+    led = SessionLedger(capacity=30, ttl_seconds=60.0, now_fn=clock)
+    led.add("a")
+    assert led.seen("a")
+    clock.advance(30)
+    assert led.seen("a")   # inside the window: still suppressed
+    clock.advance(31)      # past the window boundary: expired
+    assert not led.seen("a")
+
+
+def test_session_ledger_without_ttl_is_pure_count_ring():
+    """ttl_seconds=None (the historical behaviour, and what every pre-existing
+    direct construction gets) never time-expires, however long the clock
+    runs — suppression ends only when capacity evicts."""
+    clock = _FakeClock()
+    led = SessionLedger(capacity=2, ttl_seconds=None, now_fn=clock)
+    led.add("a")
+    led.add("b")
+    clock.advance(10**9)
+    assert led.seen("a") is True and led.seen("b") is True
+    led.add("c")           # capacity eviction, not time, removes "a"
+    assert not led.seen("a")
+    assert led.seen("b") and led.seen("c")
+
+
+def test_session_ledger_refresh_extends_suppression_from_most_recent_delivery():
+    clock = _FakeClock()
+    led = SessionLedger(capacity=30, ttl_seconds=60.0, now_fn=clock)
+    led.add("a")
+    clock.advance(50)
+    led.add("a")           # re-delivered: suppression restarts from NOW
+    clock.advance(50)
+    assert led.seen("a")   # only 50s since the most recent delivery
+    clock.advance(10)
+    assert not led.seen("a")
+
+
+def test_capacity_bound_still_applies_on_top_of_the_ttl():
+    """The TTL only ever EXPIRES entries early; it never extends retention
+    past the ring."""
+    clock = _FakeClock()
+    led = SessionLedger(capacity=2, ttl_seconds=3600.0, now_fn=clock)
+    led.add("a")
+    led.add("b")
+    led.add("c")           # evicts "a" by capacity even though its TTL runs
+    assert not led.seen("a")
+    assert led.seen("b") and led.seen("c")
+
+
+def test_ttl_expires_entries_regardless_of_ring_position():
+    clock = _FakeClock()
+    led = SessionLedger(capacity=3, ttl_seconds=60.0, now_fn=clock)
+    led.add("old")
+    clock.advance(30)
+    led.add("new")
+    clock.advance(35)      # "old" is 65s past delivery, "new" only 35s
+    assert not led.seen("old")
+    assert led.seen("new")
+    # The ring was rebuilt around the survivor: capacity accounting continues
+    # from the LIVE entries only.
+    led.add("x")
+    led.add("y")           # ring now exactly full: new,x,y (capacity 3)
+    assert led.seen("new") and led.seen("x") and led.seen("y")
+    led.add("z")           # evicts "new", the oldest-inserted LIVE entry
+    assert not led.seen("new")
+    assert led.seen("x") and led.seen("y") and led.seen("z")
+
+
+def test_ledger_store_threads_ttl_and_clock_to_every_session():
+    clock = _FakeClock()
+    store = LedgerStore(cooldown_items=5, ttl_seconds=60.0, now_fn=clock)
+    store.record("s1", ["a"])
+    store.record("s2", ["b"])
+    assert store.seen("s1", "a") and store.seen("s2", "b")
+    clock.advance(61)
+    assert not store.seen("s1", "a")
+    assert not store.seen("s2", "b")
+
+
+def test_proactive_gate_threads_cooldown_ttl_into_its_own_ledger(monkeypatch):
+    """Wiring pin: ProactiveGate(cooldown_ttl_seconds=...) must reach the
+    LedgerStore it constructs internally (app/service.py passes the settings
+    knob straight through)."""
+    import agent.proactive.gate as gate_mod
+
+    captured = {}
+    real_store = gate_mod.LedgerStore
+
+    def spy(cooldown_items, **kw):
+        captured.update(kw)
+        return real_store(cooldown_items, **kw)
+
+    monkeypatch.setattr(gate_mod, "LedgerStore", spy)
+    _gate(cooldown_ttl_seconds=90)
+    assert captured.get("ttl_seconds") == 90
+
+    captured.clear()
+    _gate()  # default: no TTL (historical behaviour for direct constructions)
+    assert captured.get("ttl_seconds") is None

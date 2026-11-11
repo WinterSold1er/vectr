@@ -339,6 +339,24 @@ class TestStatusDeterminismUPG82:
         assert svc.last_indexed == svc.status()["last_indexed"]
         assert svc.last_indexed != "never"
 
+    def test_status_includes_purpose_vector_fields_against_real_indexer(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """UPG-PURPOSE-RESUME-HOLE: status()'s total_purpose_chunks and
+        purpose_backfill_pending_files must be wired to the real
+        CodeIndexer properties, not just present in a mocked test double —
+        test_api.py/test_mcp_server.py only prove the REST/MCP layer
+        renders whatever dict service.status() hands them; this proves
+        service.status() actually populates those keys from the real
+        indexer in the first place."""
+        svc = self._make_service(tmp_path, monkeypatch)
+        svc.index(str(tmp_path))
+        data = svc.status()
+        assert "total_purpose_chunks" in data
+        assert "purpose_backfill_pending_files" in data
+        assert data["total_purpose_chunks"] == svc._indexer.total_purpose_chunks
+        assert data["purpose_backfill_pending_files"] == svc._indexer.purpose_backfill_pending_files
+
 
 # ---------------------------------------------------------------------------
 # UPG-STATUS-STALE-GRAPH: /v1/status must not let a persisted stale-toolchain
@@ -788,6 +806,78 @@ class TestIdentifierHintNearMiss:
         )
         total_names = sum(len(syms) for _token, syms in pairs)
         assert total_names <= 1
+
+
+# ---------------------------------------------------------------------------
+# UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: the PRIMARY locate surface (MCP
+# vectr_locate + REST /v1/locate both go through locate_with_snippets) opts in
+# — a total miss carries deterministic near-miss candidates on the result,
+# labeled inexact by the same formatter the tool dispatches through. The
+# search-hint paths (identifier_hint_symbols / identifier_hint_nearmiss) call
+# the graph directly and are NOT affected.
+# ---------------------------------------------------------------------------
+
+class TestLocatePrimarySurfaceNearMiss:
+    def _make_service(self, tmp_path, monkeypatch, files: dict[str, str]):
+        return TestIdentifierHintSymbols()._make_service(tmp_path, monkeypatch, files)
+
+    def test_default_locate_carries_near_miss_on_total_miss(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """vectr_locate("OrderRepositary.save_recrd") — a double typo neither
+        the qualifier widening nor any locate_l2 strategy can resolve — used to
+        answer with zero suggestions; now the result carries the deterministic
+        candidate while symbols stays empty (a miss is never rewritten)."""
+        svc = self._make_service(tmp_path, monkeypatch, {
+            "orders.py": (
+                "class OrderRepository:\n    def save_record(self):\n        pass\n"
+            ),
+        })
+        result = svc.locate_with_snippets("OrderRepositary.save_recrd")
+        assert result.resolution_strategy == "none"
+        assert result.symbols == []
+        assert [s.name for s in result.near_miss] == ["OrderRepository.save_record"]
+
+    def test_formatted_tool_text_labels_suggestions_inexact(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """End-to-end through the exact formatter call vectr_locate's dispatch
+        makes: the miss stays a miss and the suggestions are explicitly
+        inexact."""
+        svc = self._make_service(tmp_path, monkeypatch, {
+            "orders.py": (
+                "class OrderRepository:\n    def save_record(self):\n        pass\n"
+            ),
+        })
+        result = svc.locate_with_snippets("OrderRepositary.save_recrd")
+        text = svc.format_locate(result, "OrderRepositary.save_recrd")
+        assert "No exact match for 'OrderRepositary.save_recrd'" in text
+        assert "(inexact — verify before use)" in text
+        assert "No symbol matching" not in text
+
+    def test_exact_hit_unaffected(self, tmp_path, monkeypatch) -> None:
+        svc = self._make_service(tmp_path, monkeypatch, {
+            "orders.py": (
+                "class OrderRepository:\n    def save_record(self):\n        pass\n"
+            ),
+        })
+        result = svc.locate_with_snippets("OrderRepository.save_record")
+        assert result.resolution_strategy != "none"
+        assert result.near_miss == []
+
+    def test_opt_out_flag_keeps_cheap_behaviour(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        svc = self._make_service(tmp_path, monkeypatch, {
+            "orders.py": (
+                "class OrderRepository:\n    def save_record(self):\n        pass\n"
+            ),
+        })
+        result = svc.locate_with_snippets(
+            "OrderRepositary.save_recrd", with_near_miss=False,
+        )
+        assert result.resolution_strategy == "none"
+        assert result.near_miss == []
 
 
 # ---------------------------------------------------------------------------

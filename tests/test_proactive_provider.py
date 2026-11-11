@@ -88,8 +88,9 @@ async def test_provider_unreachable_is_fail_open():
 def test_provider_constructed_via_wiring_has_timeout_below_budget():
     settings = ProactiveSettings(
         enabled=True, min_similarity=0.35, max_items_per_event=3, max_chars_per_event=800,
-        cooldown_items=30, matcher_structural_note=True, matcher_semantic_note=True,
-        matcher_code_search=False, proxy_enabled=True, proxy_host="127.0.0.1",
+        cooldown_items=30, cooldown_ttl_seconds=None,
+        matcher_structural_note=True, matcher_semantic_note=True,
+        matcher_code_search=False, proxy_host="127.0.0.1",
         proxy_port=8785, proxy_upstream_base_url="https://api.anthropic.com",
         proxy_connect_timeout_s=10.0, proxy_read_timeout_s=600.0, proxy_inject=True,
         proxy_inject_budget_ms=750, proxy_inject_provider_timeout_fraction=0.8,

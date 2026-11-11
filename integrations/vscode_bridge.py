@@ -51,11 +51,15 @@ def _merge_json_file(
     logger.info("Updated %s", path)
 
 
-# Both configs below store vectr's own entry at the same dotted path,
+# Cursor and Claude Code store vectr's own entry at the same dotted path,
 # "mcpServers.vectr" — the whole subtree is vectr-owned (url, headers, name),
 # so it's always synced rather than merge-preserved; everything else in the
 # file (other MCP servers, unrelated settings) is left untouched.
 _VECTR_MCP_ENTRY_KEY: tuple[tuple[str, ...], ...] = (("mcpServers", "vectr"),)
+
+# VS Code's own MCP file uses "servers" rather than "mcpServers" for the same
+# concept, so it needs its own owned-key path — the merge is otherwise identical.
+_VECTR_VSCODE_ENTRY_KEY: tuple[tuple[str, ...], ...] = (("servers", "vectr"),)
 
 
 def configure_cursor(workspace_root: str, port: int = DEFAULT_PORT) -> None:
@@ -84,6 +88,28 @@ def configure_claude_code(workspace_root: str, port: int = DEFAULT_PORT) -> None
     }, owned_keys=_VECTR_MCP_ENTRY_KEY)
 
 
+def configure_vscode(workspace_root: str, port: int = DEFAULT_PORT) -> None:
+    """Write/merge .vscode/mcp.json for VS Code.
+
+    This file was previously synced ONLY by the editor extension, after the
+    extension itself spawned the daemon. Any other route to a port change --
+    a daemon started from the CLI, or a workspace that is a secondary root of
+    a multi-root instance -- left it pointing at a dead port indefinitely,
+    while .cursor/mcp.json and .claude/settings.json self-healed here on the
+    next startup. Keeping it in `configure_all` makes the daemon the one
+    writer that always converges (UPG-VSCODE-MCP-NO-DAEMON-SELF-HEAL).
+    """
+    path = Path(workspace_root) / ".vscode" / "mcp.json"
+    _merge_json_file(path, {
+        "servers": {
+            "vectr": {
+                "type": "http",
+                "url": f"http://localhost:{port}/mcp",
+            }
+        }
+    }, owned_keys=_VECTR_VSCODE_ENTRY_KEY)
+
+
 def configure_all(workspace_root: str, port: int = DEFAULT_PORT) -> None:
     """Configure all supported AI tools."""
     try:
@@ -94,3 +120,7 @@ def configure_all(workspace_root: str, port: int = DEFAULT_PORT) -> None:
         configure_claude_code(workspace_root, port)
     except Exception as e:
         logger.warning("Could not configure Claude Code: %s", e)
+    try:
+        configure_vscode(workspace_root, port)
+    except Exception as e:
+        logger.warning("Could not configure VS Code: %s", e)

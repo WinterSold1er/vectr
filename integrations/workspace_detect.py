@@ -279,14 +279,6 @@ def should_index_file(
     if path.suffix.lower() not in _SUPPORTED_EXTS:
         return False
 
-    # UPG-1.3: never index vectr's own injected IDE-config files, nor
-    # machine-generated/vendored files (lookup tables, protobuf, minified).
-    # UPG-15.9: never index files inside build-artifact directories (*.egg-info,
-    # *.dist-info) — they contain only file-path manifests and packaging metadata
-    # with no educational content (SOURCES.txt, PKG-INFO flood BM25 on identifiers).
-    if is_vectr_config_file(file_path) or is_generated_file(file_path) or is_build_artifact_file(file_path):
-        return False
-
     excluded = _ALWAYS_SKIP | (extra_excluded_dirs or set())
 
     rel_path = path
@@ -295,6 +287,21 @@ def should_index_file(
             rel_path = path.resolve().relative_to(Path(workspace_root).resolve())
         except ValueError:
             pass  # file outside the root — fall back to the full path
+
+    # UPG-1.3/UPG-15.9: never index vectr's own injected IDE-config files,
+    # machine-generated/vendored files (lookup tables, protobuf, minified), or
+    # files inside build-artifact directories (*.egg-info, *.dist-info).
+    # UPG-RAGAS-WORKTREE-GUARD: the matchers scan every component OF THE PATH
+    # THEY ARE GIVEN, so handing them the absolute path let an ANCESTOR of the
+    # workspace decide exclusion — a checkout living under a directory named
+    # `generated`/`node_modules`, `mypkg.egg-info`, `.vscode`, etc. silently
+    # lost its entire tree even though nothing below the workspace root
+    # matches. Feed them the workspace-relative path for exactly the reason
+    # the ignore-dir loop right below is relative-only. When relativization
+    # fails (file outside the root) we still fall back to the full path,
+    # matching the loop's behavior.
+    if is_vectr_config_file(str(rel_path)) or is_generated_file(str(rel_path)) or is_build_artifact_file(str(rel_path)):
+        return False
 
     for part in rel_path.parts:
         if part in excluded:

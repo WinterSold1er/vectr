@@ -153,6 +153,43 @@ def test_iter_result_paths_skips_superseded_and_poisoned_trajectories(tmp_path):
     assert not any(".superseded-" in str(p) for p in found)
 
 
+def test_iter_result_paths_ignores_stale_absolute_result_path_from_a_relocated_copy(tmp_path):
+    """UPG-EVAL-RESCORE-RUNSDIR-ESCAPE: `state.json`'s `result_path` is an ABSOLUTE
+    path baked in by `run_plan.py` at the run's ORIGINAL invocation. When `runs_dir`
+    passed to `rescore.py` is a relocated COPY of that tree (exactly
+    `results/longitudinal/README.md`'s documented "This is a copy of the private run
+    directory"), that recorded path points at a directory that may not even exist
+    here. `iter_result_paths` must reconstruct the k>=2 path structurally from
+    `traj_dir` (already resolved under the CALLER's own `runs_dir`) instead of
+    trusting it, so rescoring a relocated copy never escapes outside `runs_dir`.
+    """
+    leg1_path = _write_leg1_fixture(tmp_path, scenario_slug="release_via_ci", seed=0, command="cat RELEASING.md")
+    result_path, _ = _write_leg2_fixture(
+        tmp_path, scenario_slug="release_via_ci", seed=0, leg1_result_path=leg1_path, command="cat RELEASING.md",
+    )
+
+    # Simulate relocation: state.json still names the ORIGINAL machine's absolute
+    # path, which does not exist under this fixture's tmp_path at all.
+    traj_dir = result_path.parent.parent.parent.parent
+    stale_original_path = "/Users/original-operator/vectr-eval-runs/longitudinal-s0/release_via_ci-none-none-s0/legs/2/artifacts/result.json"
+    state = json.loads((traj_dir / "state.json").read_text())
+    for leg in state["legs"]:
+        if leg["k"] == 2:
+            leg["result_path"] = stale_original_path
+    (traj_dir / "state.json").write_text(json.dumps(state))
+
+    found = list(rescore.iter_result_paths(tmp_path))
+    assert result_path in found  # found via structural reconstruction, not the stale field
+    assert not any(str(p) == stale_original_path for p in found)
+
+    summary = rescore.run(tmp_path)
+    assert summary["legs_rescored"] == 2
+    # Every rescored sibling lands under this call's own runs_dir -- nothing escapes
+    # to the stale recorded location (which does not exist and was never created).
+    assert (result_path.parent / "result.rescored.json").is_file()
+    assert not Path("/Users/original-operator/vectr-eval-runs").exists()
+
+
 # ---------------------------------------------------------------------------
 # rescore_leg / run -- end to end
 # ---------------------------------------------------------------------------

@@ -314,7 +314,7 @@ class TestMcpDispatchMemoryOnly:
         from app.service import RememberOutcome
         svc = self._make_mock_service(memory_only=True)
         svc.remember_with_extras.return_value = RememberOutcome(
-            note_id=7, related=[], proxy_anchor_suggestions=[],
+            note_id=7, related=[], revoked_related=[], proxy_anchor_suggestions=[],
         )
 
         result = handle_tools_call("vectr_remember", {"content": "important finding"}, svc)
@@ -533,6 +533,7 @@ class TestDoStartEnvConstruction:
     def test_memory_only_flag_adds_env_var(self, tmp_path):
         import main as m
         from agent.instance_registry import workspace_hash
+        from pathlib import Path as _Path
 
         ws = str(tmp_path)
         wh = workspace_hash(ws)
@@ -545,9 +546,20 @@ class TestDoStartEnvConstruction:
             proc.pid = 99999
             return proc
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
+        # UPG-TEST-HOME-DIR-WRITES-FROM-UNIT-SUITE: redirect Path.home so
+        # _do_start's secure_dir(Path.home() / ".vectr"[/logs]) mkdir lives
+        # in tmp_path, not the developer's home. The call still runs
+        # end-to-end — a real crash in secure_dir would still surface here.
         with patch("subprocess.Popen", side_effect=_mock_popen), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
+             patch("pathlib.Path.home", lambda: _Path(tmp_path)), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh, memory_only=True)
@@ -557,6 +569,7 @@ class TestDoStartEnvConstruction:
     def test_default_mode_does_not_add_env_var(self, tmp_path):
         import main as m
         from agent.instance_registry import workspace_hash
+        from pathlib import Path as _Path
 
         ws = str(tmp_path)
         wh = workspace_hash(ws)
@@ -569,9 +582,18 @@ class TestDoStartEnvConstruction:
             proc.pid = 99999
             return proc
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
+        # UPG-TEST-HOME-DIR-WRITES-FROM-UNIT-SUITE: see the comment in the
+        # companion test above.
         with patch("subprocess.Popen", side_effect=_mock_popen), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
+             patch("pathlib.Path.home", lambda: _Path(tmp_path)), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh, memory_only=False)

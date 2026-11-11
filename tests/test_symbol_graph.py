@@ -38,6 +38,11 @@ from agent.symbol_graph import (
     _locate_scope_depth_batch,
     _locate_class_enclosed_batch,
     _enclosing_class_from_lines,
+    # UPG-BASE-METHOD-OVERRIDE-FLOOD: same-file override extraction.
+    _extract_overrides,
+    _collect_methods_by_class,
+    _python_class_bases,
+    _js_class_bases,
 )
 import agent.symbol_graph as _sgmod
 from tests.conftest import make_py
@@ -291,6 +296,378 @@ class TestJavaMethodNameExtractionUPG:
         p.write_text("class Calc {\n  int add(int a, int b) { return a + b; }\n}\n")
         names = {s["name"] for s in extract_symbols_from_file(str(p))[0]}
         assert "add" in names
+
+
+class TestRustImplSymbolNameUPG:
+    """UPG-RUST-IMPL-SYMBOL-NAME-TRAIT-VS-TYPE: an `impl_item` exposes no
+    `name` field, so `_get_symbol_name` fell through to the positional
+    child-scan, whose first identifier-ish child is the TRAIT for
+    `impl Trait for Type { }` — the impl container was indexed under the
+    trait's name. Resolution now goes through the grammar's `type` field,
+    which names the implemented type on both inherent and trait impls."""
+
+    def test_trait_impl_indexed_under_type_not_trait(self, tmp_path) -> None:
+        # No struct declaration in the file: the ONLY emitted symbol is the
+        # impl block itself, so the assertion can't be satisfied by anything
+        # else. With the bug present this emits ("Measurable", "impl") and
+        # nothing else; fixed, it emits ("Widget", "impl").
+        p = tmp_path / "widget_impl.rs"
+        p.write_text(
+            "impl Measurable for Widget {\n"
+            "    fn measure(&self) -> u32 { 1 }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        by_name = {s["name"]: s for s in symbols}
+        assert by_name.get("Widget", {}).get("kind") == "impl", (
+            f"expected the impl block indexed under the TYPE 'Widget', got {symbols}"
+        )
+        assert "Measurable" not in by_name, (
+            f"the trait name must never become the impl symbol's name: {sorted(by_name)}"
+        )
+
+    def test_inherent_impl_still_resolved(self, tmp_path) -> None:
+        # Regression guard: `impl Type { }` has no trait child; the old scan
+        # happened to pick the type. The field-based path must agree.
+        p = tmp_path / "widget.rs"
+        p.write_text(
+            "impl Widget {\n"
+            "    fn refresh(&mut self) { }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        impls = [s for s in symbols if s["kind"] == "impl"]
+        assert [s["name"] for s in impls] == ["Widget"]
+
+    def test_generic_trait_impl_resolved_via_type_field(self, tmp_path) -> None:
+        # Both the trait (`Measurable<T>`) and the type (`Bag<T>`) are
+        # generic_type nodes here, so the positional scan found NO matching
+        # direct child and dropped the impl entirely (name "" → not emitted).
+        # The field path unwraps generic_type → its own `type` field down to
+        # the bare type_identifier, same as _graph._impl_owner_type_name.
+        p = tmp_path / "bag.rs"
+        p.write_text(
+            "impl<T> Measurable<T> for Bag<T> {\n"
+            "    fn measure(&self) -> u32 { 1 }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        impls = [s for s in symbols if s["kind"] == "impl"]
+        assert [s["name"] for s in impls] == ["Bag"], (
+            f"generic trait impl must resolve to the type 'Bag', got {symbols}"
+        )
+
+
+class TestJavaConstructorSymbolsUPG:
+    """UPG-ENUM-CONTAINER-NONMETHOD-COVERAGE (constructor half):
+    constructor_declaration was absent from the Java symbol map, so every
+    constructor was invisible to the symbol graph — unlocatable, and calls
+    inside its body attributed to the enclosing class's context rather than
+    to the constructor's own position."""
+
+    def test_constructor_extracted_as_method_kind_symbol(self, tmp_path) -> None:
+        p = tmp_path / "Widget.java"
+        p.write_text(
+            "public class Widget {\n"
+            "    private int v;\n"
+            "    public Widget() { this.v = 0; }\n"
+            "    public Widget(int v) { this.v = v; }\n"
+            "    public int get() { return v; }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        widget_kinds = {s["kind"] for s in symbols if s["name"] == "Widget"}
+        # Both the class definition AND its constructors share the name;
+        # before the fix only the class's "class" kind existed.
+        assert {"class", "method"} <= widget_kinds, (
+            f"expected class + constructor(method) symbols named 'Widget', got {widget_kinds}"
+        )
+
+    def test_constructor_line_points_at_declaration(self, tmp_path) -> None:
+        p = tmp_path / "Gauge.java"
+        p.write_text(
+            "public class Gauge {\n"
+            "    public Gauge(int start) { }\n"
+            "    public int read() { return 0; }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        ctors = [s for s in symbols if s["name"] == "Gauge" and s["kind"] == "method"]
+        assert len(ctors) == 1
+        lines = p.read_text().splitlines()
+        assert "Gauge(int start)" in lines[ctors[0]["start_line"] - 1], (
+            f"constructor start_line {ctors[0]['start_line']} does not point at its declaration"
+        )
+
+
+class TestJavaEnumAndFieldSymbolsUPG:
+    """UPG-JAVA-ENUM-CONSTANTS-NO-L2-SYMBOLS: enum_constant and field_declaration
+    were absent from the Java symbol map, so `vectr_locate STATUS_CODE_159` /
+    `vectr_locate MAX_RETRIES` missed while the L3 chunker now finds them — the
+    TIER0 asymmetry class in its inverted form, after the constructor half was
+    closed at v13. Enum constants and class fields are members of a type's
+    namespace and locatable; method-locals are not — but tree-sitter-java
+    separates `field_declaration` (class/enum body) from
+    `local_variable_declaration` (method body) at the grammar level, so the
+    enclosing-kind gate the Zig case required is unnecessary here."""
+
+    def test_enum_constants_are_extracted_with_their_kind(self, tmp_path) -> None:
+        p = tmp_path / "Status.java"
+        p.write_text(
+            "public enum Status {\n"
+            "    ACTIVE,\n"
+            "    INACTIVE,\n"
+            "    PENDING_CODE_159\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        by_name = {s["name"]: s for s in symbols}
+        # The enum itself is still kind=enum (rank 0); each constant is kind=
+        # enum_constant (rank 1) so the enum outranks its values on a same-
+        # name collision, mirroring the class/method precedent.
+        assert by_name["Status"]["kind"] == "enum"
+        assert by_name["ACTIVE"]["kind"] == "enum_constant"
+        assert by_name["INACTIVE"]["kind"] == "enum_constant"
+        assert by_name["PENDING_CODE_159"]["kind"] == "enum_constant"
+        # No "Status" kind=enum_constant leak — the enum body's name is its
+        # own declaration, not a member of itself.
+        assert "Status" not in {n for n, s in by_name.items() if s["kind"] == "enum_constant"}
+
+    def test_enum_constant_is_locatable_via_locate_l2(self, tmp_path) -> None:
+        p = tmp_path / "Status.java"
+        p.write_text(
+            "public enum Status {\n"
+            "    ACTIVE,\n"
+            "    INACTIVE\n"
+            "}\n"
+        )
+        g = SymbolGraph(str(tmp_path))
+        g.index_file("ws", str(p))
+        result = g.locate_l2("ws", "ACTIVE")
+        assert result.resolution_strategy == "exact"
+        assert result.symbols[0].name == "ACTIVE"
+        assert result.symbols[0].kind == "enum_constant"
+
+    def test_class_field_is_extracted_with_field_kind(self, tmp_path) -> None:
+        p = tmp_path / "Config.java"
+        p.write_text(
+            "public class Config {\n"
+            "    public int MAX_RETRIES = 3;\n"
+            "    private final String NAME = \"default\";\n"
+            "    public static int PORT = 8080;\n"
+            "    public void setPort(int p) { this.PORT = p; }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        by_name = {s["name"]: s for s in symbols}
+        # The static/final distinction does not change the kind — both instance
+        # and `static`/`final` fields are part of the class's namespace and
+        # share a single `field` kind. Splitting them would multiply locate
+        # noise without a documented use case.
+        assert by_name["MAX_RETRIES"]["kind"] == "field"
+        assert by_name["NAME"]["kind"] == "field"
+        assert by_name["PORT"]["kind"] == "field"
+        # The setPort method must still be present and not demoted by the new
+        # field entries; the class ranks above its fields, methods rank with
+        # fields (all 1), and the locatable "PORT" is the field, not anything
+        # else.
+        assert by_name["setPort"]["kind"] == "method"
+        assert by_name["Config"]["kind"] == "class"
+
+    def test_method_local_variable_is_not_extracted_as_a_field(self, tmp_path) -> None:
+        """tree-sitter-java separates `field_declaration` (class/enum body
+        members) from `local_variable_declaration` (method body locals) at the
+        grammar level. Without that separation, the Zig-style enclosing-kind
+        gate would have been required to keep `int x = 0;` inside a method
+        body from leaking into the graph as a `field`. The grammar already
+        prevents that, and this test pins the property: a local declaration
+        matching the field_declaration signature (`int x = 0;`) inside a
+        method body is not in the symbol set."""
+        p = tmp_path / "Local.java"
+        p.write_text(
+            "public class Local {\n"
+            "    public void run() {\n"
+            "        int x = 0;\n"
+            "        String s = \"hi\";\n"
+            "        x = x + 1;\n"
+            "    }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        names = {s["name"] for s in symbols}
+        assert "x" not in names
+        assert "s" not in names
+        # The class and method are still extracted.
+        assert "Local" in names
+        assert "run" in names
+
+    def test_enum_constant_ranks_below_its_enum_with_the_same_name(self, tmp_path) -> None:
+        """A symbol kind that ranks BELOW the enum/class that contains it
+        must hold for both of the new kinds, so an enum and an enum constant
+        of the same name (or a class and a field of the same name) resolves
+        to the type definition, not the member. Confirms the rank=1 entry
+        for both new kinds, matching the class/method precedent (rank 0/1).
+
+        Asserted through `locate_l2`, which is the surface that consults
+        `_KIND_RANK`; plain `locate` orders by exact-match/name-length/path
+        and has never ranked by kind, so it would return seed order here and
+        prove nothing either way (cf. the struct-over-impl precedent in
+        TestLocateL2Ranking.test_canonical_def_ranks_before_impl_on_exact_match).
+        Each pair is seeded member-first so a pass cannot come from insertion
+        order."""
+        # Seed the graph directly so we can test the rank ordering without
+        # any tree-sitter grammar concerns — _seed_symbols is the existing
+        # helper for that.
+        g = SymbolGraph(str(tmp_path))
+        p = tmp_path / "Same.java"
+        p.write_text("class Same { }\n")
+        _seed_symbols(g, "ws", [
+            ("Same", "enum_constant", str(p)),
+            ("Same", "enum",         str(p)),
+        ])
+        ranked = g.locate_l2("ws", "Same").symbols
+        # The first result is the type definition; the constant sorts after.
+        assert ranked[0].kind == "enum"
+        assert ranked[1].kind == "enum_constant"
+        # Same property for the class/field pair.
+        _seed_symbols(g, "ws2", [
+            ("Pair", "field", str(p)),
+            ("Pair", "class", str(p)),
+        ])
+        ranked2 = g.locate_l2("ws2", "Pair").symbols
+        assert ranked2[0].kind == "class"
+        assert ranked2[1].kind == "field"
+
+    def test_static_final_field_has_no_distinct_kind(self, tmp_path) -> None:
+        """Static/final/instance fields are all extracted under the single
+        `field` kind, by design: splitting them would multiply locate noise
+        without a documented use case. Constants (Java `final` primitives
+        the JLS would call a compile-time constant) are NOT a separate kind
+        in the symbol graph — they are still a `field`, mirroring the L3
+        chunker which also has no Java-constant-specific kind."""
+        p = tmp_path / "Const.java"
+        p.write_text(
+            "public class Const {\n"
+            "    public static final int LIMIT = 100;\n"
+            "    public final int VERSION = 1;\n"
+            "    public int counter = 0;\n"
+            "}\n"
+        )
+        by_name = {s["name"]: s for s in extract_symbols_from_file(str(p))[0]}
+        for n in ("LIMIT", "VERSION", "counter"):
+            assert by_name[n]["kind"] == "field", (
+                f"{n} should be a field, not {by_name[n]['kind']!r}"
+            )
+
+
+class TestRustImplSymbolNameNodeUPG:
+    """UPG-IMPL-SYMBOL-NAME-NODE-GAP: `_get_symbol_name_node` returned None
+    for a Rust `impl_item` and the parse-error check fell back to the whole
+    impl block, so an impl containing one locally-erroring construct lost
+    its symbol identity where an equivalent function kept it. The fix
+    factors the type-field walk out of `_get_symbol_name` into
+    `_rust_impl_type_node` and uses it from both resolvers, so the name-node
+    the parse-error check scopes to is the same node the string resolver
+    extracts the name from — one walk, two callers, no drift."""
+
+    def test_impl_with_locally_erroring_construct_keeps_its_symbol(self, tmp_path) -> None:
+        """The witness shape for the gap: a syntactically clean impl header
+        followed by a body containing a construct the grammar cannot parse.
+        Here the broken function body has an unmatched `let` (missing `;`),
+        which tree-sitter-rust flags as a local ERROR inside the function
+        without wrapping the whole impl block — exactly the shape this fix
+        is meant to recover from. Before the fix the impl symbol was
+        dropped because `node.has_error` over the whole block returned
+        True; after the fix it is kept because the parse-error check scopes
+        to the `type_identifier` node, which is clean."""
+        p = tmp_path / "widget.rs"
+        p.write_text(
+            "struct Widget;\n"
+            "impl Widget {\n"
+            "    fn broken() {\n"
+            "        let x = 1\n"
+            "        let y = 2;\n"
+            "    }\n"
+            "    fn ok() -> u32 { 1 }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        impls = [s for s in symbols if s["kind"] == "impl"]
+        # The impl block must still be indexed under its type name, even
+        # though its body contains a locally-unparseable statement sequence.
+        assert [s["name"] for s in impls] == ["Widget"], (
+            f"impl symbol must survive a locally-erroring body construct, got {symbols}"
+        )
+
+    def test_trait_for_type_still_indexed_under_type(self, tmp_path) -> None:
+        """Regression guard for the shared walk: `impl Trait for Type { }`
+        must still resolve to the TYPE, never the trait. The v13 fix put the
+        type-field walk into `_get_symbol_name`; the v14 refactor moves it
+        into `_rust_impl_type_node` and shares it with the name-node
+        resolver. Both consumers of the walk must agree on which type the
+        impl symbol names. Pin with a fixture that has NO other `Widget`
+        symbols so the assertion cannot pass by accident."""
+        p = tmp_path / "widget_impl.rs"
+        p.write_text(
+            "impl Measurable for Widget {\n"
+            "    fn measure(&self) -> u32 { 1 }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        by_name = {s["name"]: s for s in symbols}
+        assert by_name.get("Widget", {}).get("kind") == "impl", (
+            f"impl Trait for Type must resolve to the type 'Widget', got {symbols}"
+        )
+        assert "Measurable" not in by_name, (
+            f"the trait name must never become the impl symbol's name: {sorted(by_name)}"
+        )
+
+    def test_generic_trait_impl_resolved_via_type_field(self, tmp_path) -> None:
+        """Both the trait (`Measurable<T>`) and the type (`Bag<T>`) are
+        `generic_type` nodes here, so the old positional scan found no
+        matching direct child and dropped the impl entirely (name "" → not
+        emitted). The shared walk unwraps `generic_type` → its own `type`
+        field down to the bare `type_identifier`; the refactor must keep
+        that."""
+        p = tmp_path / "bag.rs"
+        p.write_text(
+            "impl<T> Measurable<T> for Bag<T> {\n"
+            "    fn measure(&self) -> u32 { 1 }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        impls = [s for s in symbols if s["kind"] == "impl"]
+        assert [s["name"] for s in impls] == ["Bag"], (
+            f"generic trait impl must resolve to the type 'Bag', got {symbols}"
+        )
+
+    def test_broken_impl_name_still_rejected(self, tmp_path) -> None:
+        """The whole point of the name-node-scoped error check is to
+        preserve symbols whose name is clean; a name that is itself part
+        of a parse error must STILL be rejected (a malformed identifier
+        cannot mint a symbol). Without the reserved-keyword and
+        whole-subtree check, a previous coverage push indexed grammar
+        keywords as symbols. Pin the rejection on the worst-case impl
+        header the grammar can produce — one whose `type` field is
+        itself an ERROR node (no `type_identifier` reachable). The
+        shared walk returns None, the name resolver returns "", and
+        no symbol is emitted."""
+        p = tmp_path / "broken.rs"
+        # `impl {` — no type at all, the parser produces an impl_item whose
+        # `type` field is missing/empty. Both the string and the name-node
+        # resolver must fall through cleanly to "not a symbol".
+        p.write_text(
+            "impl {\n"
+            "    fn nothing() { }\n"
+            "}\n"
+        )
+        symbols, _ = extract_symbols_from_file(str(p))
+        # The impl has no resolvable name → no impl-kind symbol, and the
+        # function inside it (kind=function) is independent and not pinned
+        # by this test.
+        assert not any(s["kind"] == "impl" for s in symbols), (
+            f"an impl with no resolvable type must not be indexed, got {symbols}"
+        )
 
 
 class TestTSTypedefSymbolGraphUPG:
@@ -931,6 +1308,112 @@ class TestNearestSymbolNamesExactGuardUPG:
         assert near == []
 
 
+# ---------------------------------------------------------------------------
+# UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: locate_l2's "none" branch now carries
+# the same deterministic near-miss candidates nearest_symbol_names has always
+# computed — ON THE RESULT (opt-in via `with_near_miss`) so the primary
+# vectr_locate surface can render them labeled inexact instead of answering a
+# zero-suggestion miss. `symbols` stays empty: a suggestion, never a rewrite.
+# ---------------------------------------------------------------------------
+
+class TestLocateNearMissOnResultUPG:
+    def test_qualified_double_typo_carries_suggestion_on_result(self, tmp_path) -> None:
+        """The original witness shape: vectr_locate("OrderRepositary.save_recrd")
+        called directly (not via trace/search) still resolves "none" — never a
+        silent rewrite — but no longer returns a zero-suggestion miss."""
+        g = SymbolGraph(str(tmp_path))
+        make_py(
+            tmp_path, "orders.py",
+            "class OrderRepository:\n    def save_record(self):\n        pass\n",
+        )
+        g.index_file("ws", str(tmp_path / "orders.py"))
+
+        result = g.locate_l2("ws", "OrderRepositary.save_recrd", with_near_miss=True)
+        assert result.resolution_strategy == "none"
+        assert result.symbols == []          # a miss stays a miss
+        assert [s.name for s in result.near_miss] == ["OrderRepository.save_record"]
+        assert result.near_miss[0].snippet   # rendered by the formatter below
+
+    def test_prefix_containment_shape_carried_on_result(self, tmp_path) -> None:
+        """The other fallback stage (token = real name + misremembered extra
+        word) reaches the primary tool path too, not just nearest_symbol_names
+        callers."""
+        g = SymbolGraph(str(tmp_path))
+        make_py(tmp_path, "control.py", "class CacheControl:\n    pass\n")
+        g.index_file("ws", str(tmp_path / "control.py"))
+
+        result = g.locate_l2("ws", "CacheControlHeader", with_near_miss=True)
+        assert result.resolution_strategy == "none"
+        assert [s.name for s in result.near_miss] == ["CacheControl"]
+
+    def test_near_miss_off_by_default_for_internal_callers(self, tmp_path) -> None:
+        """Internal locate_l2 callers (the search-hint paths run it per token
+        per search) keep the cheap behaviour: no suggestion queries on a miss
+        unless they opt in."""
+        g = SymbolGraph(str(tmp_path))
+        make_py(tmp_path, "control.py", "class CacheControl:\n    pass\n")
+        g.index_file("ws", str(tmp_path / "control.py"))
+
+        result = g.locate_l2("ws", "CacheControlHeader")
+        assert result.resolution_strategy == "none"
+        assert result.near_miss == []
+
+    def test_exact_resolution_never_populates_near_miss(self, tmp_path) -> None:
+        g = SymbolGraph(str(tmp_path))
+        make_py(tmp_path, "control.py", "class CacheControl:\n    pass\n")
+        g.index_file("ws", str(tmp_path / "control.py"))
+
+        result = g.locate_l2("ws", "CacheControl", with_near_miss=True)
+        assert result.resolution_strategy == "exact"
+        assert result.near_miss == []
+
+    def test_formatter_leads_with_labeled_inexact_suggestions(self, tmp_path) -> None:
+        """Same labeling convention as trace()'s qualifier-near-miss banner and
+        the search-hint near-miss section — never the plain dead-end text and
+        never presented as a match."""
+        g = SymbolGraph(str(tmp_path))
+        make_py(
+            tmp_path, "orders.py",
+            "class OrderRepository:\n    def save_record(self):\n        pass\n",
+        )
+        g.index_file("ws", str(tmp_path / "orders.py"))
+
+        result = g.locate_l2("ws", "OrderRepositary.save_recrd", with_near_miss=True)
+        text = g.format_locate_l2_for_llm(result)
+        assert "No exact match for 'OrderRepositary.save_recrd'" in text
+        assert "(inexact — verify before use)" in text
+        assert "[function] OrderRepository.save_record" in text
+        assert "No symbol matching" not in text
+
+    def test_formatter_plain_miss_unchanged_without_candidates(self, tmp_path) -> None:
+        """A miss with no near-miss candidates keeps the existing redirect
+        message byte-for-byte."""
+        g = SymbolGraph(str(tmp_path))
+        text = g.format_locate_l2_for_llm(
+            LocateResult(symbols=[], resolution_strategy="none",
+                         query="XyzzyQwerty"),
+        )
+        assert "No symbol matching 'XyzzyQwerty' found in the indexed codebase." in text
+
+
+class TestNearestSymbolNamesExactTokenUPG:
+    def test_exactly_resolved_token_gets_no_suggestions(self, tmp_path) -> None:
+        """nearest_symbol_names' contract is 'a token that already failed EXACT
+        resolution': an exactly-resolving token now returns [] rather than
+        falling through to prefix-containment candidates dressed up as a
+        near-miss for an already-correct lookup."""
+        g = SymbolGraph(str(tmp_path))
+        make_py(
+            tmp_path, "mod.py",
+            "class CacheControl:\n    pass\n"
+            "class CacheControlExtra:\n    pass\n",
+        )
+        g.index_file("ws", str(tmp_path / "mod.py"))
+
+        assert g.locate_l2("ws", "CacheControl").resolution_strategy == "exact"
+        assert g.nearest_symbol_names("ws", "CacheControl", limit=10) == []
+
+
 class TestLevenshtein:
     def test_identical_strings(self) -> None:
         assert _levenshtein("abc", "abc") == 0
@@ -994,18 +1477,26 @@ class TestSymbolGraphTrace:
         result = g.trace("ws", "process", direction="both")
         assert "callers" in result
         assert "callees" in result
+        assert result["callers"] is not None
+        assert result["callees"] is not None
 
     def test_trace_callers_only(self, tmp_path) -> None:
+        # UPG-TRACE-DIRECTION-UNQUERIED-RENDER: a direction the caller did
+        # not ask for is recorded as `None`, not absent, so the formatter
+        # can distinguish "we never looked" from "we looked and found
+        # nothing". The dict now carries both keys consistently — the
+        # value shape is the public signal, not key presence.
         g, _ = self._indexed_graph(tmp_path)
         result = g.trace("ws", "process", direction="callers")
-        assert "callers" in result
-        assert "callees" not in result
+        assert isinstance(result["callers"], list)
+        assert result["callees"] is None
 
     def test_trace_callees_only(self, tmp_path) -> None:
+        # UPG-TRACE-DIRECTION-UNQUERIED-RENDER: see `test_trace_callers_only`.
         g, _ = self._indexed_graph(tmp_path)
         result = g.trace("ws", "process", direction="callees")
-        assert "callees" in result
-        assert "callers" not in result
+        assert isinstance(result["callees"], list)
+        assert result["callers"] is None
 
     def test_edges_have_file_path(self, tmp_path) -> None:
         g, path = self._indexed_graph(tmp_path)
@@ -2260,6 +2751,365 @@ class TestCallerAggregationDoesNotCollapseAcrossFilesUPG:
         text = g.format_trace_for_llm(result, "target")
         assert f"{ws}/one/handler.py" in text
         assert f"{ws}/two/handler.py" in text
+
+
+# ---------------------------------------------------------------------------
+# UPG-TRACE-CALLER-LIMIT-TRANSPARENCY: every trace list truncated at `limit`
+# says how many entries were cut — a caller/callee list must never read as
+# complete when it is only a prefix of the real one. Since
+# UPG-TRACE-CALLER-AGGREGATION stopped collapsing same-leaf callers across
+# files, distinct (name, file) pairs each consume their own slot against the
+# limit, so truncation got dramatically easier to hit silently.
+# ---------------------------------------------------------------------------
+
+class TestTraceLimitTransparencyUPG:
+    def test_flat_callers_truncated_count_and_footer(self, tmp_path) -> None:
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        # 25 DISTINCT callers (distinct names AND files — each its own entry
+        # since UPG-TRACE-CALLER-AGGREGATION) against limit=20.
+        _seed_edges(g, ws, [
+            (f"{ws}/pkg/caller_{i}.py", f"caller_{i}", 10 + i, "target")
+            for i in range(25)
+        ])
+        result = g.trace(ws, "target", direction="callers", limit=20)
+        assert len(result["callers"]) == 20
+        assert result["callers_truncated"] == 5
+        text = g.format_trace_for_llm(result, "target")
+        assert "(+5 more callers not shown — pass a higher limit to show)" in text
+
+    def test_flat_callees_truncated_count_and_footer(self, tmp_path) -> None:
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        _seed_edges(g, ws, [
+            (f"{ws}/caller.py", "target", i, f"callee_{i}")
+            for i in range(25)
+        ])
+        result = g.trace(ws, "target", direction="callees", limit=20)
+        assert len(result["callees"]) == 20
+        assert result["callees_truncated"] == 5
+        text = g.format_trace_for_llm(result, "target")
+        assert "(+5 more callees not shown — pass a higher limit to show)" in text
+
+    def test_per_definition_callee_truncation_reported_per_entry(
+        self, tmp_path,
+    ) -> None:
+        """The by-definition branch renders one callee list PER definition —
+        each list is truncated independently against the same limit, so each
+        entry carries its own count and its own footer."""
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        _seed_symbols(g, ws, [
+            ("target", "function", f"{ws}/mod_a.py"),
+            ("target", "function", f"{ws}/mod_b.py"),
+        ])
+        specs = []
+        for mod in ("mod_a", "mod_b"):
+            specs += [
+                (f"{ws}/{mod}.py", "target", i, f"{mod}_callee_{i}")
+                for i in range(22)
+            ]
+        _seed_edges(g, ws, specs)
+
+        result = g.trace(ws, "target", direction="both", limit=20)
+        by_def = result["by_definition"]
+        assert len(by_def) == 2
+        assert all(entry["truncated_callees"] == 2 for entry in by_def)
+        text = g.format_trace_for_llm(result, "target")
+        # Both per-definition lists were cut, and BOTH cuts are disclosed.
+        assert text.count("(+2 more callees not shown — pass a higher limit to show)") == 2
+
+    def test_definitions_beyond_limit_disclosed(self, tmp_path) -> None:
+        """Whole definitions (with their calls) silently missing when the
+        definitions fetch hits the cap is the worst shape of this defect — the
+        reader can't even tell which sections never rendered."""
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        _seed_symbols(g, ws, [
+            ("multi_def_fn", "function", f"{ws}/mod_{i}.py") for i in range(21)
+        ])
+        result = g.trace(ws, "multi_def_fn", direction="both", limit=20)
+        assert len(result["by_definition"]) == 20
+        assert result["definitions_truncated"] == 1
+        text = g.format_trace_for_llm(result, "multi_def_fn")
+        assert (
+            "(+1 more definition of 'multi_def_fn' beyond "
+            "the limit not shown — pass a higher limit to show)"
+        ) in text
+
+    def test_definitions_disclosure_suppressed_for_resolved_qualified_query(
+        self, tmp_path,
+    ) -> None:
+        # A resolved Class.method query fetches ALL classes' definitions of the
+        # leaf, then keeps only the named class's — beyond-cap definitions are
+        # other-class sites excluded BY DESIGN there, so disclosing them would
+        # misrepresent designed filtering as silent loss. Both definitions here
+        # belong to the NAMED class (in different files), so whichever one the
+        # LIMIT-capped fetch returns, the qualifier still resolves and the
+        # second definition is genuinely lost to the cap — yet correctly not
+        # disclosed as such for this query shape.
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        make_py(
+            tmp_path, "orders_a.py",
+            "class OrderRepository:\n    def save_record(self):\n        pass\n",
+        )
+        make_py(
+            tmp_path, "orders_b.py",
+            "class OrderRepository:\n    def save_record(self):\n        pass\n",
+        )
+        g.index_file(ws, str(tmp_path / "orders_a.py"))
+        g.index_file(ws, str(tmp_path / "orders_b.py"))
+
+        result = g.trace(ws, "OrderRepository.save_record", direction="both", limit=1)
+        assert result.get("qualified_class") == "OrderRepository"
+        assert len(result["by_definition"]) == 1
+        assert result["definitions_truncated"] == 1
+        text = g.format_trace_for_llm(result, "OrderRepository.save_record")
+        assert "beyond the limit not shown" not in text
+
+    def test_no_truncation_means_no_footer(self, tmp_path) -> None:
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        _seed_edges(g, ws, [(f"{ws}/a.py", "caller", 1, "target")])
+        result = g.trace(ws, "target", direction="both", limit=20)
+        assert result["callers_truncated"] == 0
+        assert result["callees_truncated"] == 0
+        assert result["definitions_truncated"] == 0
+        text = g.format_trace_for_llm(result, "target")
+        assert "not shown" not in text
+
+    def test_aggregate_edges_reports_truncated_directly(self, tmp_path) -> None:
+        """Unit guard on the authoritative layer: `_aggregate_edges` owns THE
+        cut against the user-facing `limit`, so the count must come from there
+        — a count taken after any second truncation would itself be wrong."""
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        edges = [
+            CallEdge(
+                from_file=f"{ws}/f{i}.py", from_symbol=f"caller_{i}",
+                from_line=i + 1, to_symbol="target", edge_type="calls",
+            )
+            for i in range(7)
+        ]
+        shown, hidden, truncated = g._aggregate_edges(
+            ws, edges, "from_symbol", 5, rank_repo_defined=False,
+        )
+        assert len(shown) == 5
+        assert hidden == 0
+        assert truncated == 2
+
+
+# ---------------------------------------------------------------------------
+# UPG-TRACE-DIRECTION-UNQUERIED-RENDER: a single-direction trace must not
+# render anything about the direction the caller never asked for. The
+# previous "absent key ⇒ `[]` via `.get(key, [])` ⇒ always non-None ⇒
+# always rendered" chain turned every `direction="callees"` result into a
+# fake "Called by: (none found in index)" line about a lookup that never
+# ran — a confident-looking false negative an LLM caller would act on.
+# Fix: `trace()` now sets the un-queried direction to `None` (not absent,
+# not `[]`), and the formatter gates on `is None`.
+# ---------------------------------------------------------------------------
+
+class TestTraceDirectionUnqueriedRenderUPG:
+    def _indexed_graph(self, tmp_path):
+        g = SymbolGraph(str(tmp_path))
+        path = make_py(tmp_path, "svc.py", textwrap.dedent("""\
+            def helper():
+                pass
+
+            def process():
+                helper()
+
+            def orchestrate():
+                process()
+                helper()
+        """))
+        g.index_file("ws", path)
+        return g, path
+
+    def test_callees_direction_does_not_render_callers_block(self, tmp_path) -> None:
+        g, _ = self._indexed_graph(tmp_path)
+        result = g.trace("ws", "process", direction="callees")
+        # The un-queried callers direction must not appear anywhere in the
+        # rendered text — no "Called by" heading, no "(none found in index)"
+        # line about callers, no callers block at all. A reader of this
+        # answer must not be able to conclude "process has no callers" from
+        # a `direction="callees"` trace.
+        text = g.format_trace_for_llm(result, "process")
+        assert "Called by" not in text
+        assert "none found in index" not in text
+
+    def test_callers_direction_does_not_render_callees_block(self, tmp_path) -> None:
+        g, _ = self._indexed_graph(tmp_path)
+        result = g.trace("ws", "helper", direction="callers")
+        # Symmetric: a callers-only trace must not render the Calls block.
+        # The per-definition "calls (N)" header (only when by_def is
+        # rendered) and the flat "Calls (N):" heading both come from the
+        # callees path; either here would be a real false negative.
+        text = g.format_trace_for_llm(result, "helper")
+        assert "Calls" not in text  # no "Calls (N):" or "calls (0):" header
+        assert "(none found in index)" not in text
+
+    def test_both_direction_with_genuine_empty_still_renders_both_blocks(
+        self, tmp_path,
+    ) -> None:
+        # A `direction="both"` trace on a symbol that genuinely has no
+        # callers and no callees must STILL render the two "none found in
+        # index" lines — those are real, queried lookups that returned
+        # empty, not the un-queried-direction false negative fixed above.
+        # Fixing the un-queried case must not break this honest-miss case.
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        path = make_py(tmp_path, "lonely.py", "def lonely_function():\n    pass\n")
+        g.index_file(ws, path)
+        result = g.trace(ws, "lonely_function", direction="both")
+        assert isinstance(result["callers"], list) and result["callers"] == []
+        assert isinstance(result["callees"], list) and result["callees"] == []
+        text = g.format_trace_for_llm(result, "lonely_function")
+        assert "Called by: (none found in index)" in text
+        assert "Calls: (none found in index)" in text
+
+    def test_unqueried_direction_silences_recovery_hint(self, tmp_path) -> None:
+        # The `_empty_trace_hint` recovery banner is a "static call-graph
+        # found no calls for X" suggestion. It must not fire for a
+        # single-direction trace whose OTHER direction was simply not
+        # queried — the recovery hint assumes both sides were looked up.
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        path = make_py(tmp_path, "c.py", "def lonely():\n    pass\n")
+        g.index_file(ws, path)
+        result = g.trace(ws, "lonely", direction="callees")
+        text = g.format_trace_for_llm(result, "lonely")
+        # Recovery hint is gated by `callers_empty and callees_empty`; an
+        # un-queried callers direction is `None`, so `callers_empty`
+        # evaluates False and the hint must NOT appear.
+        assert "vectr_search" not in text
+        assert "dynamic" not in text.lower()
+
+    def test_result_dict_carries_unqueried_direction_as_none(self, tmp_path) -> None:
+        # The signal must be `None` (not absent, not `[]`) — see the
+        # docstring of the class for why the dict now has both keys
+        # consistently. This pins the public contract for any future
+        # caller that wants to introspect the result directly.
+        g, _ = self._indexed_graph(tmp_path)
+        callers_only = g.trace("ws", "process", direction="callers")
+        assert "callers" in callers_only
+        assert "callees" in callers_only
+        assert isinstance(callers_only["callers"], list)
+        assert callers_only["callees"] is None
+        callees_only = g.trace("ws", "process", direction="callees")
+        assert "callers" in callees_only
+        assert "callees" in callees_only
+        assert isinstance(callees_only["callees"], list)
+        assert callees_only["callers"] is None
+
+
+# ---------------------------------------------------------------------------
+# UPG-TRACE-EDGE-FETCH-CAP-UNCOUNTED: `_EDGE_FETCH_CAP = 1000` is an
+# upstream SQL LIMIT on raw edge rows. When it bites, the aggregated
+# `truncated` count the user sees in "(+N more ...)" is itself a LOWER
+# BOUND — aggregation never saw the beyond-cap raw rows. The disclosure
+# must say so. No extra query per trace: we detect cap-hit by
+# `len(rows) == _EDGE_FETCH_CAP` and reword the note.
+# ---------------------------------------------------------------------------
+
+class TestTraceEdgeFetchCapUncountedUPG:
+    def test_raw_capped_flag_propagated_to_truncation_note(self, tmp_path) -> None:
+        # When the SQL fetch hits _EDGE_FETCH_CAP, the per-direction
+        # `*_raw_capped` flag is True and the rendered "(+N more X not
+        # shown — pass a higher limit to show)" is reworded to the
+        # lower-bound phrasing. This pins the formatter path end-to-end.
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        # Seed exactly the cap count of raw rows so `len(rows) ==
+        # _EDGE_FETCH_CAP` is true. Each row is a distinct (name, file)
+        # pair after UPG-TRACE-CALLER-AGGREGATION, so the `limit=20`
+        # truncation also fires — both caps bit, raw_capped wins on the
+        # note wording.
+        cap = SymbolGraph._EDGE_FETCH_CAP
+        _seed_edges(g, ws, [
+            (f"{ws}/p_{i}.py", f"caller_{i}", 1, "target")
+            for i in range(cap)
+        ])
+        result = g.trace(ws, "target", direction="callers", limit=20)
+        assert result["callers_raw_capped"] is True
+        # The 1000 raw rows deduped to (up to) 1000 entries before the
+        # limit cut — 20 are shown, the rest are "more not shown" and the
+        # note MUST announce that count is a lower bound.
+        text = g.format_trace_for_llm(result, "target")
+        assert "lower bound" in text
+        assert "at least" in text
+        assert "raw edge row cap" in text
+        # And must NOT use the old exact-looking wording — that is the
+        # whole defect this UPG item names.
+        assert "pass a higher limit to show" not in text
+
+    def test_raw_capped_flag_false_when_under_cap(self, tmp_path) -> None:
+        # Below the cap, the existing exact-count wording is correct and
+        # must be preserved (no regression for the common case).
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        _seed_edges(g, ws, [
+            (f"{ws}/caller_{i}.py", f"caller_{i}", 1, "target")
+            for i in range(25)
+        ])
+        result = g.trace(ws, "target", direction="callers", limit=20)
+        assert result["callers_raw_capped"] is False
+        text = g.format_trace_for_llm(result, "target")
+        assert "(+5 more callers not shown — pass a higher limit to show)" in text
+        assert "lower bound" not in text
+
+    def test_callees_raw_capped_flag_propagated(self, tmp_path) -> None:
+        # Same path on the callees direction — symmetry check.
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        cap = SymbolGraph._EDGE_FETCH_CAP
+        _seed_edges(g, ws, [
+            (f"{ws}/caller.py", "target", i, f"callee_{i}")
+            for i in range(cap)
+        ])
+        result = g.trace(ws, "target", direction="callees", limit=20)
+        assert result["callees_raw_capped"] is True
+        text = g.format_trace_for_llm(result, "target")
+        assert "lower bound" in text
+        assert "raw edge row cap" in text
+
+    def test_per_definition_raw_capped_propagated(self, tmp_path) -> None:
+        # The by-definition branch runs its OWN SQL fetch (per
+        # definition's file) and so has its own raw-cap signal per entry.
+        # When a single definition has more raw rows than the cap, the
+        # per-entry "(+N more ...)" footer must reword to the lower-bound
+        # phrasing.
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        cap = SymbolGraph._EDGE_FETCH_CAP
+        _seed_symbols(g, ws, [
+            ("target", "function", f"{ws}/mod_a.py"),
+            ("target", "function", f"{ws}/mod_b.py"),
+        ])
+        # Only mod_a hits the cap; mod_b stays small. The cap'd
+        # definition's note must reword; mod_b's note (if it fires at
+        # all) must use the exact wording.
+        _seed_edges(g, ws, [
+            (f"{ws}/mod_a.py", "target", i, f"callee_{i}")
+            for i in range(cap)
+        ] + [
+            (f"{ws}/mod_b.py", "target", i, f"modb_callee_{i}")
+            for i in range(25)
+        ])
+        result = g.trace(ws, "target", direction="both", limit=20)
+        by_def = result["by_definition"]
+        assert len(by_def) == 2
+        capped_entry = next(e for e in by_def if e["truncated_callees_raw_capped"])
+        not_capped = next(e for e in by_def if not e["truncated_callees_raw_capped"])
+        assert capped_entry["truncated_callees"] > 0
+        assert not_capped["truncated_callees"] > 0
+        text = g.format_trace_for_llm(result, "target")
+        # The capped entry's lower-bound note appears at least once.
+        assert "lower bound" in text
+        # The non-capped entry's exact note also appears.
+        assert "pass a higher limit to show" in text
 
 
 # ---------------------------------------------------------------------------
@@ -4068,14 +4918,16 @@ class TestFileImportanceARCH1a:
         """SYMBOL_SCHEMA_VERSION is an exact pin, not a floor: every
         extraction-behavior change must bump it (or existing installs never
         rebuild their graph) AND consciously update this pin in the same
-        commit. Currently 12 (Zig struct/enum-scoped const/var extracted as
-        locatable namespace members, function-locals still excluded —
-        UPG-ZIG-STRUCT-CONST-LOCATE — bumped from 11 Java/C/Zig/TS name-extraction fixes —
-        UPG-JAVA-METHOD-NAME-EXTRACTION / UPG-C-STRUCT-TYPEDEF-LOCATE /
-        UPG-C-MACRO-ADJACENT-DROP / UPG-ZIG-SYMBOL-EXTRACTION /
-        UPG-TS-SYMBOLGRAPH-TYPEDEF — bumped from 10/UPG-SIBLING-TYPEDEF-CROWDING)."""
-        assert SYMBOL_SCHEMA_VERSION == 12, (
-            f"Expected SYMBOL_SCHEMA_VERSION=12; got {SYMBOL_SCHEMA_VERSION}. "
+        commit. Currently 15 (same-file class-base override edges of
+        edge_type="overrides" recorded at index time;
+        SymbolGraph.overrides_of / SymbolGraph.overridden_by expose the
+        read API — UPG-BASE-METHOD-OVERRIDE-FLOOD — bumped from 14 Java
+        enum_constant and field_declaration extracted as symbols,
+        UPG-JAVA-ENUM-CONSTANTS-NO-L2-SYMBOLS, and Rust impl_item
+        parse-error check scoped to the implemented type's
+        `type_identifier` node, UPG-IMPL-SYMBOL-NAME-NODE-GAP)."""
+        assert SYMBOL_SCHEMA_VERSION == 15, (
+            f"Expected SYMBOL_SCHEMA_VERSION=15; got {SYMBOL_SCHEMA_VERSION}. "
             "If you changed extraction behavior, bump the version and update this pin."
         )
 
@@ -4451,3 +5303,564 @@ class TestClassImportanceARCH2:
             "log-scale gap should be at least an order of magnitude larger "
             "than the linear-scale gap in this high-max_count scenario"
         )
+
+
+# ---------------------------------------------------------------------------
+# UPG-BASE-METHOD-OVERRIDE-FLOOD: same-file class-base override extraction
+# and read API.
+#
+# Pinned here as structural fact (extraction is a fact about the code, not a
+# query-side decision), in line with the lane scope. Synthetic fixtures
+# only — Django / real-corpus names stay in the benchmark corpus, not in
+# committed tests, matching the vectr product/benchmark separation.
+# ---------------------------------------------------------------------------
+
+class TestExtractOverridesPython:
+    """Python `class Sub(Base)` form: emit one overrides edge per (subclass
+    method, base method) pair, all with edge_type='overrides'."""
+
+    def test_simple_single_base_override_emits_one_edge(self, tmp_path) -> None:
+        """A class with one same-named method override on one base emits
+        exactly one overrides edge with the expected fields."""
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent("""\
+            class BasePasswordHasher:
+                def verify(self, password, encoded):
+                    return True
+
+            class BCryptSHA256PasswordHasher(BasePasswordHasher):
+                def verify(self, password, encoded):
+                    return True
+        """))
+        symbols, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert len(override_edges) == 1, (
+            f"expected 1 override edge for the BCryptSHA256PasswordHasher.verify "
+            f"override of BasePasswordHasher.verify; got {override_edges}"
+        )
+        e = override_edges[0]
+        assert e["from_file"] == path
+        assert e["from_symbol"] == "verify", (
+            f"from_symbol must be the bare method name (matching the symbols "
+            f"table convention); got {e['from_symbol']!r}"
+        )
+        assert e["from_line"] == 6, (
+            f"from_line must point at the SUBCLASS method (the override site); "
+            f"got {e['from_line']}"
+        )
+        assert e["to_symbol"] == "BasePasswordHasher.verify", (
+            f"to_symbol must be qualified 'BaseClass.method' so the consumer "
+            f"can locate the base unambiguously when many classes in the same "
+            f"file share a method name; got {e['to_symbol']!r}"
+        )
+
+    def test_override_edge_targets_actual_base_method_line(self, tmp_path) -> None:
+        """The base method's line is recoverable via the symbols table after
+        a locate() on the qualified 'BaseClass.method' name — pins that the
+        qualified target is locatable, not just a string."""
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent("""\
+            class BasePasswordHasher:
+                def verify(self, password, encoded):
+                    return True
+
+            class BCryptSHA256PasswordHasher(BasePasswordHasher):
+                def verify(self, password, encoded):
+                    return True
+        """))
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        g.index_file(ws, path)
+        # The symbols table must have an entry for `verify` (the base), and
+        # the locate surface must resolve the qualified target to the base
+        # class (line 2) rather than the subclass (line 6).
+        result = g.locate_l2(ws, "BasePasswordHasher.verify")
+        syms = result.symbols
+        assert syms, (
+            f"locate('BasePasswordHasher.verify') must resolve to the base "
+            f"class method; got empty result {result}"
+        )
+        base_hit = next(
+            (s for s in syms if s.start_line == 2 and s.file_path == path),
+            None,
+        )
+        assert base_hit is not None, (
+            f"qualified locate must find the BASE method at line 2; got "
+            f"candidates: {[(s.start_line, s.name) for s in syms]}"
+        )
+
+    def test_multiple_subclasses_each_get_their_own_override_edge(self, tmp_path) -> None:
+        """Six PasswordHasher subclasses overriding `verify` produce six
+        distinct override edges, one per subclass (F56 family of cases)."""
+        classes = [
+            "BCryptSHA256PasswordHasher", "MD5PasswordHasher",
+            "PBKDF2PasswordHasher", "ScryptPasswordHasher",
+            "Argon2PasswordHasher",
+        ]
+        body = "class BasePasswordHasher:\n    def verify(self, password, encoded):\n        return True\n\n"
+        for cls in classes:
+            body += f"class {cls}(BasePasswordHasher):\n    def verify(self, password, encoded):\n        return True\n\n"
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent(body))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert len(override_edges) == len(classes), (
+            f"expected {len(classes)} override edges (one per subclass); "
+            f"got {len(override_edges)}"
+        )
+        # All five edges must point to the same base, but have distinct from_lines.
+        from_lines = sorted(e["from_line"] for e in override_edges)
+        assert len(set(from_lines)) == len(classes), (
+            f"every override must have a distinct from_line (the subclass "
+            f"method's line); got {from_lines}"
+        )
+        for e in override_edges:
+            assert e["to_symbol"] == "BasePasswordHasher.verify", (
+                f"every override must target the same base; got {e['to_symbol']!r}"
+            )
+
+    def test_unrelated_subclass_method_is_not_an_override_edge(self, tmp_path) -> None:
+        """A method on the subclass whose name does NOT exist on the base
+        must NOT produce an override edge (the override relationship is
+        name-matched on the base)."""
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent("""\
+            class BasePasswordHasher:
+                def verify(self, password, encoded):
+                    return True
+
+            class CustomHasher(BasePasswordHasher):
+                def custom_method(self):
+                    return False
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert override_edges == [], (
+            f"custom_method on CustomHasher does not exist on the base, so "
+            f"no override edge should be emitted; got {override_edges}"
+        )
+
+    def test_no_base_in_same_file_emits_no_override_edge(self, tmp_path) -> None:
+        """A subclass whose base is in a different file emits no override
+        edge (same-file scope is the explicit precision/recall tradeoff —
+        see LANE-REPORT)."""
+        path = make_py(tmp_path, "custom_hashers.py", textwrap.dedent("""\
+            from other_module import BasePasswordHasher
+
+            class CustomHasher(BasePasswordHasher):
+                def verify(self, password, encoded):
+                    return True
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert override_edges == [], (
+            f"base is imported from another module, NOT in this file — no "
+            f"override edge should be emitted (same-file scope); got {override_edges}"
+        )
+
+    def test_no_class_definition_emits_no_override_edges(self, tmp_path) -> None:
+        """A file with no classes emits no override edges — sanity check
+        that the override walk is class-scoped, not file-wide."""
+        path = make_py(tmp_path, "helpers.py", textwrap.dedent("""\
+            def alpha():
+                return 1
+
+            def beta():
+                return 2
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert override_edges == [], (
+            f"no classes in file — no override edges expected; got {override_edges}"
+        )
+
+    def test_unresolvable_compound_base_is_skipped(self, tmp_path) -> None:
+        """A class base that's an attribute lookup (e.g. `models.Model`) is
+        skipped — without a real type resolver, the identifier on the left
+        of `.` doesn't name a single class. The override edge is recorded
+        only for the SIMPLE-identifier base."""
+        path = make_py(tmp_path, "fields.py", textwrap.dedent("""\
+            class SimpleBase:
+                def my_method(self):
+                    return 1
+
+            class SimpleChild(SimpleBase):
+                def my_method(self):
+                    return 2
+
+            from somewhere import other
+
+            class CompoundBase(other.Thing):
+                def my_method(self):
+                    return 3
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        # Only the SIMPLE base (SimpleBase) should resolve; the compound
+        # base (`other.Thing`) is skipped.
+        assert len(override_edges) == 1, (
+            f"only the simple-identifier base should produce an override "
+            f"edge; got {override_edges}"
+        )
+        assert override_edges[0]["to_symbol"] == "SimpleBase.my_method", (
+            f"the resolved base must be the simple-identifier one; got "
+            f"{override_edges[0]['to_symbol']!r}"
+        )
+
+    def test_inner_class_with_no_base_emits_no_override(self, tmp_path) -> None:
+        """An inner class with no declared base: no override edge from it.
+        The walk reaches the inner class (verified separately in
+        _collect_methods_by_class's own recursion contract) but, lacking a
+        base, nothing to match against. Sanity check that the walk's flat
+        iteration does not silently drop inner classes from consideration."""
+        path = make_py(tmp_path, "models.py", textwrap.dedent("""\
+            class Outer:
+                def render(self):
+                    return 'outer'
+
+                class Inner:
+                    def render(self):
+                        return 'inner'
+        """))
+        # Inner.render has no class base at all (it's just `class Inner: ...`),
+        # so no override edge should be emitted from the inner class.
+        # Outer.render is a module-level method on a class with no parent
+        # either, so no override edge there either.
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert override_edges == [], (
+            f"neither Outer nor Inner declares a base; no override edges "
+            f"expected; got {override_edges}"
+        )
+
+
+class TestExtractOverridesJavaScript:
+    """JavaScript / TypeScript `class X extends Y[, Z, ...]` form: same
+    shape as Python but different grammar node types (`class_heritage`
+    instead of `superclasses`)."""
+
+    def test_ts_extends_single_base_emits_one_edge(self, tmp_path) -> None:
+        path = make_py(tmp_path, "btn.ts", textwrap.dedent("""\
+            class BaseButton {
+                render(): void { }
+            }
+
+            class PrimaryButton extends BaseButton {
+                render(): void { }
+            }
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert len(override_edges) == 1, (
+            f"TS `extends BaseButton` should emit one override edge; got {override_edges}"
+        )
+        e = override_edges[0]
+        assert e["from_symbol"] == "render"
+        assert e["from_line"] == 6, f"from_line should be the subclass method line; got {e['from_line']}"
+        assert e["to_symbol"] == "BaseButton.render", (
+            f"to_symbol should be qualified 'BaseClass.method'; got {e['to_symbol']!r}"
+        )
+
+    def test_ts_extends_multiple_bases_emits_edges_per_base(self, tmp_path) -> None:
+        """TS allows `class X extends A, B, C` — each base gets an edge
+        when the corresponding method exists on it."""
+        path = make_py(tmp_path, "multi.ts", textwrap.dedent("""\
+            class MixinA {
+                go(): void { }
+            }
+            class MixinB {
+                go(): void { }
+            }
+
+            class Composite extends MixinA, MixinB {
+                go(): void { }
+            }
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        # Composite.go overrides BOTH MixinA.go and MixinB.go.
+        targets = sorted(e["to_symbol"] for e in override_edges)
+        assert targets == ["MixinA.go", "MixinB.go"], (
+            f"expected edges to both bases; got {targets}"
+        )
+
+    def test_js_class_without_extends_emits_no_edge(self, tmp_path) -> None:
+        path = make_py(tmp_path, "simple.js", textwrap.dedent("""\
+            class Widget {
+                render() { return 'w'; }
+            }
+        """))
+        _, edges = extract_symbols_from_file(path)
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert override_edges == [], (
+            f"no extends → no base → no override edge; got {override_edges}"
+        )
+
+
+class TestExtractOverridesNonOOOLanguages:
+    """Languages without a `class ... (Base)` form return [] — no override
+    edge can be emitted without resolving the base, and these languages
+    use different syntax (impl blocks, struct embedding, etc.) that is
+    deliberately out of scope for this lane."""
+
+    @pytest.mark.parametrize("language,path_name,body", [
+        ("rust", "lib.rs", "trait Foo { fn bar(&self) {} }\n"),
+        ("go", "main.go", "package main\n\nfunc plainFunc() {}\n"),
+        ("c", "main.c", "int main(void) { return 0; }\n"),
+    ])
+    def test_rust_go_c_emit_no_override_edges(
+        self, tmp_path, language, path_name, body
+    ) -> None:
+        path = tmp_path / path_name
+        path.write_text(body)
+        _, edges = extract_symbols_from_file(str(path))
+        override_edges = [e for e in edges if e["edge_type"] == "overrides"]
+        assert override_edges == [], (
+            f"{language} does not use a class-inheritance form that this "
+            f"lane resolves; expected no override edges; got {override_edges}"
+        )
+
+
+class TestExtractOverridesDedup:
+    """Override edges are deduped by (file, from_symbol, from_line, to_symbol,
+    edge_type) so two walkers producing the same edge don't double-insert."""
+
+    def test_dedup_collapses_duplicate_edges(self, tmp_path) -> None:
+        """If the same (subclass, base) pair were walked twice (e.g. the
+        _collect_methods_by_class walk and the override walk both finding
+        the same method), the dedup should collapse to one edge."""
+        path = make_py(tmp_path, "dup.py", textwrap.dedent("""\
+            class Base:
+                def go(self):
+                    pass
+
+            class Sub(Base):
+                def go(self):
+                    pass
+        """))
+        _, edges = extract_symbols_from_file(path)
+        # Build a key for every override edge.
+        keys = [
+            (e["from_file"], e["from_symbol"], e["from_line"],
+             e["to_symbol"], e["edge_type"])
+            for e in edges if e["edge_type"] == "overrides"
+        ]
+        assert len(keys) == len(set(keys)), (
+            f"override edges must be deduped by (file, from_symbol, from_line, "
+            f"to_symbol, edge_type); got duplicates: {keys}"
+        )
+
+
+class TestSymbolGraphOverridesOf:
+    """The `overrides_of` read API on SymbolGraph — given a (file, method,
+    line) triple, return every base method it overrides. Uses the existing
+    `edges` table (no schema migration) and the same SQLite query shape
+    as the other edge query methods."""
+
+    def _index_fixtures(self, tmp_path) -> tuple[SymbolGraph, str, str, int, int]:
+        """Helper: index a simple Base/Sub fixture and return
+        (graph, workspace, file_path, base_line, sub_line)."""
+        # Callers pass a SUBDIRECTORY (tmp_path / "a") to get two isolated
+        # workspaces, and pytest's tmp_path only guarantees the root exists.
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent("""\
+            class BasePasswordHasher:
+                def verify(self, password, encoded):
+                    return True
+
+            class BCryptPasswordHasher(BasePasswordHasher):
+                def verify(self, password, encoded):
+                    return True
+        """))
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        g.index_file(ws, path)
+        return g, ws, path, 2, 6  # base at line 2, subclass at line 6
+
+    def test_overrides_of_returns_base_edge(self, tmp_path) -> None:
+        g, ws, path, base_line, sub_line = self._index_fixtures(tmp_path)
+        edges = g.overrides_of(ws, path, "verify", sub_line)
+        assert len(edges) == 1, (
+            f"subclass verify at line {sub_line} overrides exactly one base; "
+            f"got {len(edges)} edges: {edges}"
+        )
+        e = edges[0]
+        assert e.to_symbol == "BasePasswordHasher.verify", (
+            f"edge target must be the qualified base name; got {e.to_symbol!r}"
+        )
+        assert e.edge_type == "overrides"
+        assert e.from_symbol == "verify"
+        assert e.from_line == sub_line
+
+    def test_overrides_of_returns_empty_for_non_override(self, tmp_path) -> None:
+        """A method that does NOT override anything has no edge — query
+        returns an empty list (not None, not an error)."""
+        g, ws, path, base_line, sub_line = self._index_fixtures(tmp_path)
+        # Base.verify itself doesn't override anything.
+        edges = g.overrides_of(ws, path, "verify", base_line)
+        assert edges == [], (
+            f"base method has no parent; overrides_of must return []; got {edges}"
+        )
+
+    def test_overrides_of_returns_empty_for_unknown_line(self, tmp_path) -> None:
+        """A (file, symbol, line) triple that doesn't correspond to a
+        recorded override returns [] — same shape as an empty result for
+        any other reason, so callers don't have to special-case it."""
+        g, ws, path, base_line, sub_line = self._index_fixtures(tmp_path)
+        edges = g.overrides_of(ws, path, "verify", 9999)
+        assert edges == [], (
+            f"unknown line must return [] (same as a method that has no "
+            f"parent); got {edges}"
+        )
+
+    def test_overrides_of_is_workspace_isolated(self, tmp_path) -> None:
+        """An override edge recorded under workspace A must not be visible
+        from workspace B's query — same isolation contract as every other
+        graph accessor."""
+        g_a, ws_a, path_a, _, sub_line = self._index_fixtures(tmp_path / "a")
+        g_b, ws_b, path_b, _, _ = self._index_fixtures(tmp_path / "b")
+        # edges are scoped per-workspace by SQLite; query B with A's data.
+        edges = g_b.overrides_of(ws_b, path_b, "verify", sub_line)
+        # B has its OWN override edge (different workspace but same file
+        # path and line — both are the right number in their own DB). The
+        # isolation test: A's row must not be readable through B.
+        for e in edges:
+            assert e.from_file == path_b, (
+                f"edges returned by workspace B must come from B's DB; got {e.from_file}"
+            )
+
+
+class TestSymbolGraphOverriddenBy:
+    """The `overridden_by` read API on SymbolGraph — the inverse of
+    `overrides_of`. Given a (file, BaseClass.method) target, return every
+    subclass method that overrides it."""
+
+    def test_overridden_by_returns_subclass_edges(self, tmp_path) -> None:
+        """The F56 case shape: 5 subclasses each override the same
+        `BasePasswordHasher.verify`; overridden_by must list all 5."""
+        classes = [
+            "BCryptSHA256PasswordHasher", "MD5PasswordHasher",
+            "PBKDF2PasswordHasher", "ScryptPasswordHasher",
+            "Argon2PasswordHasher",
+        ]
+        body = "class BasePasswordHasher:\n    def verify(self, password, encoded):\n        return True\n\n"
+        for cls in classes:
+            body += f"class {cls}(BasePasswordHasher):\n    def verify(self, password, encoded):\n        return True\n\n"
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent(body))
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        g.index_file(ws, path)
+        edges = g.overridden_by(ws, path, "BasePasswordHasher.verify")
+        # Every subclass's verify is an override; 5 distinct (file, line) triples.
+        assert len(edges) == len(classes), (
+            f"expected {len(classes)} subclass override edges for "
+            f"BasePasswordHasher.verify; got {len(edges)}: {edges}"
+        )
+        from_lines = sorted(set(e.from_line for e in edges))
+        assert len(from_lines) == len(classes), (
+            f"every override must have a distinct from_line; got {from_lines}"
+        )
+        for e in edges:
+            assert e.to_symbol == "BasePasswordHasher.verify"
+            assert e.from_symbol == "verify"
+            assert e.from_file == path
+
+    def test_overridden_by_returns_empty_for_no_subclasses(self, tmp_path) -> None:
+        """A base with no subclass overrides in this file returns []. A
+        cross-file subclass would be missed by the same-file scope (and
+        is the explicit out-of-scope tradeoff — see LANE-REPORT)."""
+        path = make_py(tmp_path, "lonely.py", textwrap.dedent("""\
+            class LonelyBase:
+                def go(self):
+                    pass
+        """))
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        g.index_file(ws, path)
+        edges = g.overridden_by(ws, path, "LonelyBase.go")
+        assert edges == [], (
+            f"no subclass override in this file → []; got {edges}"
+        )
+
+
+class TestOverrideEdgesDontInterfereWithExistingEdges:
+    """The `overrides` edge_type is additive — it must not collide with
+    the existing `calls` / `uses` / `dynamic` edges in callers(), callees(),
+    or any other graph accessor that filters on edge_type."""
+
+    def test_callers_does_not_pick_up_overrides(self, tmp_path) -> None:
+        """A caller of `verify` must still see only CALLER methods, not
+        `overrides` edges (which are structural class relationships, not
+        control-flow)."""
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent("""\
+            class BasePasswordHasher:
+                def verify(self, password, encoded):
+                    return True
+
+            class CustomHasher(BasePasswordHasher):
+                def verify(self, password, encoded):
+                    return True
+
+            def login():
+                CustomHasher().verify("p", "h")
+        """))
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        g.index_file(ws, path)
+        # `verify` is called from `login`; the override edges between
+        # subclasses and the base must not appear in the caller list.
+        callers = g.callers(ws, "verify")
+        caller_names = {c.from_symbol for c in callers}
+        assert "login" in caller_names, (
+            f"callers of `verify` must include the actual caller `login`; "
+            f"got {caller_names}"
+        )
+        # Override edges (which would carry the from_symbol 'verify' for
+        # the SUBCLASS methods, not for a caller) must not appear in this
+        # callers() result — callers() filters to control-flow edges by
+        # construction, and a `verify -> verify` overrides edge would
+        # otherwise be a self-collision.
+        # Easier check: callers' from_lines should be the line of `login`,
+        # not the line of any method definition.
+        caller_lines = {c.from_line for c in callers}
+        # login is the last def in the fixture; line varies by dedent —
+        # assert it is NOT 2 (the base method's line) and NOT 6 (the
+        # subclass method's line).
+        for ln in caller_lines:
+            assert ln != 2 and ln != 6, (
+                f"caller of `verify` must NOT be a method definition (those "
+                f"are override edges, not call edges); got from_line={ln}"
+            )
+
+
+class TestOverridesF56Shape:
+    """The F56 case shape: a base hasher with multiple subclass overrides
+    of `verify`. The new override edges are exactly the data the lane
+    ships — they let a later ranking change discover that all the top-5
+    candidates in the F56 query are overrides of a single base class."""
+
+    def test_f56_shape_records_override_graph(self, tmp_path) -> None:
+        """Replicate the F56 family of fixtures: BasePasswordHasher with
+        five subclass overrides, all named `verify`. Confirm the override
+        graph captures every subclass as an override of the base."""
+        classes = [
+            "BCryptSHA256PasswordHasher", "MD5PasswordHasher",
+            "PBKDF2PasswordHasher", "ScryptPasswordHasher",
+            "Argon2PasswordHasher",
+        ]
+        body = "class BasePasswordHasher:\n    def verify(self, password, encoded):\n        return True\n\n"
+        for cls in classes:
+            body += f"class {cls}(BasePasswordHasher):\n    def verify(self, password, encoded):\n        return True\n\n"
+        path = make_py(tmp_path, "hashers.py", textwrap.dedent(body))
+        ws = str(tmp_path)
+        g = SymbolGraph(ws)
+        g.index_file(ws, path)
+        # The base's overridden_by list must contain exactly the 5
+        # subclass override edges. A later ranking change consuming this
+        # data could observe "all 5 top-5 candidates are overrides of the
+        # same base" — the structural signal this lane ships.
+        edges = g.overridden_by(ws, path, "BasePasswordHasher.verify")
+        assert len(edges) == 5, (
+            f"F56-shape: 5 subclass overrides of BasePasswordHasher.verify; "
+            f"got {len(edges)}"
+        )
+        # Every edge is from the same file (same-file scope; this is the
+        # precision/recall tradeoff documented in LANE-REPORT).
+        assert {e.from_file for e in edges} == {path}
+

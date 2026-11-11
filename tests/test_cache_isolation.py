@@ -85,13 +85,27 @@ class TestSessionWideIsolation:
         assert db_dir.is_relative_to(vectr_cache_root())
         assert not db_dir.is_relative_to(_real_home_cache_root())
 
-    def test_code_indexer_without_db_path_lands_under_isolated_root(self, tmp_path) -> None:
+    def test_code_indexer_without_db_path_lands_under_isolated_root(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """The exact construction pattern (CodeIndexer(workspace_root) with no
         explicit db_path) that minted the ~4,000 real-cache junk dirs a
-        2026-07-20 cleanup swept -- must now resolve under the isolated root."""
+        2026-07-20 cleanup swept -- must now resolve under the isolated root.
+
+        The embed provider is stubbed because `CodeIndexer.__init__` builds one
+        eagerly (agent/indexer/_core.py): with the session cache root isolated to
+        a fresh tmp dir, a real provider finds nothing cached and downloads the
+        model from Hugging Face on every run. That download is irrelevant to the
+        db-path resolution under test and it made CI fail on an HF 429.
+        """
+        import agent.indexer as idx_module
         from agent.indexer import CodeIndexer
         from agent.config import vectr_cache_root
+        from tests.conftest import _DummyEmbedProvider
 
+        monkeypatch.setattr(
+            idx_module, "get_embed_provider", lambda _model: _DummyEmbedProvider()
+        )
         (tmp_path / "mod.py").write_text("def func_a(): pass")
         indexer = CodeIndexer(str(tmp_path))
         assert indexer._db_dir.is_relative_to(vectr_cache_root())

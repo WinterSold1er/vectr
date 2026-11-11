@@ -5,7 +5,12 @@
 # codebase might invoke — NEVER a project-specific or corpus-specific
 # pattern. Additions go through review (see agent/outcome.py, which loads
 # and applies this table).
-version: 1
+# Table version. Nothing reads it today; it exists so a change to what a
+# marker MEANS is distinguishable from stored `markers_matched` values
+# recorded under an earlier table (episodes and arcs persist them).
+#   1 -> 2: go_test.fail narrowed from ^FAIL to ^FAIL(\s|$) so it stops
+#           claiming pytest's own FAILED lines.
+version: 2
 markers:
   # --- Maven ---
   - id: maven.build_failure
@@ -51,8 +56,19 @@ markers:
     kind: success
 
   # --- go test ---
+  # ^FAIL(\s|$), never a bare ^FAIL: pytest's short summary prints
+  # "FAILED tests/x.py::test_y" per failing test, and since match_markers()
+  # scans the combined digest with no per-tool scoping, a bare prefix match
+  # fires this Go marker on every failing Python run. Both markers are
+  # kind: failure so the verdict was right by luck, but markers_matched is
+  # the record of WHICH tool reported what, and a Go marker on a pytest run
+  # makes that record wrong. Go's own line is tab-separated
+  # ("FAIL\tpkg\t0.02s", "FAIL\tpkg [build failed]"), so requiring a
+  # following whitespace or end-of-line keeps every real Go form and drops
+  # "FAILED". Same cross-tool contamination class as the [1-9] convention
+  # documented above (UPG-MARKER-GOFAIL-MATCHES-PYTEST-FAILED).
   - id: go_test.fail
-    pattern: "^FAIL"
+    pattern: "^FAIL(\\s|$)"
     kind: failure
   - id: go_test.ok
     pattern: "^ok\\s"

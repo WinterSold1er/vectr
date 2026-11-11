@@ -11,6 +11,7 @@ Critical coverage:
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import pytest
@@ -785,6 +786,64 @@ class TestRecallForPathUPG96:
             )
         notes = store.recall_for_path("/repo", "/repo/gate.py", limit=3)
         assert any("pool ceiling" in n.content for n in notes)
+
+    # -- UPG-PROXY-ANCHOR-ABS-REL-NORM ---------------------------------------
+    #
+    # Declared anchors are authored either way (remember() allows absolute OR
+    # workspace-relative), and so are incoming file_paths (a real hook sends
+    # an absolute one; direct callers legitimately pass relative ones).
+    # Matching on "as-given + workspace-relative" covered
+    # abs-input-vs-rel-anchor but silently missed the mirror case,
+    # REL-input-vs-ABS-anchor: the note below could only be found through its
+    # prose, never its declaration.
+
+    def test_relative_query_matches_absolute_declared_anchor(self, tmp_path) -> None:
+        """A note anchored to an ABSOLUTE path must be recalled when the
+        caller passes a WORKSPACE-RELATIVE file_path — the candidate set
+        needs the workspace-rooted absolute form."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        (tmp_path / "src").mkdir()
+        # Stored fully-resolved on purpose: _anchors_exact_match() compares
+        # candidate forms to declared anchors by exact string equality, so on
+        # symlinked temp dirs (/var -> /private/var) only the resolved
+        # spelling can byte-equal the workspace-rooted absolute candidate the
+        # fix derives.
+        abs_anchor = str((tmp_path / "src" / "gate.py").resolve())
+        store.remember(
+            ws, "the retry loop here needs a backoff cap", kind="gotcha",
+            anchors=[abs_anchor],
+        )
+        notes = store.recall_for_path(ws, "src/gate.py", kind="gotcha")
+        assert len(notes) == 1
+        # Non-vacuity: content never names the file, so ONLY the anchors arm
+        # can have produced this hit.
+        assert "gate.py" not in notes[0].content
+
+    def test_relative_query_still_matches_relative_declared_anchor(self, tmp_path) -> None:
+        """Control for the mirror case above: the long-standing direction (a
+        relative query finding its own relative anchor) is unchanged."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        (tmp_path / "src").mkdir()
+        store.remember(
+            ws, "the retry loop here needs a backoff cap", kind="gotcha",
+            anchors=["src/gate.py"],
+        )
+        notes = store.recall_for_path(ws, "src/gate.py", kind="gotcha")
+        assert len(notes) == 1
+
+    def test_relative_query_does_not_match_other_files_absolute_anchor(
+        self, tmp_path
+    ) -> None:
+        """Negative control: normalisation widens the candidate set, it does
+        not loosen exact equality — a note anchored elsewhere stays silent."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        (tmp_path / "src").mkdir()
+        abs_anchor = str((tmp_path / "src" / "gate.py").resolve())
+        store.remember(
+            ws, "the retry loop here needs a backoff cap", kind="gotcha",
+            anchors=[abs_anchor],
+        )
+        assert store.recall_for_path(ws, "app/routes.py", kind="gotcha") == []
 
 
 # ---------------------------------------------------------------------------
@@ -1563,6 +1622,41 @@ class TestT17DataRetention:
         assert any("query=x" in ln and "client=alice" in ln for ln in lines)
         assert any("query=y" in ln and "client=" not in ln for ln in lines)
 
+    def test_audit_log_stamps_true_utc_not_local_time(self, tmp_path, monkeypatch) -> None:
+        """UPG-AUDIT-LOCAL-TIME-Z: the stamp's trailing 'Z' claims UTC, but
+        logging.Formatter defaults to LOCAL time — the file used to carry
+        local wall-clock under a Z suffix (observed 03:12:39Z for a true
+        21:42:44Z), silently skewing audit-to-transcript correlation by the
+        host's UTC offset. The formatter must be pinned to gmtime (the
+        deterministic half of this pin), and a freshly written stamp must be
+        within a minute of true UTC regardless of host timezone (the
+        end-to-end half; a one-minute tolerance cannot false-pass any real
+        timezone offset, which is at least ~30 minutes)."""
+        import logging
+        import time as _time
+        from datetime import datetime, timezone
+
+        log_file = tmp_path / "audit.log"
+        monkeypatch.setenv("VECTR_AUDIT_LOG", str(log_file))
+        log = logging.getLogger("vectr.audit")
+        log.handlers.clear()
+        try:
+            from agent.working_context_store import _get_audit_logger, audit as _audit
+            formatter = _get_audit_logger().handlers[0].formatter
+            assert formatter.converter is _time.gmtime, (
+                "audit stamps must use gmtime — the datefmt's literal Z means UTC"
+            )
+            _audit("UTC_CHECK", k="v")
+        finally:
+            log.handlers.clear()
+
+        stamp_text = log_file.read_text().split(" ", 1)[0]
+        stamped = datetime.strptime(stamp_text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        skew_s = abs((datetime.now(timezone.utc) - stamped).total_seconds())
+        assert skew_s < 60, f"audit stamp {stamp_text!r} is not true UTC (skew {skew_s:.0f}s)"
+
     def test_remember_increments_count(self, tmp_path) -> None:
         store, ws = self._store(tmp_path)
         assert store.count_notes(ws) == 0
@@ -2093,7 +2187,10 @@ class TestRememberTriggerEngineParams:
         store, ws = _store(tmp_path), str(tmp_path)
         note_id = store.remember(ws, "a gotcha about a future file", anchors=["not/created/yet.py"])
         note = store.get_note(ws, note_id)
-        assert note.anchors == [["not/created/yet.py", None]]
+        # Third element is the UPG-ANCHOR-UNOBSERVED-BINDING observation
+        # verdict: no session_id was passed, so it is unknown (None), never
+        # inferred as False.
+        assert note.anchors == [["not/created/yet.py", None, None]]
 
     def test_supersedes_tombstones_the_target_note(self, tmp_path) -> None:
         store, ws = _store(tmp_path), str(tmp_path)
@@ -2174,6 +2271,300 @@ class TestRememberTriggerEngineParams:
         old = next(n for n in all_notes if n.content == "original")
         assert old.superseded_by == "bob"
         assert old.superseded_by_note_id is None  # untouched by the explicit-supersedes path
+
+
+class TestAnchorObservedBinding:
+    """UPG-ANCHOR-UNOBSERVED-BINDING: remember() stamps a third, tri-state
+    element onto each declared anchor row (`_anchor_observed_at_write()`) —
+    True/False only when the writing session's own PreToolUse traffic
+    (recorded via fire()'s file_path parameter, see `_record_observation()`)
+    gives a real answer, else None/unknown. An absent ledger must never be
+    read as "never observed" — an unknown observation state and a genuine
+    negative are different facts and must never collapse into one."""
+
+    def test_anchor_to_a_path_observed_earlier_in_session_is_marked_observed(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        f = tmp_path / "src" / "auth.py"
+        f.parent.mkdir(parents=True)
+        f.write_text("original content")
+        # Simulate the PreToolUse hook reporting a Read/Edit of this file
+        # earlier in the session (no note needs to actually fire on it).
+        store.fire(ws, event="pre-edit", file_path="src/auth.py", session_id="s1")
+        note_id = store.remember(
+            ws, "a gotcha about auth.py", anchors=["src/auth.py"], session_id="s1",
+        )
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is True
+
+    def test_anchor_to_a_path_never_observed_in_a_session_with_a_ledger_is_marked_false(
+        self, tmp_path
+    ) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        # The session DOES have a ledger (it observed some other file) —
+        # this is the genuine "present ledger, absent path" False case,
+        # distinct from "no ledger exists at all".
+        store.fire(ws, event="pre-edit", file_path="src/other.py", session_id="s1")
+        note_id = store.remember(
+            ws, "a gotcha about auth.py", anchors=["src/auth.py"], session_id="s1",
+        )
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is False
+
+    def test_no_observation_ledger_at_all_stores_unknown_not_false(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        # No fire() call was ever made for this session_id -- no ledger key
+        # exists. Must read back as None (unknown), never inferred False.
+        note_id = store.remember(
+            ws, "a gotcha about auth.py", anchors=["src/auth.py"], session_id="never-fired",
+        )
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is None
+
+    def test_omitted_session_id_at_write_also_stores_unknown(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        store.fire(ws, event="pre-edit", file_path="src/auth.py", session_id="s1")
+        note_id = store.remember(ws, "a gotcha about auth.py", anchors=["src/auth.py"])
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is None
+
+    def test_ledger_is_populated_only_via_fires_file_path_parameter(self, tmp_path) -> None:
+        """Criterion (e): remember() itself never populates the ledger, and
+        a fire()/recall() call carrying no file_path never does either —
+        the ledger's only writer is fire()'s own file_path argument, which
+        the caller (the editor's PreToolUse hook) already resolved."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        store.remember(ws, "an unrelated note", session_id="s1")
+        store.fire(ws, event="session-start", session_id="s1")  # no file_path
+        note_id = store.remember(
+            ws, "a gotcha about auth.py", anchors=["src/auth.py"], session_id="s1",
+        )
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is None  # still unknown -- nothing ever reported this path
+
+    def test_absolute_hook_path_observation_matches_a_relatively_authored_anchor(self, tmp_path) -> None:
+        """Mirrors the P-primitive's existing abs/rel normalization
+        (`_path_trigger_candidates`): a real editor hook reports an
+        ABSOLUTE file_path while the anchor is naturally authored
+        workspace-relative."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        (tmp_path / "src").mkdir()
+        abs_path = str(tmp_path / "src" / "auth.py")
+        store.fire(ws, event="pre-edit", file_path=abs_path, session_id="s1")
+        note_id = store.remember(
+            ws, "a gotcha about auth.py", anchors=["src/auth.py"], session_id="s1",
+        )
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is True
+
+    def test_observation_is_scoped_per_session_not_shared_across_sessions(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        store.fire(ws, event="pre-edit", file_path="src/auth.py", session_id="s1")
+        note_id = store.remember(
+            ws, "a gotcha about auth.py", anchors=["src/auth.py"], session_id="s2",
+        )
+        note = store.get_note(ws, note_id)
+        assert note.anchors[0][2] is None  # s2 never had a ledger of its own
+
+    def test_fire_and_format_renders_the_unobserved_caveat_end_to_end(self, tmp_path) -> None:
+        """End-to-end: the tri-state verdict actually reaches the injected
+        framing a caller sees, not just the stored row."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        store.fire(ws, event="pre-edit", file_path="src/other.py", session_id="s1")
+        store.remember(
+            ws, "check auth expiry before merging", kind="gotcha",
+            anchors=["src/auth.py"], session_id="s1",
+            triggers=[{"event": "pre-edit", "path": "src/auth.py"}],
+        )
+        text, note_ids = store.fire_and_format(ws, event="pre-edit", file_path="src/auth.py")
+        assert len(note_ids) == 1
+        from agent.working_context_store._store import _UNOBSERVED_STATUS_SUFFIX
+        assert _UNOBSERVED_STATUS_SUFFIX in text
+
+
+class TestAttachAnchors:
+    """UPG-ANCHOR-ATTACH: post-write anchoring without a re-store — same
+    pair format, hashing, and tri-state observation contracts as
+    remember(anchors=...)."""
+
+    def test_attach_computes_hash_and_stores_tri_state(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        f = tmp_path / "src" / "auth.py"
+        f.parent.mkdir(parents=True)
+        f.write_text("original content")
+        nid = store.remember(ws, "a gotcha about auth.py")
+        result = store.attach_anchors(ws, nid, ["src/auth.py"])
+        assert result == {"attached": ["src/auth.py"], "already_present": []}
+        note = store.get_note(ws, nid)
+        assert len(note.anchors) == 1
+        assert note.anchors[0][0] == "src/auth.py"
+        # Same write-time hashing contract as remember(anchors=...).
+        assert note.anchors[0][1] is not None
+        assert len(note.anchors[0][1]) == 16
+        # No session ledger exists -> unknown, never False (tri-state).
+        assert note.anchors[0][2] is None
+
+    def test_attach_is_idempotent_on_exact_paths(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/auth.py"])
+        result = store.attach_anchors(ws, nid, ["src/auth.py"])
+        assert result == {"attached": [], "already_present": ["src/auth.py"]}
+        note = store.get_note(ws, nid)
+        assert len(note.anchors) == 1  # not duplicated
+
+    def test_attach_mixed_new_and_existing_preserves_order(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["a.py"])
+        result = store.attach_anchors(ws, nid, ["a.py", "b.py"])
+        assert result == {"attached": ["b.py"], "already_present": ["a.py"]}
+        note = store.get_note(ws, nid)
+        assert [a[0] for a in note.anchors] == ["a.py", "b.py"]
+
+    def test_attach_to_unknown_note_returns_none(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        assert store.attach_anchors(ws, 999999, ["a.py"]) is None
+
+    def test_attach_requires_at_least_one_anchor(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note")
+        with pytest.raises(ValueError):
+            store.attach_anchors(ws, nid, [])
+        note = store.get_note(ws, nid)
+        assert not note.anchors  # unchanged by the rejected call
+
+    def test_attached_anchor_participates_in_staleness_check(self, tmp_path) -> None:
+        """The point of the whole primitive end-to-end: the attach-time
+        hash becomes the drift baseline — a later file change flags the
+        note stale on the next check, exactly as if anchored at write."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        f = tmp_path / "src" / "server.py"
+        f.parent.mkdir(parents=True)
+        f.write_text("original")
+        nid = store.remember(ws, "gotcha about server.py")
+        store.attach_anchors(ws, nid, ["src/server.py"])
+        note = store.get_note(ws, nid)
+        assert not store.check_staleness([note], ws)  # baseline matches
+        f.write_text("changed content")
+        note = store.get_note(ws, nid)
+        stale = store.check_staleness([note], ws)
+        assert stale.get(nid)
+
+    def test_attach_with_session_ledger_records_observation_verdict(self, tmp_path) -> None:
+        """session_id threads into the UPG-ANCHOR-UNOBSERVED-BINDING
+        tri-state exactly as remember(session_id=..., anchors=...) does."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        # Ledger exists but never observed src/auth.py -> genuine False.
+        store.fire(ws, event="pre-edit", file_path="src/other.py", session_id="s1")
+        nid = store.remember(ws, "note about auth")
+        store.attach_anchors(ws, nid, ["src/auth.py"], session_id="s1")
+        note = store.get_note(ws, nid)
+        assert note.anchors[0][2] is False
+
+
+class TestDetachAnchors:
+    """UPG-ANCHOR-DETACH: post-write de-anchoring without a re-store —
+    inverse of attach_anchors(). Path comparison mirrors attach exactly
+    (element 0 of the pair, no normalisation); idempotent for paths the
+    note was never anchored to; removes the last anchor as `[]`, not NULL."""
+
+    def test_detach_removes_named_anchor(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/auth.py", "src/server.py"])
+        result = store.detach_anchors(ws, nid, ["src/auth.py"])
+        assert result == {"removed": ["src/auth.py"], "not_present": []}
+        note = store.get_note(ws, nid)
+        assert [a[0] for a in note.anchors] == ["src/server.py"]
+
+    def test_detach_unknown_path_is_idempotent_not_an_error(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/auth.py"])
+        result = store.detach_anchors(ws, nid, ["src/other.py"])
+        assert result == {"removed": [], "not_present": ["src/other.py"]}
+        note = store.get_note(ws, nid)
+        # Untouched — the rejected-by-absence request never wrote.
+        assert [a[0] for a in note.anchors] == ["src/auth.py"]
+
+    def test_detach_mixed_present_and_absent_preserves_request_order(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["a.py", "b.py"])
+        result = store.detach_anchors(ws, nid, ["b.py", "missing.py", "a.py"])
+        # `removed` and `not_present` both follow request order, like
+        # attach's `attached` and `already_present`.
+        assert result == {"removed": ["b.py", "a.py"], "not_present": ["missing.py"]}
+        note = store.get_note(ws, nid)
+        assert note.anchors == []
+
+    def test_detach_last_anchor_writes_empty_list_never_null(self, tmp_path) -> None:
+        """Schema's TEXT NOT NULL DEFAULT '[]' contract: a detached-to-zero
+        note must reload byte-identical to a never-anchored note."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/auth.py"])
+        store.detach_anchors(ws, nid, ["src/auth.py"])
+        note = store.get_note(ws, nid)
+        assert note.anchors == []
+        # The on-disk column must be the JSON `[]` literal, not SQL NULL —
+        # get_note() always materialises the column so a NULL here would
+        # surface as anchors=None from the Note dataclass.
+        from agent.working_context_store import WorkingContextStore as _WCS
+        with _WCS(str(tmp_path))._conn() as conn:
+            raw = conn.execute(
+                "SELECT anchors FROM notes WHERE workspace = ? AND note_id = ?",
+                (ws, nid),
+            ).fetchone()[0]
+        assert raw == "[]"
+
+    def test_detach_is_idempotent_on_repeat(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/auth.py"])
+        first = store.detach_anchors(ws, nid, ["src/auth.py"])
+        second = store.detach_anchors(ws, nid, ["src/auth.py"])
+        assert first == {"removed": ["src/auth.py"], "not_present": []}
+        assert second == {"removed": [], "not_present": ["src/auth.py"]}
+
+    def test_detach_duplicate_request_entries_follow_attach_mirror(self, tmp_path) -> None:
+        """A duplicate entry in the request (['x.py', 'x.py']) must report
+        as one-removed + one-not_present, the exact symmetric of
+        attach_anchors()'s one-attached + one-already_present."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["x.py"])
+        result = store.detach_anchors(ws, nid, ["x.py", "x.py"])
+        assert result == {"removed": ["x.py"], "not_present": ["x.py"]}
+
+    def test_detach_unknown_note_returns_none(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        assert store.detach_anchors(ws, 999999, ["a.py"]) is None
+
+    def test_detach_requires_at_least_one_anchor(self, tmp_path) -> None:
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/auth.py"])
+        with pytest.raises(ValueError):
+            store.detach_anchors(ws, nid, [])
+        # Unchanged by the rejected call.
+        note = store.get_note(ws, nid)
+        assert [a[0] for a in note.anchors] == ["src/auth.py"]
+
+    def test_detach_stops_anchor_participating_in_staleness_check(self, tmp_path) -> None:
+        """The point of the whole primitive end-to-end: a detached anchor
+        drops out of the next check_staleness() pass. Note stays."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        f = tmp_path / "src" / "server.py"
+        f.parent.mkdir(parents=True)
+        f.write_text("original")
+        nid = store.remember(ws, "gotcha about server.py", anchors=["src/server.py"])
+        store.detach_anchors(ws, nid, ["src/server.py"])
+        f.write_text("changed content")
+        note = store.get_note(ws, nid)
+        # Detached -> no longer a candidate, so no stale flag.
+        assert not store.check_staleness([note], ws).get(nid)
+
+    def test_detach_uses_exact_string_on_path_no_normalisation(self, tmp_path) -> None:
+        """A note anchored as 'src/Auth.py' is not detachable via
+        'src/auth.py' — matching attach_anchors()'s exact-string rule."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        nid = store.remember(ws, "note", anchors=["src/Auth.py"])
+        result = store.detach_anchors(ws, nid, ["src/auth.py"])
+        assert result == {"removed": [], "not_present": ["src/auth.py"]}
+        note = store.get_note(ws, nid)
+        assert [a[0] for a in note.anchors] == ["src/Auth.py"]
 
 
 class TestKindDefaultScopes:
@@ -2993,6 +3384,169 @@ class TestFirePathPrimitiveAbsoluteRelative:
         results = store.fire(ws, event="pre-edit", file_path=outside)
         assert len(results) == 1  # still only the absolute-pattern note
 
+    def test_absolute_pattern_fires_on_relative_hook_path(self, tmp_path) -> None:
+        """UPG-PROXY-ANCHOR-ABS-REL-NORM's mirror case through fire(): a
+        trigger whose `path` is ABSOLUTE must still fire when the caller
+        passes a WORKSPACE-RELATIVE file_path — `_path_trigger_candidates()`
+        now derives the workspace-rooted absolute form for relative inputs,
+        and this P-primitive shares that candidate set with
+        `recall_for_path()`."""
+        store, ws = _store(tmp_path), str(tmp_path)
+        f = tmp_path / "agent" / "trigger_engine.py"
+        f.parent.mkdir(parents=True)
+        f.write_text("content")
+        absolute_pattern = str(f.resolve())
+        store.remember(
+            ws, "an absolutely-anchored gotcha", kind="gotcha",
+            triggers=[{"path": absolute_pattern, "event": "pre-edit"}],
+        )
+        results = store.fire(ws, event="pre-edit", file_path="agent/trigger_engine.py")
+        assert len(results) == 1
+        assert results[0].fired is True
+
+
+class TestPathTriggerCandidateForms:
+    """Direct units on the shared helpers (UPG-PROXY-ANCHOR-ABS-REL-NORM /
+    UPG-PROXY-WEAK-TIER-TIEBREAK): `recall_for_path()`'s narrowing inputs and
+    `fire()`'s live P primitive both consume `_path_trigger_candidates()`'s
+    output, and three consumers share one boundary predicate — pin its exact
+    shape here so the consumers can never silently disagree."""
+
+    def test_relative_input_yields_workspace_rooted_absolute_form(self, tmp_path) -> None:
+        from agent.working_context_store._store import _path_trigger_candidates
+
+        ws = str(tmp_path)
+        cands = _path_trigger_candidates(ws, "src/auth.py")
+        assert cands[0] == "src/auth.py"
+        # Exactly one derived form: the process cwd is nowhere near `ws`, so
+        # no CWD-relative form exists, and the absolute form is rooted at the
+        # WORKSPACE (never this process's cwd).
+        assert cands == (
+            "src/auth.py",
+            str((tmp_path / "src" / "auth.py").resolve()),
+        )
+
+    def test_absolute_input_under_root_stays_two_forms(self, tmp_path) -> None:
+        """A real hook event (absolute file_path) keeps the historical
+        two-form candidate sequence byte-for-byte: as-given + workspace-
+        relative. The new absolute form is only derived for RELATIVE inputs,
+        so this contract is what makes the change a pure widening."""
+        from agent.working_context_store._store import _path_trigger_candidates
+
+        ws = str(tmp_path)
+        p = str(tmp_path / "src" / "auth.py")
+        assert _path_trigger_candidates(ws, p) == (p, "src/auth.py")
+
+    def test_absolute_input_outside_root_has_no_derived_forms(self, tmp_path) -> None:
+        from agent.working_context_store._store import _path_trigger_candidates
+
+        ws = str(tmp_path)
+        outside = str(tmp_path.parent / "outside_the_workspace.py")
+        assert _path_trigger_candidates(ws, outside) == (outside,)
+
+    def test_none_input_returns_none(self) -> None:
+        from agent.working_context_store._store import _path_trigger_candidates
+
+        assert _path_trigger_candidates("/some/ws", None) is None
+
+    def test_boundary_count_and_first_agree_with_match(self) -> None:
+        """The boolean, the count, and the first-offset views of the ONE
+        boundary predicate can never drift: count>0 <=> match <=> first>=0,
+        and first is occurrences[0]."""
+        from agent.working_context_store._store import (
+            _path_boundary_count,
+            _path_boundary_first,
+            _path_boundary_match,
+            _path_boundary_occurrences,
+        )
+
+        cases = [
+            ("edit gate.py now", "gate.py"),
+            ('the file "gate.py" was touched', "gate.py"),
+            ("gate.py: verify_token must check expiry", "gate.py"),
+            ("mentions uv_regate.py instead", "gate.py"),   # substring, no boundary
+            ("open gate.pyc for bytecode", "gate.py"),      # longer extension
+            ("see src/auth/gate.py handled", "src/auth/gate.py"),  # multi-segment needle
+        ]
+        for text, needle in cases:
+            occ = _path_boundary_occurrences(text, needle)
+            assert _path_boundary_match(text, needle) == bool(occ), (text, needle)
+            assert _path_boundary_count(text, needle) == len(occ), (text, needle)
+            assert (_path_boundary_first(text, needle) >= 0) == bool(occ), (text, needle)
+            assert _path_boundary_first(text, needle) == (occ[0] if occ else -1), (text, needle)
+
+    def test_boundary_count_counts_and_first_locates(self) -> None:
+        from agent.working_context_store._store import (
+            _path_boundary_count,
+            _path_boundary_first,
+        )
+
+        text = "gate.py supersedes the old gate.py notes"
+        assert _path_boundary_count(text, "gate.py") == 2
+        assert _path_boundary_first(text, "gate.py") == 0
+
+    def test_empty_needle_is_never_a_match_anywhere(self) -> None:
+        from agent.working_context_store._store import (
+            _path_boundary_count,
+            _path_boundary_first,
+            _path_boundary_match,
+        )
+
+        assert _path_boundary_match("anything", "") is False
+        assert _path_boundary_count("anything", "") == 0
+        assert _path_boundary_first("anything", "") == -1
+
+
+class TestWorkingMemoryFetchWidth:
+    """Direct units on the over-fetch contract helper (UPG-OVERFETCH-
+    CONTRACT-UNDOCUMENTED): every vector query against the GLOBAL
+    'working_memory' collection must size n_results through
+    working_memory_fetch_width(), because workspace/lifecycle filtering runs
+    in SQL only AFTER the vector search. Pins the exact formula — multiplier,
+    floor override, col_count cap — plus byte-for-byte equivalence with the
+    three pre-helper expressions it replaced, so no call site can drift back
+    to a raw render limit without an obvious failure."""
+
+    def test_multiplier_is_three_times_the_render_limit(self) -> None:
+        from agent.working_context_store._store import working_memory_fetch_width
+
+        assert working_memory_fetch_width(5, 1000) == 15
+        assert working_memory_fetch_width(1, 1000) == 3
+
+    def test_floor_raises_width_above_the_multiplier(self) -> None:
+        from agent.working_context_store._store import working_memory_fetch_width
+
+        # related_active_notes passes floor=limit + 1; the revoked path
+        # passes MEMORY_WRITE_RELATED_REVOKED_QUERY_FLOOR. The floor wins
+        # whenever it exceeds render_limit * 3; the multiplier otherwise.
+        assert working_memory_fetch_width(1, 1000, floor=7) == 7
+        assert working_memory_fetch_width(10, 1000, floor=2) == 30
+
+    def test_col_count_caps_the_ask(self) -> None:
+        from agent.working_context_store._store import working_memory_fetch_width
+
+        # ChromaDB errors when asked for more results than exist, so the
+        # live collection count caps even a large floor.
+        assert working_memory_fetch_width(10, 4) == 4
+        assert working_memory_fetch_width(1, 1000, floor=50) == 50
+        assert working_memory_fetch_width(5, 2, floor=20) == 2
+
+    def test_matches_the_literal_formulas_it_replaced(self) -> None:
+        """The helper conversion had to change NO fetched width anywhere:
+        each expression below is the pre-helper formula verbatim."""
+        from agent.config import MEMORY_WRITE_RELATED_REVOKED_QUERY_FLOOR
+        from agent.working_context_store._store import working_memory_fetch_width
+
+        for limit in (1, 3, 10):
+            for col_count in (limit * 3, limit * 3 + 7, 10_000):
+                assert working_memory_fetch_width(limit, col_count) == min(limit * 3, col_count)
+                assert working_memory_fetch_width(
+                    limit, col_count, floor=limit + 1,
+                ) == min(max(limit * 3, limit + 1), col_count)
+                assert working_memory_fetch_width(
+                    limit, col_count, floor=MEMORY_WRITE_RELATED_REVOKED_QUERY_FLOOR,
+                ) == min(max(limit * 3, MEMORY_WRITE_RELATED_REVOKED_QUERY_FLOOR), col_count)
+
 
 class TestFireScopeEnforcement:
     """TRIGGER-ENGINE wave 2a, bm2-design-skeleton.md §1 — all five
@@ -3495,6 +4049,70 @@ class TestInjectedFrame:
         assert "anchor: none" in text
         assert "status: last confirmed" in text
 
+    def test_unobserved_anchor_appends_a_distinct_suffix_not_the_drift_wording(self, tmp_path) -> None:
+        """UPG-ANCHOR-UNOBSERVED-BINDING criterion (b): a False third
+        element (this session HAD a ledger, and this path was not in it)
+        appends a caveat that reads distinctly from drift's 'changed since
+        — verify' — drift wants re-derivation, unobserved wants a first
+        read. The two must never collapse into one 'stale' flag."""
+        from agent.working_context_store._store import _injected_frame, _UNOBSERVED_STATUS_SUFFIX
+        note = self._note(anchors=[["src/auth.py", "abc123", False]])
+        frame = _injected_frame(note, stale_warnings={})
+        assert "status: matches current state" in frame
+        assert _UNOBSERVED_STATUS_SUFFIX in frame
+        assert "changed since — verify" not in frame
+
+    def test_unknown_observation_third_element_none_renders_no_new_caveat(self, tmp_path) -> None:
+        """Criterion (c): an explicit None third element (a session with no
+        observation ledger) must render byte-identical to a note with no
+        anchor-observation knowledge at all — no caveat text appears."""
+        from agent.working_context_store._store import (
+            _injected_frame, _UNOBSERVED_STATUS_SUFFIX, _date_str,
+        )
+        note = self._note(anchors=[["src/auth.py", "abc123", None]])
+        frame = _injected_frame(note, stale_warnings={})
+        assert frame == (
+            f"Recorded {_date_str(note.created_at)} (anchor: src/auth.py, "
+            f"status: matches current state): "
+        )
+        assert _UNOBSERVED_STATUS_SUFFIX not in frame
+
+    def test_legacy_two_element_anchor_row_renders_as_unknown_never_as_unobserved(self, tmp_path) -> None:
+        """Criterion (d): a pre-existing anchor row written before this
+        field existed (only [path, hash], no third element) must load and
+        render exactly as before — never inferred as observed=False just
+        because the element is missing."""
+        from agent.working_context_store._store import (
+            _injected_frame, _UNOBSERVED_STATUS_SUFFIX, _date_str,
+        )
+        note = self._note(anchors=[["src/auth.py", "abc123"]])
+        frame = _injected_frame(note, stale_warnings={})
+        assert frame == (
+            f"Recorded {_date_str(note.created_at)} (anchor: src/auth.py, "
+            f"status: matches current state): "
+        )
+        assert _UNOBSERVED_STATUS_SUFFIX not in frame
+
+    def test_observed_true_third_element_renders_no_unobserved_caveat(self, tmp_path) -> None:
+        """A True third element (this session's own hook traffic reported
+        this exact path) is the properly-bound case — no caveat, same as
+        the unknown/legacy cases, distinguishing it is purely internal."""
+        from agent.working_context_store._store import _injected_frame, _UNOBSERVED_STATUS_SUFFIX
+        note = self._note(anchors=[["src/auth.py", "abc123", True]])
+        frame = _injected_frame(note, stale_warnings={})
+        assert _UNOBSERVED_STATUS_SUFFIX not in frame
+
+    def test_unobserved_and_drifted_compose_additively_not_merged(self, tmp_path) -> None:
+        """Drift and unobserved are orthogonal facts — a note can be both
+        drifted AND unobserved, and both pieces of text must appear (not
+        collapsed into a single boolean 'stale' flag)."""
+        from agent.working_context_store._store import _injected_frame, _UNOBSERVED_STATUS_SUFFIX
+        note = self._note(note_id=11, anchors=[["src/auth.py", "abc123", False]])
+        stale_warnings = {11: ["src/auth.py [anchor_changed]"]}
+        frame = _injected_frame(note, stale_warnings)
+        assert "status: changed since — verify" in frame
+        assert _UNOBSERVED_STATUS_SUFFIX in frame
+
 
 # ---------------------------------------------------------------------------
 # B9: Semantic recall — embed_fn + ChromaDB cosine similarity
@@ -3521,6 +4139,30 @@ def _semantic_store(tmp_path):
     chroma_dir = str(tmp_path / "chroma")
     client = chromadb.PersistentClient(path=chroma_dir)
     return WorkingContextStore(str(tmp_path), embed_fn=_dummy_embed, notes_chroma_client=client)
+
+
+def _spy_store_sql(store, monkeypatch) -> list[str]:
+    """Capture every SQL statement `store` runs, and return the growing list.
+
+    sqlite3.Cursor is an immutable C type, so its `execute` cannot be patched.
+    The supported hook is Connection.set_trace_callback(), installed here by
+    wrapping the store's own _conn() on the instance.
+
+    The callback yields EXPANDED SQL — parameters are already substituted, so
+    a captured statement reads `kind = \'finding\'` and `LIMIT 2`, never
+    `kind = ?` / `LIMIT ?`. Match on the expanded form; a predicate written
+    against placeholders matches nothing and passes vacuously.
+    """
+    seen_sqls: list[str] = []
+    real_conn = store._conn
+
+    def traced_conn():
+        conn = real_conn()
+        conn.set_trace_callback(seen_sqls.append)
+        return conn
+
+    monkeypatch.setattr(store, "_conn", traced_conn)
+    return seen_sqls
 
 
 class TestSemanticRecall:
@@ -3599,6 +4241,150 @@ class TestSemanticRecall:
         ws = "/repo"
         store.remember(ws, "the only note here")
         assert len(store.recall(ws, query="something off topic entirely")) == 1
+
+    def test_kind_filter_deepens_pool_via_floor(self, tmp_path, monkeypatch) -> None:
+        """UPG-SEMANTIC-UNDERFILL: when `kind` is set, _semantic_recall
+        passes a wider `floor` to working_memory_fetch_width() so the
+        vector query is sized to absorb unknown `kind` selectivity rather
+        than the 3x default. Unset `kind` must keep the 3x default — no
+        regression on the no-filter case."""
+        import agent.working_context_store._store as _store_mod
+
+        captured: list[tuple[int, int, int]] = []
+
+        def spy(render_limit, col_count, *, floor=0):
+            captured.append((render_limit, col_count, floor))
+            return _store_mod.working_memory_fetch_width(
+                render_limit, col_count, floor=floor,
+            )
+
+        # The function uses the module-level name; rebinding on the
+        # module is the canonical monkeypatch target.
+        monkeypatch.setattr(_store_mod, "working_memory_fetch_width", spy)
+
+        store = _semantic_store(tmp_path)
+        ws = "/repo"
+        # More than 3x the render limit below, so the width is not clamped by
+        # col_count and the multiplier is what is actually being asserted.
+        for i in range(12):
+            store.remember(ws, f"note content {i}")
+
+        # No kind: floor is 0 (the default), width is `limit * 3`.
+        captured.clear()
+        store.recall(ws, query="note content 0", limit=2)
+        assert captured, "working_memory_fetch_width must be called"
+        render_limit, col_count, floor = captured[-1]
+        assert floor == 0
+        # Sanity: the no-kind width is at least limit*3 (and exactly so
+        # when the corpus is bigger than 3x the limit).
+        assert col_count >= render_limit * 3
+
+        # With kind: floor is widened to `limit * 10`, raising the pool
+        # ceiling above the 3x default.
+        captured.clear()
+        store.recall(ws, query="note content 0", limit=2, kind="finding")
+        assert captured, "working_memory_fetch_width must be called"
+        render_limit, col_count, floor = captured[-1]
+        assert floor == render_limit * 10
+
+    def test_kind_prefetch_runs_in_relevance_branch(self, tmp_path, monkeypatch) -> None:
+        """The relevance branch runs the kind-aware SQL prefetch backstop
+        even when the query embedding is unrelated to the corpus (i.e.
+        the semantic pool would not naturally select kind matches first).
+        Verified by intercepting the SQL the prefetch runs and asserting
+        it carries the `kind = ?` predicate."""
+        store = _semantic_store(tmp_path)
+        ws = "/repo"
+        for i in range(4):
+            store.remember(ws, f"finding note {i}", kind="finding")
+        store.remember(ws, "unrelated task", kind="task")
+
+        # Spy on the store's own _conn() to capture every SQL the
+        # _semantic_recall call makes. We filter for the prefetch
+        # signature (ORDER BY created_at DESC, no `note_id IN` clause).
+        seen_sqls = _spy_store_sql(store, monkeypatch)
+        store.recall(ws, query="anything", limit=2, kind="finding")
+
+        # The prefetch in the relevance branch runs the metadata filters
+        # WITHOUT a `note_id IN (...)` clause (otherwise the prefetch is
+        # a no-op) and ends with `ORDER BY created_at DESC LIMIT ?`.
+        prefetch_sqls = [
+            s for s in seen_sqls
+            if "kind = " in s
+            and "note_id IN" not in s
+            and "ORDER BY created_at DESC" in s
+        ]
+        assert prefetch_sqls, (
+            "kind-aware SQL prefetch should run in the relevance branch "
+            "when kind= is set, so underfill is the backstop of the "
+            "pool widening rather than the only fix"
+        )
+
+    def test_kind_prefetch_does_not_leak_other_kinds(self, tmp_path) -> None:
+        """The SQL prefetch reuses the kind predicate (filter_sql), so a
+        `kind='finding'` recall must NEVER surface rows of any other kind,
+        even if those rows are abundant in the corpus."""
+        store = _semantic_store(tmp_path)
+        ws = "/repo"
+        for _ in range(4):
+            store.remember(ws, "task one", kind="task")
+        for _ in range(4):
+            store.remember(ws, "gotcha one", kind="gotcha")
+        # Only the kind that matches the filter is expected back.
+        notes = store.recall(ws, query="anything", limit=10, kind="task")
+        assert notes
+        assert all(n.kind == "task" for n in notes)
+
+    def test_no_kind_filter_does_not_run_kind_prefetch(self, tmp_path, monkeypatch) -> None:
+        """The fix is `kind`-gated: a recall() without `kind=...` must
+        NOT run the new SQL prefetch (no selectivity problem to fix)."""
+        store = _semantic_store(tmp_path)
+        ws = "/repo"
+        for i in range(3):
+            store.remember(ws, f"note {i}")
+
+        seen_sqls = _spy_store_sql(store, monkeypatch)
+        store.recall(ws, query="anything", limit=2)
+
+        # The kind prefetch signature is a SELECT * FROM notes that ends
+        # in `ORDER BY created_at DESC LIMIT <n>` (no `note_id DESC`
+        # tie-break — _recall_floor_notes uses `created_at DESC, note_id
+        # DESC`, the sort-aware prefetch uses one of three `ORDER BY`
+        # variants, and recall's SQL path appends `LIMIT ?` to the
+        # `ORDER BY` rather than ending with `LIMIT ?` alone). The
+        # kind gate is exactly that the prefetch includes `kind = ?` in
+        # its WHERE — without a kind filter, the underfill fix is not
+        # applicable, so the query must not run.
+        prefetch_sqls = [
+            s for s in seen_sqls
+            if "SELECT * FROM notes" in s
+            and "workspace = " in s
+            and "note_id IN" not in s
+            and re.search(r"ORDER BY created_at DESC LIMIT \d+$", s.rstrip())
+        ]
+        assert not prefetch_sqls, (
+            "kind-gated SQL prefetch must not run when no `kind` filter "
+            "is set — the underfill fix is intentionally narrow"
+        )
+
+    def test_kind_underfill_with_min_similarity_still_respects_floor(self, tmp_path) -> None:
+        """min_similarity and the kind backstop coexist: even when the
+        pool is widened for kind, an off-topic query whose whole pool is
+        below min_similarity still returns nothing. The underfill fix
+        only addresses the kind selectivity artifact, not the similarity
+        cutoff (which is correct behavior, not underfill — see
+        UPG-5.1)."""
+        store = _semantic_store(tmp_path)
+        ws = "/repo"
+        store.remember(ws, "finding about tp_del legacy garbage")
+        # Unrelated query with a 0.5 floor — every vector in the pool is
+        # near-orthogonal under _dummy_embed, so the floor withholds all.
+        notes = store.recall(
+            ws, query="kubernetes ingress controller",
+            kind="finding", min_similarity=0.5,
+        )
+        assert notes == []
+
 
     def test_forget_removes_from_chroma(self, tmp_path) -> None:
         import chromadb

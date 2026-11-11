@@ -227,52 +227,6 @@ _CODEX_TOML_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-# DeepSeek Harness (dsh) integration (UPG-DSH-PARITY): dsh loads MCP servers
-# as `@deepseek-ai/dsh-mcp-client` plugin rows in a profile's
-# `cordis.patch.yml` — a top-level YAML array of patch entries, NOT a
-# per-workspace file like the editors above. vectr registers itself by
-# managing one comment-delimited `- insert:` item in the ACTIVE profile's
-# patch file (default `web` — the GUI profile — overridable via
-# `$VECTR_DSH_PROFILE` or `$DSH_PROFILE`). Same strip-then-append idiom as
-# the Codex TOML block and the markdown vectr block: only vectr's own
-# `# vectr-start`…`# vectr-end` region is touched, anything else the user
-# has in the patch (their own inserts, disables) survives verbatim.
-_DSH_PATCH_TEMPLATE = load_template("dsh_mcp.patch.yml.template")
-_DSH_BLOCK_START = "# vectr-start"
-_DSH_BLOCK_END = "# vectr-end"
-# Matches vectr's dsh patch block plus any blank lines immediately before it.
-_DSH_BLOCK_RE = re.compile(
-    r"\n*" + re.escape(_DSH_BLOCK_START) + r"\b.*?" + re.escape(_DSH_BLOCK_END) + r"\n?",
-    re.DOTALL,
-)
-# Matches a lone `[]` empty top-level YAML array (optionally surrounded by
-# comment lines), which a fresh `cordis.patch.yml` ships as.
-_DSH_EMPTY_ARRAY_RE = re.compile(r"^(\s*(?:#.*\n)*)\s*\[\s*\]\s*$", re.MULTILINE)
-# Default profile: the browser GUI profile ships as `web`; `headless` is the
-# one-shot runner. `$DSH_PROFILE` is honored first, then `$VECTR_DSH_PROFILE`
-# (vectr-specific override), then `web`.
-_DSH_DEFAULT_PROFILE = "web"
-
-# dsh hook bridge (UPG-DSH-PARITY): dsh has its own Claude Code hook bridge
-# (`@deepseek-ai/dsh-hooks-claude-code`) that runs a user's `.claude/
-# settings.json` `hooks` key on dsh's interception points. vectr's hook rows
-# (`vectr hook <event>`) speak the same Claude Code stdin/exit contract, so
-# the bridge consumes them unchanged. This is a SEPARATE comment-delimited
-# region from the MCP block above (`# vectr-hooks-start`…`# vectr-hooks-end`,
-# distinct markers so each block is managed independently): it points the
-# bridge at this workspace's `.claude/settings.json`. dsh's bridge does not
-# support `PreCompact` or `PostToolUseFailure` (ignored at parse), so those
-# two vectr hook groups simply never fire on dsh — every other event works.
-_DSH_HOOKS_PATCH_TEMPLATE = load_template("dsh_hooks.patch.yml.template")
-_DSH_HOOKS_BLOCK_START = "# vectr-hooks-start"
-_DSH_HOOKS_BLOCK_END = "# vectr-hooks-end"
-# Matches vectr's dsh hooks block plus any blank lines immediately before it.
-_DSH_HOOKS_BLOCK_RE = re.compile(
-    r"\n*" + re.escape(_DSH_HOOKS_BLOCK_START) + r"\b.*?" + re.escape(_DSH_HOOKS_BLOCK_END) + r"\n?",
-    re.DOTALL,
-)
-
-
 _VECTR_BLOCK_START = "<!-- vectr-start -->"
 _VECTR_BLOCK_END = "<!-- vectr-end -->"
 # Matches the vectr block plus any blank lines immediately before it.
@@ -365,6 +319,66 @@ def _write_ide_config_merge_safe(
     else:
         path.write_text(f"{existing.rstrip()}\n\n{block}", encoding="utf-8")
         print(f"  Appended vectr block to {path}", file=sys.stderr)
+
+
+def _write_guidance_files_merged(
+    specs: list[tuple[Path, dict]], *, search_only: bool,
+) -> None:
+    """Write the vectr guidance block into each IDE config file named by
+    `specs` — `(path, _write_ide_config_merge_safe options)` — writing each
+    DISTINCT underlying file exactly once (UPG-INIT-SYMLINK-WRITE-ORDER).
+
+    Workspaces commonly alias these files to one another (CLAUDE.md ->
+    AGENTS.md, AGENTS.md -> CLAUDE.md, GEMINI.md -> AGENTS.md, occasionally a
+    hardlink). Writing each PATH in turn follows the alias, so every write
+    after the first silently rewrote the same underlying bytes, and because
+    each write strips any existing vectr block before appending its own, the
+    LAST intended variant won and every earlier variant was discarded —
+    e.g. a CLAUDE.md->AGENTS.md symlink lost CLAUDE.md's deferred-tool
+    loading blockquote to AGENTS.md's rewrite seconds later.
+
+    Aliased paths are grouped by resolved identity — `(st_dev, st_ino)` for
+    files that stat, `realpath` for names that don't (which still collapses
+    a dangling symlink with its target's name) — and each group gets ONE
+    merge-safe write through its first member's path, with options merged
+    so the single shared body serves every member:
+
+    - create_if_missing: True when ANY member would create its file;
+    - tool_loading: True when ANY member gets the deferred-tool loading
+      blockquote — its conditional wording ("if ... not directly callable
+      yet") is inert for a harness without that mechanism;
+    - hooks_installed: True only when EVERY member's own hook surface is
+      installed — the conservative intersection. Hook-aware copy tells the
+      reader NOT to self-recall at session start because injection is
+      automatic; on an aliased file that claim is only true when every
+      harness reading it actually injects. With only some surfaces hooked,
+      the default variant keeps manual recall working everywhere at the
+      cost of one redundant recall where hooks ARE installed.
+
+    Non-aliased paths keep their own per-file write, message, and options —
+    behavior is unchanged for workspaces without aliases.
+    """
+    # Plain dict: insertion order is preserved (py3.7+), so non-aliased
+    # files keep their spec order below.
+    groups: dict[tuple, list[tuple[Path, dict]]] = {}
+    for path, opts in specs:
+        try:
+            st = path.stat()  # follows symlinks; hardlinks share an inode
+            key = ("inode", st.st_dev, st.st_ino)
+        except OSError:
+            # Missing name — realpath still resolves any symlink components
+            # it CAN, so a dangling symlink groups with its target's name.
+            key = ("missing", os.path.realpath(path))
+        groups.setdefault(key, []).append((path, opts))
+
+    for members in groups.values():
+        _write_ide_config_merge_safe(
+            members[0][0],
+            create_if_missing=any(o["create_if_missing"] for _, o in members),
+            hooks_installed=all(o["hooks_installed"] for _, o in members),
+            search_only=search_only,
+            tool_loading=any(o["tool_loading"] for _, o in members),
+        )
 
 
 def _remove_vectr_block(path: Path) -> None:
@@ -809,172 +823,6 @@ def _write_codex_mcp_config(path: Path, port: int, headers: dict[str, str]) -> N
     print(f"  {'Updated vectr block in' if existed else 'Created'} {path}", file=sys.stderr)
 
 
-def _dsh_home() -> Path:
-    """Locate the DeepSeek Harness home directory: `$DSH_HOME` if set, else
-    `~/.dsh` (the default the harness itself uses)."""
-    env_home = os.getenv("DSH_HOME")
-    if env_home:
-        return Path(env_home)
-    return Path.home() / ".dsh"
-
-
-def _dsh_profile() -> str:
-    """Resolve the dsh profile vectr should register itself in: `$DSH_PROFILE`
-    first (the harness's own selector), then `$VECTR_DSH_PROFILE` (a
-    vectr-specific override for hosts that pin a different profile), then the
-    `web` default (the browser GUI profile, the most common local setup)."""
-    return os.getenv("DSH_PROFILE") or os.getenv("VECTR_DSH_PROFILE") or _DSH_DEFAULT_PROFILE
-
-
-def _dsh_patch_path() -> Path:
-    """Path to the active dsh profile's `cordis.patch.yml`, the file vectr's
-    `mcp-client.vectr` insert row is merged into."""
-    return _dsh_home() / "profiles" / _dsh_profile() / "cordis.patch.yml"
-
-
-def _render_dsh_mcp_block(port: int, headers: dict[str, str]) -> str:
-    """Render vectr's `- insert:` MCP row for a dsh `cordis.patch.yml`,
-    splicing a `headers` block when the daemon is authenticated (keyless
-    daemons — the default — get the header-free block, byte-identical to the
-    template). dsh's Streamable HTTP config names the field `headers`, the
-    same key the editor JSON MCP configs use."""
-    hdr = ""
-    if headers:
-        hdr = "\n        headers:"
-        for key, value in headers.items():
-            hdr += f"\n          {key}: {value}"
-    return _DSH_PATCH_TEMPLATE.format(port=port).replace("__HEADERS__", hdr)
-
-
-def _render_dsh_hooks_block(config_path: str) -> str:
-    """Render vectr's `- insert:` hook-bridge row for a dsh `cordis.patch.yml`.
-    `config_path` is the ABSOLUTE path to the workspace's `.claude/settings.
-    json` (dsh resolves `configPath` once at load against the server's launch
-    cwd, so a relative path would point at the wrong tree)."""
-    return _DSH_HOOKS_PATCH_TEMPLATE.format(config_path=json.dumps(config_path))
-
-
-def _merge_dsh_patch_block(
-    existing: str, block: str, block_start: str, block_re: "re.Pattern[str]",
-) -> str | None:
-    """Merge one vectr comment-delimited block into the text of a dsh
-    `cordis.patch.yml`, returning the new content or `None` when the result
-    would be byte-identical to the input (a no-op caller skips the write).
-
-    Shared by the MCP-row and hook-bridge writers. When the block's own marker
-    region is already present it is replaced IN PLACE (so a file holding both
-    the MCP and hooks blocks keeps each block where it is, no matter which
-    writer runs last); otherwise a fresh `[]` empty array is replaced by the
-    block, and a file with real content gets the block appended as a new
-    top-level item. In every case any other patch entries survive verbatim."""
-    if block_start in existing:
-        new_content = block_re.sub(block, existing)
-        return None if new_content == existing else new_content
-    match = _DSH_EMPTY_ARRAY_RE.search(existing)
-    if match:
-        # Fresh `[]` (optionally under header comments): replace the empty
-        # array with vectr's block, keeping the comments.
-        return f"{match.group(1).rstrip()}\n{block}" if match.group(1).strip() else block
-    # Real content: append the block as a new top-level item.
-    return f"{existing.rstrip()}\n\n{block}"
-
-
-def _write_dsh_mcp_config(path: Path, port: int, headers: dict[str, str]) -> None:
-    """Write/refresh vectr's `mcp-client.vectr` insert row in a dsh profile's
-    `cordis.patch.yml`.
-
-    Merge-safe by comment-delimited region (mirrors `_write_codex_mcp_config`
-    for TOML): only vectr's own `# vectr-start`…`# vectr-end` block is
-    touched; any other patch entries the user has (their own inserts,
-    disables) are preserved verbatim. Idempotent — a port change rewrites the
-    block in place; an unchanged block is a no-op.
-
-    The file is a top-level YAML array. A fresh `cordis.patch.yml` ships as
-    `[]` (possibly under a header comment), so appending a bare `- insert:`
-    item after it would be invalid YAML — the empty array is replaced by the
-    block instead. A file with real content gets the block appended as a new
-    top-level item.
-    """
-    block = _render_dsh_mcp_block(port, headers)
-    existed = path.exists()
-    if not existed:
-        new_content = block
-    else:
-        merged = _merge_dsh_patch_block(
-            path.read_text(encoding="utf-8"), block, _DSH_BLOCK_START, _DSH_BLOCK_RE,
-        )
-        if merged is None:
-            return
-        new_content = merged
-    _write_dsh_patch_validated(path, new_content, existed, "mcp-client.vectr insert row")
-
-
-def _write_dsh_hooks_config(path: Path, config_path: str) -> None:
-    """Write/refresh vectr's `hooks-claude-code` hook-bridge row in a dsh
-    profile's `cordis.patch.yml`, pointing the bridge at the workspace's
-    `.claude/settings.json`.
-
-    Same merge-safe contract as `_write_dsh_mcp_config`, under its own
-    `# vectr-hooks-start`…`# vectr-hooks-end` markers so the two blocks are
-    managed independently (hooks are installed by `vectr init --hooks`, MCP by
-    every `vectr start`/`init`)."""
-    block = _render_dsh_hooks_block(config_path)
-    existed = path.exists()
-    if not existed:
-        new_content = block
-    else:
-        merged = _merge_dsh_patch_block(
-            path.read_text(encoding="utf-8"), block, _DSH_HOOKS_BLOCK_START, _DSH_HOOKS_BLOCK_RE,
-        )
-        if merged is None:
-            return
-        new_content = merged
-    _write_dsh_patch_validated(path, new_content, existed, "hooks-claude-code row")
-
-
-def _write_dsh_patch_validated(path: Path, new_content: str, existed: bool, what: str) -> None:
-    """Validate `new_content` parses as a top-level YAML array, then write it.
-    A merged file that would not parse is left untouched with a README pointer
-    rather than compounding a malformed pre-existing patch."""
-    try:
-        _validate_dsh_patch_yaml(new_content)
-    except Exception as exc:
-        print(
-            f"  Skipped {path}: merged content is not valid YAML ({exc}) — "
-            f"add the {what} by hand (see README).",
-            file=sys.stderr,
-        )
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_content, encoding="utf-8")
-    print(f"  {'Updated vectr block in' if existed else 'Created'} {path}", file=sys.stderr)
-
-
-
-def _validate_dsh_patch_yaml(content: str) -> None:
-    """Parse `content` as a top-level YAML array of patch entries to prove the
-    merged `cordis.patch.yml` is loadable before it is written. A pre-existing
-    malformed patch is left untouched rather than compounded.
-
-    `!!js` tags (which dsh's loader evaluates) are unknown to PyYAML, so the
-    check registers the `!!js` tag on a `SafeLoader` subclass as a passthrough
-    that returns the raw scalar: any OTHER unknown tag or a structurally
-    invalid document still raises, while a user's `!!js` expressions (rare in
-    a patch file, but legal) don't false-positive the guard."""
-    import yaml
-
-    def _js_constructor(loader: yaml.Loader, node: yaml.Node):
-        return loader.construct_scalar(node)
-
-    class _Loader(yaml.SafeLoader):
-        pass
-
-    _Loader.add_constructor("tag:yaml.org,2002:js", _js_constructor)
-    parsed = yaml.load(content, Loader=_Loader)
-    if not isinstance(parsed, list):
-        raise ValueError("top-level value is not a YAML array")
-
-
 def _write_workspace_config(workspace: str, port: int, *, search_only: bool = False) -> None:
     """Write per-IDE MCP config files and IDE guidance into the workspace root.
 
@@ -1002,19 +850,32 @@ def _write_workspace_config(workspace: str, port: int, *, search_only: bool = Fa
     # hooks are installed for this workspace (UPG-CODEX-PARITY), mirroring how
     # CLAUDE.md keys on Claude Code hooks above; the other append-only files
     # have no automatic-injection path, so they always get the default variant.
+    # UPG-INIT-SYMLINK-WRITE-ORDER: the per-file specs are handed to
+    # `_write_guidance_files_merged`, which collapses aliased paths (symlink
+    # or hardlink — e.g. CLAUDE.md -> AGENTS.md) into ONE write with merged
+    # options instead of letting the second write silently overwrite the
+    # first through the alias. `.cursor/rules/vectr.mdc` stays outside this
+    # list: it is a vectr-owned whole-file write (`_write_cursor_rules`),
+    # not a merge-safe block append.
     codex_hooks_installed = _codex_hooks_installed(workspace)
-    _write_ide_config_merge_safe(
-        root / "CLAUDE.md", create_if_missing=True, hooks_installed=hooks_installed, search_only=search_only,
-        tool_loading=True,
-    )
-    for _rel in _IDE_CONFIG_APPEND_ONLY:
-        file_hooks = codex_hooks_installed if _rel == "AGENTS.md" else False
-        _write_ide_config_merge_safe(
-            root / _rel, create_if_missing=False, hooks_installed=file_hooks, search_only=search_only,
-        )
-    _write_ide_config_merge_safe(
-        root / ".github" / "copilot-instructions.md", create_if_missing=False, search_only=search_only,
-    )
+    # Every spec carries ALL option keys — _write_guidance_files_merged
+    # merges each key across an alias group by direct lookup.
+    def _spec(rel_path: Path, *, create: bool, hooks: bool = False, tool_loading: bool = False):
+        return (rel_path, dict(create_if_missing=create, hooks_installed=hooks, tool_loading=tool_loading))
+
+    guidance_specs: list[tuple[Path, dict]] = [
+        _spec(root / "CLAUDE.md", create=True, hooks=hooks_installed, tool_loading=True),
+        *(
+            _spec(
+                root / rel,
+                create=False,
+                hooks=codex_hooks_installed if rel == "AGENTS.md" else False,
+            )
+            for rel in _IDE_CONFIG_APPEND_ONLY
+        ),
+        _spec(root / ".github" / "copilot-instructions.md", create=False),
+    ]
+    _write_guidance_files_merged(guidance_specs, search_only=search_only)
     _write_cursor_rules(workspace, search_only=search_only)
 
     # When this workspace's daemon runs with authentication enabled
@@ -1031,13 +892,6 @@ def _write_workspace_config(workspace: str, port: int, *, search_only: bool = Fa
     # interactive trust prompt (research §Q1) — an expected first-run step, not
     # something an auto-writer can (or should) clear on the user's behalf.
     _write_codex_mcp_config(root / ".codex" / "config.toml", port, headers)
-
-    # DeepSeek Harness (UPG-DSH-PARITY): register vectr in the ACTIVE dsh
-    # profile's cordis.patch.yml (profile-global, unlike the per-workspace
-    # editor files above). Skipped silently when dsh is not installed
-    # (`~/.dsh` absent) — the harness is not the target host for every user.
-    if _dsh_home().exists():
-        _write_dsh_mcp_config(_dsh_patch_path(), port, headers)
 
     # Merge-safe (not create-only): UPG-11.5 reordered `vectr init --hooks` to
     # write hooks before workspace config in the same run, so settings.json can
@@ -2064,9 +1918,12 @@ def _do_start(
         # UPG-CLI-STOP-NO-PORT-FLAG companion: a single deterministic line on
         # stdout so scripts/harnesses can discover the actually-bound port
         # (find_free_port may have walked past a busy --port) without
-        # scraping the human stderr text. Unlike the text branch below,
-        # "failed" exits non-zero here — this surface is opt-in specifically
-        # for callers that check results programmatically.
+        # scraping the human stderr text. Opt-in specifically for callers
+        # that check results programmatically; its exit contract is the one
+        # shared rule both output surfaces now follow (UPG-CLI-START-TEXT-
+        # EXIT-CODE): exit 1 exactly when `status == "failed"` — the daemon
+        # process exited before becoming ready and nothing is listening —
+        # and 0 otherwise, including "not_ready".
         print(json.dumps({
             "status": status,
             "port": port,
@@ -2123,11 +1980,29 @@ def _do_start(
         print(f"Logs      : {log_path}", file=sys.stderr)
         print(f"Poll readiness with: vectr status --path {workspace}", file=sys.stderr)
     else:
+        # UPG-CLI-START-TEXT-EXIT-CODE: the default text surface now follows
+        # the same exit contract the opt-in --json surface already had —
+        # exit 1 exactly when the daemon process exited before becoming
+        # ready (nothing is listening; any later use of this workspace's
+        # port is guaranteed to fail), and 0 otherwise. "not_ready" stays
+        # exit 0 deliberately: the process is still alive and may simply be
+        # loading (large workspace / first-run embedding-model download), so
+        # it is an uncertain outcome, not a failure — a nonzero exit there
+        # would make `set -e` scripts abort on slow-but-successful starts.
+        # Scripts that must distinguish all three outcomes have --json,
+        # whose status field names them explicitly. Pre-existing nonzero
+        # exits on this command (bind-auth refusal, --strict-port collision)
+        # already meant exit 0 was never a guarantee the daemon runs; this
+        # only closes the post-spawn gap. Callers that poll readiness after
+        # an apparent success (the benchmark harnesses, the editor
+        # extension) keep working unchanged — they never branched on the
+        # text path's code in the first place.
         print(
             f"Vectr failed to start: the process exited before becoming ready.",
             file=sys.stderr,
         )
         print(f"Logs      : {log_path}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _get_port_for_workspace(workspace: str, fallback: int) -> int:
@@ -2544,6 +2419,54 @@ def cmd_remember(args: argparse.Namespace) -> None:
         _handle_daemon_call_error(exc, port)
 
 
+def cmd_anchor(args: argparse.Namespace) -> None:
+    """Attach file anchors to an existing working-memory note
+    (UPG-ANCHOR-ATTACH): the shell path to POST /v1/anchor, mirroring the
+    MCP `vectr_anchor` tool — post-write anchoring without re-storing.
+    Anchors are staleness probes, never a claim about note correctness;
+    idempotent (already-present paths are reported, not duplicated)."""
+    import httpx
+
+    workspace = str(Path(args.path).resolve())
+    port = _get_port_for_workspace(workspace, args.port)
+    _check_version_skew(port, registry_entry=_resolve_hook_instance(workspace))
+    payload: dict = {"note_id": args.note_id, "anchors": list(args.paths)}
+    try:
+        resp = httpx.post(f"{_api_base(port)}/v1/anchor", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        print(data.get("message", "Anchored."))
+        already = data.get("already_present") or []
+        if already:
+            print(f"Already anchored (no-op): {', '.join(already)}", file=sys.stderr)
+    except (httpx.ConnectError, httpx.HTTPStatusError) as exc:
+        _handle_daemon_call_error(exc, port)
+
+
+def cmd_unanchor(args: argparse.Namespace) -> None:
+    """Remove file anchors from an existing working-memory note
+    (UPG-ANCHOR-DETACH): the shell path to POST /v1/unanchor, mirroring
+    the MCP `vectr_unanchor` tool — post-write de-anchoring without
+    re-storing. The inverse of `vectr anchor`. Idempotent: paths the note
+    is not anchored to are reported, not treated as failures."""
+    import httpx
+
+    workspace = str(Path(args.path).resolve())
+    port = _get_port_for_workspace(workspace, args.port)
+    _check_version_skew(port, registry_entry=_resolve_hook_instance(workspace))
+    payload: dict = {"note_id": args.note_id, "anchors": list(args.paths)}
+    try:
+        resp = httpx.post(f"{_api_base(port)}/v1/unanchor", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        print(data.get("message", "Unanchored."))
+        not_present = data.get("not_present") or []
+        if not_present:
+            print(f"Not anchored (no-op): {', '.join(not_present)}", file=sys.stderr)
+    except (httpx.ConnectError, httpx.HTTPStatusError) as exc:
+        _handle_daemon_call_error(exc, port)
+
+
 def cmd_recall(args: argparse.Namespace) -> None:
     """Print recalled working-memory notes to stdout (UPG-9.1).
 
@@ -2677,11 +2600,10 @@ def _post_trigger_reset(port: int, session_id: str) -> bool:
     """POST /v1/trigger/reset; True on success, False on any failure (never
     raises).
 
-    Used by the PreCompact hook (TRIGGER-ENGINE wave 2a,
-    bm2-design-skeleton.md §3: "cleared on compaction") to clear this
-    session's per-session fire ledger and cumulative injection budget —
-    a reset failure must never block compaction, mirroring `_post_snapshot`
-    immediately above.
+    Used by the PreCompact hook to clear this session's per-session fire
+    ledger and cumulative injection budget on compaction — a reset failure
+    must never block compaction, mirroring `_post_snapshot` immediately
+    above.
     """
     import httpx
     try:
@@ -2975,9 +2897,8 @@ def _resolve_hook_instance(cwd: str) -> dict | None:
 
 
 def cmd_hook(args: argparse.Namespace) -> None:
-    """Emit hook output for harness-injected vectr memory (UPG-9.4+;
-    TRIGGER-ENGINE wave 2a wires the per-memory trigger engine into every
-    branch below).
+    """Emit hook output for harness-injected vectr memory (UPG-9.4+);
+    the per-memory trigger engine is wired into every branch below.
 
     Invoked by the hook entries that `vectr init --hooks` writes — not meant to
     be called by hand. Resolves the workspace from the event's cwd (the harness
@@ -3006,9 +2927,9 @@ def cmd_hook(args: argparse.Namespace) -> None:
     note whose ONLY explicit trigger is `post-compaction` (not covered by the
     directive kind-default bundle, which already includes `session-start`) is
     folded into that one call rather than inventing a new delivery point.
-    `pre-run` is now live (wave 3, §5.2 — see the pre-tool-use row above);
-    `pre-commit` remains declared-but-inert this wave (no lifecycle moment
-    maps to it — never an error, bm2-design-skeleton.md §2).
+    `pre-run` is now live (see the pre-tool-use row above);
+    `pre-commit` remains declared-but-inert (no lifecycle moment
+    maps to it — never an error).
 
     `post-commit` (UPG-COMMIT-MEMORY-HOOK) is fundamentally different from
     the five events above: it is invoked directly by `git` (installed by
@@ -3032,7 +2953,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
         if entry is None:
             return  # no daemon serves this workspace → inject nothing
         port = entry["port"]
-        # TRIGGER-ENGINE wave 2a: the harness's own hook-JSON `session_id` —
+        # The harness's own hook-JSON `session_id` —
         # present on every real hook invocation, stable across a /compact —
         # is the per-session identity the engine's fire ledger, cumulative
         # injection budget, and scope="session"/"branch" enforcement key on.
@@ -3064,7 +2985,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
             # and inject them before the model sees it. The relevance cutoff
             # (UPG-5.1) keeps an off-topic prompt from injecting anything.
             # detail="index" keeps the injected context token-bounded (UPG-RECALL-HIERARCHY).
-            # events=["prompt-submit"] (TRIGGER-ENGINE wave 2a) additionally
+            # events=["prompt-submit"] additionally
             # fires any note with an EXPLICIT prompt-submit trigger override
             # (no kind's default bundle uses this event) — merged with, and
             # deduped against, the semantic query results server-side.
@@ -3097,7 +3018,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
             # Write, ... all put the target path under tool_input.file_path) — which
             # tool names actually reach this hook is a matcher decision made by
             # `_write_claude_hooks`, not a content-based guess made here. The
-            # engine's pre-edit event (TRIGGER-ENGINE wave 2a) is merged in
+            # engine's pre-edit event is merged in
             # server-side alongside this same file_path recall.
             #
             # Command-family injection: a Bash call carries no
@@ -3151,7 +3072,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
             trigger = (event.get("trigger") or "manual").strip() or "manual"
             label = f"pre-compact-{trigger}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
             _post_snapshot(port, label)
-            # TRIGGER-ENGINE wave 2a (§3 "cleared on compaction"): reset this
+            # Cleared on compaction: reset this
             # session's fire ledger + cumulative injection budget so the
             # SessionStart `compact` call above gets a fresh budget and
             # re-eligibility for every trigger axis. A session with no
@@ -3225,13 +3146,16 @@ def _mode_and_index_lines(
 ) -> list[str]:
     """Format the Mode + indexed-files/chunks/last-indexed lines.
 
-    In memory-only/search-only mode, indexing never runs in this process —
-    `indexed_files` reflects only files this process has walked (0, since
-    the startup walk is skipped), while `total_chunks` reads the persisted
-    index and can be nonzero from an earlier full-mode run. Framing both as
-    if they were live counts is misleading (UPG-CLI-STATUS-MODE): the mode
-    line makes the gap self-explanatory, and the row wording says the
-    figures are what's persisted, not what this run has done.
+    Both figures read the persisted index (`indexed_files` has counted
+    distinct files in the collection — not files this process has walked —
+    since UPG-STATUS-WARMSTART-FILES), so in memory-only/search-only mode
+    they describe the last full-mode run, not anything this process did.
+    Framing them as live counts would be misleading (UPG-CLI-STATUS-MODE):
+    the mode line makes that self-explanatory, and the non-full-mode row
+    wording says the figure is what's persisted. In full mode the two rows
+    print unchanged — they are now internally consistent during a warm
+    start instead of showing `indexed_files: 0` beside a populated chunk
+    count.
     """
     mode = data.get("mode", "full")
     lines = [f"{mode_label} : {mode}"]
@@ -3709,6 +3633,236 @@ def cmd_cache(args: argparse.Namespace) -> None:
             print(f"  {d.name}")
 
 
+def _memory_db_dir(workspace: str) -> str:
+    """Same resolution VectrService.__init__ uses (VECTR_DB_DIR override,
+    else _default_db_dir), so every `vectr memory` subcommand always reads
+    the identical database a running daemon for this workspace writes to.
+    _default_db_dir deliberately never creates the per-workspace cache dir
+    (UPG-CACHE-LITTER — a bare resolution must not litter the cache root);
+    a real service (or, here, an export/edit request) is the point a
+    durable dir is warranted, so secure_dir() mirrors the same call
+    VectrService.__init__ makes before its first store write."""
+    from app.service import _default_db_dir
+    from agent.fs_permissions import secure_dir
+
+    db_dir = os.getenv("VECTR_DB_DIR") or _default_db_dir(workspace)
+    secure_dir(db_dir)
+    return db_dir
+
+
+def cmd_memory(args: argparse.Namespace) -> None:
+    """`vectr memory export` / `vectr memory edit` / `vectr memory import`
+    — the three surfaces on the same `vectr memory` command group.
+
+    `export` / `edit` see the UPG-MEMORY-LEGIBLE-FILE-PROJECTION
+    docstring they have always had; `import` (UPG-MEMORY-IMPORT) is the
+    one-way-in path that was missing: it brings existing on-disk memory
+    files (`MEMORY.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`,
+    `.github/copilot-instructions.md`, or any file passed via
+    `--path`) into the store, and a file that was previously exported
+    via `vectr memory export` is recognized and round-tripped through
+    the SAME `parse_edit_buffer()` grammar `_memory_edit` uses, so its
+    blocks recover as notes with their declared kind/priority/tags
+    carried forward.
+
+    Both `export` / `edit` and `import` operate directly on the
+    workspace's SQLite database, the same "no running server required"
+    pattern as `cmd_forget --all`/`cmd_cache prune` — WAL mode lets this
+    read (and, for `edit` and `import`, write) safely even while a
+    daemon has the same file open.
+    """
+    action = getattr(args, "memory_command", None)
+    if action == "edit":
+        _cmd_memory_edit(args)
+        return
+    if action == "import":
+        _cmd_memory_import(args)
+        return
+    if action != "export":
+        print("usage: vectr memory export [--path FILE] [--workspace DIR] [--disable]", file=sys.stderr)
+        print("       vectr memory edit [--workspace DIR]", file=sys.stderr)
+        print("       vectr memory import [--path FILE]... [--workspace DIR] [--dry-run]", file=sys.stderr)
+        return
+
+    from agent.working_context_store._export import remove_export_target
+
+    workspace = str(Path(args.workspace).resolve())
+
+    if getattr(args, "disable", False):
+        previous_target = remove_export_target(workspace)
+        if previous_target is None:
+            print(f"No memory export auto-refresh was configured for {workspace}; nothing to disable.")
+        else:
+            print(f"Disabled memory export auto-refresh for {workspace} (was mirroring to {previous_target}).")
+            print("The previously exported file is left in place; re-run `vectr memory export` to turn auto-refresh back on.")
+        return
+
+    from agent.working_context_store import WorkingContextStore
+    from agent.working_context_store._export import export_memory, write_export_target
+
+    out_path = Path(getattr(args, "export_path", None) or "MEMORY.md")
+    if not out_path.is_absolute():
+        out_path = Path(workspace) / out_path
+    out_path = out_path.resolve()
+
+    store = WorkingContextStore(_memory_db_dir(workspace))
+    export_memory(store, workspace, out_path)
+    write_export_target(workspace, out_path)
+    print(f"Exported working memory for {workspace} to {out_path}")
+    print("Auto-refresh is now on: future note writes will keep this file current. "
+          "Run `vectr memory export --disable` to stop that.")
+
+
+def _cmd_memory_edit(args: argparse.Namespace) -> None:
+    from agent.working_context_store import WorkingContextStore
+    from agent.working_context_store._memory_edit import (
+        MemoryEditConflict,
+        edit_memory_interactive,
+    )
+
+    workspace = str(Path(args.workspace).resolve())
+    store = WorkingContextStore(_memory_db_dir(workspace))
+
+    try:
+        result = edit_memory_interactive(store, workspace)
+    except MemoryEditConflict as exc:
+        print(f"vectr memory edit: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if result.is_empty():
+        print("No changes.")
+        return
+
+    for old_id, new_id in result.supersedes:
+        print(f"Superseded #{old_id} -> #{new_id} (body changed)")
+    for note_id in result.field_updates:
+        print(f"Updated fields on #{note_id} (kind/priority/tags)")
+    for note_id in result.remembers:
+        print(f"Remembered new note #{note_id}")
+    for note_id in result.revokes:
+        print(f"Revoked #{note_id} (reversible with vectr_reinstate)")
+    for note_id in result.forgets:
+        print(f"Permanently deleted #{note_id}")
+
+
+def _cmd_memory_import(args: argparse.Namespace) -> None:
+    """`vectr memory import` (UPG-MEMORY-IMPORT) — bring on-disk memory
+    files into the working-memory store.
+
+    Discovery order: every `--path` argument (relative paths resolved
+    against `--workspace`, absolute paths taken as-is, directories walked
+    recursively for *.md/*.mdc up to depth 8) is tried first in the
+    order given, then the configured default candidate list at the
+    workspace root. The default list lives in
+    `agent.config.MEMORY_IMPORT_CANDIDATE_FILES` and the closed default
+    is the common on-disk memory files a user already has before
+    adopting vectr — `MEMORY.md`, `CLAUDE.md`, `AGENTS.md`,
+    `.cursorrules`, `.github/copilot-instructions.md`.
+
+    Idempotency: every imported note carries a `src:` / `src-sha:` /
+    `src-lines:` tag triple on it; a re-run against the same file body
+    recognizes the existing tag and skips that block. A re-run against
+    a file whose body has been edited creates a new note for the new
+    body — the original is left untouched, since deleting the user's
+    prior import behind their back is the exact silent-loss the design
+    defends against on the export side.
+
+    `--dry-run` is the path of first resort: it prints exactly what
+    would be created (kind, title, source file, source-line range,
+    provenance) and changes nothing. Memory is the one resource the
+    user cannot easily reconstruct, so dry run must always be reachable
+    without the user having to dig through the help output to find it.
+    """
+
+    from agent.working_context_store import WorkingContextStore
+    from agent.working_context_store._import import (
+        execute_import,
+        plan_import,
+        _walk_directory_for_markdown,
+    )
+
+    workspace = str(Path(args.workspace).resolve())
+    workspace_path = Path(workspace)
+
+    # Build the explicit-path list. Each --path is taken as either a
+    # file (read directly) or a directory (walked for *.md/*.mdc).
+    # Repeated --path flags accumulate.
+    extra_paths: list[Path] = []
+    for raw in getattr(args, "paths", []) or []:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = workspace_path / p
+        p = p.resolve()
+        if p.is_dir():
+            extra_paths.extend(_walk_directory_for_markdown(p))
+        else:
+            extra_paths.append(p)
+
+    store = WorkingContextStore(_memory_db_dir(workspace))
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    # Dry run with a `None` store: skip the idempotency check so the
+    # user sees what a first-time import would do, even when the
+    # store already has the same notes from a prior run.
+    plan_store = None if dry_run else store
+    plan = plan_import(workspace_path, extra_paths, plan_store)
+
+    # Discovery report: which files we considered, which were found,
+    # which were skipped because they don't exist (the common case
+    # for a workspace that never had a particular file).
+    candidates_seen: set[Path] = set()
+    from agent.config import MEMORY_IMPORT_CANDIDATE_FILES
+    for rel in MEMORY_IMPORT_CANDIDATE_FILES:
+        candidates_seen.add((workspace_path / rel).resolve())
+    for p in extra_paths:
+        candidates_seen.add(p)
+    found = sorted(p for p in candidates_seen if p.exists())
+    missing = sorted(p for p in candidates_seen if not p.exists())
+
+    print(f"vectr memory import: workspace = {workspace}")
+    if found:
+        print(f"  Found {len(found)} source file(s):")
+        for p in found:
+            rel = p.relative_to(workspace_path) if p.is_relative_to(workspace_path) else p
+            print(f"    {rel}")
+    if missing:
+        print(f"  Skipped {len(missing)} non-existent default(s) (no --path supplied):")
+        for p in missing:
+            rel = p.relative_to(workspace_path) if p.is_relative_to(workspace_path) else p
+            print(f"    {rel}")
+    if not found:
+        print("  Nothing to import: no source files exist at the workspace root.")
+        return
+
+    if dry_run:
+        print(f"\nDRY RUN — would create {len(plan.planned)} note(s), "
+              f"skip {len(plan.skipped_existing)} already-imported, "
+              f"skip {len(plan.skipped_too_short)} too-short, "
+              f"{len(plan.parse_errors)} parse error(s).")
+        for n in plan.planned:
+            rel = n.source_path.name
+            print(f"  + [{n.kind}/{n.provenance}] {n.title!r}  ({rel}:{n.source_start_line}-{n.source_end_line})")
+        for path, line, preview in plan.skipped_existing:
+            print(f"  = {path.name}:{line} already imported ({preview!r})")
+        for path, line, preview in plan.skipped_too_short:
+            print(f"  - {path.name}:{line} too short ({preview!r})")
+        for path, line, reason in plan.parse_errors:
+            print(f"  ! {path.name}:{line} {reason}", file=sys.stderr)
+        return
+
+    result = execute_import(store, workspace, plan)
+    print(f"Imported {len(result.written)} note(s) into {workspace}.")
+    for note, new_id in result.written:
+        rel = note.source_path.name
+        print(f"  + #{new_id} [{note.kind}/{note.provenance}] {note.title!r}  ({rel}:{note.source_start_line}-{note.source_end_line})")
+    if result.skipped_existing:
+        print(f"  Skipped {result.skipped_existing} block(s) already imported (idempotent re-run).")
+    if result.skipped_too_short:
+        print(f"  Skipped {result.skipped_too_short} block(s) under the {8}-char body floor.")
+    if result.parse_errors:
+        print(f"  {result.parse_errors} parse error(s); see the import module's audit log.", file=sys.stderr)
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     workspace = str(Path(args.path).resolve())
 
@@ -3779,14 +3933,6 @@ def cmd_init(args: argparse.Namespace) -> None:
             # search-only gate (it writes a note, so it needs the same
             # working-memory layer the two hooks above inject from).
             _write_git_post_commit_hook(workspace)
-            # DeepSeek Harness (UPG-DSH-PARITY): point dsh's Claude Code hook
-            # bridge at this workspace's .claude/settings.json (written just
-            # above). Skipped silently when dsh is not installed. The path is
-            # ABSOLUTE because dsh resolves configPath once at load against
-            # the server's launch cwd, not per-session.
-            if _dsh_home().exists():
-                settings_path = Path(workspace) / ".claude" / "settings.json"
-                _write_dsh_hooks_config(_dsh_patch_path(), str(settings_path.resolve()))
 
     _maybe_write_workspace_config(workspace, port, args, search_only=search_only)
 
@@ -3817,7 +3963,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_watch(args: argparse.Namespace) -> None:
     """Index workspace(s) and start filesystem watcher without launching the MCP server."""
     import hashlib
-    from agent.config import embed_model_spec
+    from agent.config import EMBEDDING_DEFAULT_MODEL
     from agent.indexer import CodeIndexer
     from agent.watcher import CodeWatcher
     from integrations.workspace_detect import find_workspace_root
@@ -3833,7 +3979,11 @@ def cmd_watch(args: argparse.Namespace) -> None:
     else:
         workspace = find_workspace_root(roots[0])
     extra_roots = roots[1:]
-    embed_model = embed_model_spec()
+    from agent.indexer._types import resolve_embed_model
+    embed_model = resolve_embed_model(
+        os.getenv("VECTR_EMBED_MODEL"), workspace, EMBEDDING_DEFAULT_MODEL
+    )
+
 
     # Use same db layout as VectrService so a later `vectr start` shares the index.
     db_hash = hashlib.md5(workspace.encode()).hexdigest()[:12]
@@ -4355,7 +4505,9 @@ def main() -> None:
     p_remember = sub.add_parser("remember", help="Store a working-memory note (shell path to the note store)")
     p_remember.add_argument("content", help="The note content to store")
     p_remember.add_argument("--tags", action="append", metavar="TAG", help="Topic tag (repeatable)")
-    p_remember.add_argument("--priority", choices=["high", "medium", "low"], default="medium")
+    p_remember.add_argument("--priority", choices=["high", "medium", "low"], default="medium",
+                            help="For kind='task' checkpoints: only priority='high' appears on "
+                                 "session-start/resume surfaces")
     p_remember.add_argument("--kind", choices=["directive", "task", "gotcha", "finding", "reference", "decision", "operational"],
                             default="finding", help="Memory kind (controls injection policy)")
     p_remember.add_argument("--title", default="", help="Short label for index-tier display (optional; derived from first content line if empty)")
@@ -4375,7 +4527,15 @@ def main() -> None:
                           help="Relevance cutoff [0..1]: drop semantic matches below this cosine similarity")
     p_recall.add_argument("--max-age-days", type=float, default=None, dest="max_age_days",
                           help="Time filter: only return notes created within this many days")
-    p_recall.add_argument("--sort-by", choices=["relevance", "recency", "priority", "chronological"], default="relevance",
+    # UPG-SORTBY-SHARED-VOCAB: the same SORT_BY_VALUES constant the REST
+    # validator, MCP dispatch guard, and MCP tool schema consume is what the
+    # CLI's argparse choices list declares. Imported function-locally to match
+    # this file's convention — every other agent.working_context_store import
+    # in main.py is function-local too (see the WorkingContextStore imports in
+    # the memory subcommands), keeping the store package off the import path
+    # of CLI invocations that never touch working memory.
+    from agent.working_context_store import SORT_BY_VALUES as _SORT_BY_VALUES
+    p_recall.add_argument("--sort-by", choices=list(_SORT_BY_VALUES), default="relevance",
                           dest="sort_by", help="Sort order: relevance | recency | priority | chronological (oldest-first; index lines show the creation date)")
     p_recall.add_argument("--detail", choices=["index", "full"], default="index",
                           help="Detail level: 'index' = one-line summaries (default); 'full' = bodies")
@@ -4384,6 +4544,27 @@ def main() -> None:
     p_recall.add_argument("--limit", type=int, default=10)
     p_recall.add_argument("--path", default=_default_path)
     p_recall.add_argument("--port", type=int, default=_default_port)
+
+    p_anchor = sub.add_parser("anchor", help="Attach file anchors to an existing working-memory note")
+    # NOTE: anchor paths are POSITIONAL (--path stays the universal
+    # workspace-root flag on every subcommand); repeat for several paths.
+    p_anchor.add_argument("paths", nargs="+", metavar="PATH",
+                          help="Workspace-relative file path(s) to anchor the note to")
+    p_anchor.add_argument("--id", type=int, required=True, dest="note_id",
+                          help="Note ID to attach anchors to (the [#N] id from 'vectr recall')")
+    p_anchor.add_argument("--path", default=_default_path)
+    p_anchor.add_argument("--port", type=int, default=_default_port)
+
+    p_unanchor = sub.add_parser("unanchor", help="Remove file anchors from an existing working-memory note")
+    # Same positional-paths convention as 'anchor' (--path is the universal
+    # workspace-root flag on every subcommand); nargs="+" enforces the
+    # non-empty contract that REST and MCP both pin.
+    p_unanchor.add_argument("paths", nargs="+", metavar="PATH",
+                            help="Workspace-relative file path(s) to detach this note from")
+    p_unanchor.add_argument("--id", type=int, required=True, dest="note_id",
+                            help="Note ID to remove anchors from (the [#N] id from 'vectr recall')")
+    p_unanchor.add_argument("--path", default=_default_path)
+    p_unanchor.add_argument("--port", type=int, default=_default_port)
 
     p_resume = sub.add_parser(
         "resume",
@@ -4427,6 +4608,104 @@ def main() -> None:
     p_cache_prune.add_argument(
         "--dry-run", action="store_true", dest="dry_run",
         help="List the dirs that would be removed without deleting anything",
+    )
+
+    p_memory = sub.add_parser(
+        "memory",
+        help="Render, edit, or import working memory as markdown",
+        description=(
+            "UPG-MEMORY-LEGIBLE-FILE-PROJECTION. `vectr memory export` renders "
+            "this workspace's notes to a deterministic, read-only markdown "
+            "file (default MEMORY.md) so memory is greppable/git-diffable "
+            "without MCP tool access — nothing ever reads that file back; the "
+            "database stays the source of truth. `vectr memory edit` opens the "
+            "same buffer grammar in $EDITOR for a real check-out/check-in "
+            "round trip: on save, changes are translated into note writes "
+            "(body edits become supersedes, never in-place mutations). "
+            "`vectr memory import` is the one-way-in path: it brings existing "
+            "on-disk memory files into the store, idempotently on content, "
+            "with `--dry-run` as the path of first resort."
+        ),
+    )
+    memory_sub = p_memory.add_subparsers(dest="memory_command")
+    p_memory_export = memory_sub.add_parser(
+        "export", help="Render notes to a markdown file (default MEMORY.md)"
+    )
+    p_memory_export.add_argument(
+        "--path", dest="export_path", default="MEMORY.md",
+        help="Output markdown file (default MEMORY.md, resolved relative to --workspace)",
+    )
+    p_memory_export.add_argument(
+        "--workspace", default=_default_path,
+        help="Workspace whose notes to export (default: $VECTR_WORKSPACE or cwd)",
+    )
+    p_memory_export.add_argument(
+        "--disable", action="store_true",
+        help="Turn off auto-refresh: remove the .vectr/memory_export_path marker "
+             "so future note writes no longer re-render the mirror. Does not "
+             "delete the previously exported file. A no-op (not an error) if "
+             "auto-refresh was never configured for this workspace.",
+    )
+    p_memory_edit = memory_sub.add_parser(
+        "edit",
+        help="Open ACTIVE notes in $EDITOR; translate the saved diff into note writes",
+        description=(
+            "UPG-MEMORY-LEGIBLE-FILE-PROJECTION part (b). Renders this "
+            "workspace's ACTIVE notes (superseded/revoked notes are omitted — "
+            "use `vectr memory export` for the full audit mirror) to a temp "
+            "file carrying stable [#N] anchors, opens $EDITOR on it, and on "
+            "save translates the diff: a changed body becomes a supersedes "
+            "write (the original row is never mutated in place); changed "
+            "kind/priority/tags become a field update; a deleted block "
+            "becomes a revoke (reversible with vectr_reinstate); a new block "
+            "with no [#N] becomes a fresh note. Exits non-zero and writes "
+            "nothing if a touched note changed concurrently since render."
+        ),
+    )
+    p_memory_edit.add_argument(
+        "--workspace", default=_default_path,
+        help="Workspace whose notes to edit (default: $VECTR_WORKSPACE or cwd)",
+    )
+
+    p_memory_import = memory_sub.add_parser(
+        "import",
+        help="Import on-disk memory files into the working-memory store (idempotent)",
+        description=(
+            "UPG-MEMORY-IMPORT. Bring existing memory files into vectr's "
+            "working-memory store. With no --path, walks the closed list "
+            "of default candidate files at the workspace root "
+            "(MEMORY.md, CLAUDE.md, AGENTS.md, .cursorrules, "
+            ".github/copilot-instructions.md). A file that is itself a "
+            "vectr export (recognized by the header comment) is parsed "
+            "through the same block grammar `vectr memory edit` consumes, "
+            "and its notes are recovered with their kind/priority/tags "
+            "carried forward. Imported notes carry `imported` / "
+            "`src:<filename>` / `src-sha:<hash>` / `src-lines:a-b` tags, "
+            "so a re-run against the same body creates no duplicates "
+            "(idempotent on content). Provenance is `auto` for every "
+            "imported note; a heading-prefix-imperative short block is "
+            "promoted to kind=directive and provenance=agent so the "
+            "store's auto+directive write-time guard does not reject it. "
+            "--dry-run prints what would be created without writing."
+        ),
+    )
+    p_memory_import.add_argument(
+        "--path", dest="paths", action="append", default=[],
+        help="Path to a file or directory to import (may be repeated; "
+             "directories are walked recursively for *.md/*.mdc up to "
+             "depth 8). Relative paths resolve against --workspace. "
+             "When omitted, walks the default candidate list at the "
+             "workspace root.",
+    )
+    p_memory_import.add_argument(
+        "--workspace", default=_default_path,
+        help="Workspace to import into (default: $VECTR_WORKSPACE or cwd)",
+    )
+    p_memory_import.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Print exactly what would be created and change nothing. "
+             "Use this first: it writes to the one store the user cannot "
+             "easily reconstruct.",
     )
 
     p_connect = sub.add_parser(
@@ -4494,10 +4773,13 @@ def main() -> None:
         "forget":  cmd_forget,
         "remember": cmd_remember,
         "recall":  cmd_recall,
+        "anchor":  cmd_anchor,
+        "unanchor": cmd_unanchor,
         "resume":  cmd_resume,
         "hook":    cmd_hook,
         "key":     cmd_key,
         "cache":   cmd_cache,
+        "memory":  cmd_memory,
         "connect": cmd_connect,
         "proxy":   cmd_proxy,
     }

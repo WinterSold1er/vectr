@@ -224,6 +224,62 @@ def test_declared_trigger_glob_wildcard_matches_via_matcher():
     assert cands[0].structural_tier == STRUCTURAL_TIER_DECLARED_TRIGGER
 
 
+def test_declared_trigger_wildcard_renders_the_matching_glob():
+    """UPG-MATCHER-RELATIVE-ANCHOR-LABEL: the provenance label names the
+    form that ACTUALLY matched. A '*.py' glob must render as
+    "triggers on *.py", not as the concrete basename it happened to hit —
+    before this fix the line claimed "triggers on resolver.py", overstating
+    a package-wide declaration as a single-file one."""
+    n = _note(41, "package-wide caveat", triggers=[{"path": "*.py"}])
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    cands = _matcher(src, semantic_note=False, code_search=False).match(w)
+    assert len(cands) == 1
+    assert "triggers on *.py" in cands[0].line
+
+
+def test_full_path_declared_anchor_renders_the_declared_string():
+    """UPG-MATCHER-RELATIVE-ANCHOR-LABEL: an anchor authored as the exact
+    window path renders as itself ("anchored to /abs/resolver.py"), not as
+    the basename the match never used."""
+    n = _note(42, "the backoff cap here needs tuning")
+    n.anchors = [["/abs/resolver.py", None]]
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    cands = _matcher(src, semantic_note=False, code_search=False).match(w)
+    assert len(cands) == 1
+    assert "anchored to /abs/resolver.py" in cands[0].line
+    assert cands[0].anchor_path == "/abs/resolver.py"
+
+
+def test_basename_and_full_path_both_declared_still_render_basename():
+    """UPG-MATCHER-RELATIVE-ANCHOR-LABEL preserves the pre-change label when
+    BOTH forms are declared: only the case where the basename was never
+    declared switched to reporting the matched string."""
+    n = _note(43, "the backoff cap here needs tuning")
+    n.anchors = [["resolver.py", None], ["/abs/resolver.py", None]]
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    cands = _matcher(src, semantic_note=False, code_search=False).match(w)
+    assert len(cands) == 1
+    assert "anchored to resolver.py" in cands[0].line
+
+
+def test_tiebreak_signals_stay_keyed_to_the_basename():
+    """UPG-MATCHER-RELATIVE-ANCHOR-LABEL must be label-only: a note whose
+    prose names resolver.py twice keeps counting 2 mentions even though its
+    label now renders a wildcard glob, so gate.py's equal-score ordering
+    inputs are byte-for-byte what they were before the label change."""
+    n = _note(44, "resolver.py lock drops on scope exit; see resolver.py docs",
+              triggers=[{"path": "*.py"}])
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    c = _matcher(src, semantic_note=False, code_search=False).match(w)[0]
+    assert "triggers on *.py" in c.line
+    assert c.path_mention_count == 2
+    assert c.path_mention_first_offset == 0
+
+
 def test_declared_anchor_still_wins_over_a_declared_trigger_on_the_same_note():
     """When a note declares BOTH an exact anchor and a (broader) trigger
     glob for the same file, the stronger anchor relation wins -- matching
@@ -246,6 +302,66 @@ def test_declared_trigger_candidate_does_not_carry_anchor_path():
     w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
     c = _matcher(src, semantic_note=False, code_search=False).match(w)[0]
     assert c.anchor_path is None
+
+
+# -- UPG-PROXY-WEAK-TIER-TIEBREAK: relevance-bearing equal-score signals -----
+#
+# Every Tier-C candidate carries the SAME flat score (structural_scores.
+# mention), so the gate's per-event weak-item cap was admitting whichever
+# candidate an irrelevant input-order tie-break happened to surface first
+# (16/20 admitted items measured off-topic). The matcher now stamps each
+# structural candidate with HOW HARD its note talks about the matched file —
+# path-boundary basename mentions, and where the first one lands — as
+# tie-break-ONLY signals (they never touch score or the floor; see
+# agent/proactive/gate.py's step-5 sort).
+
+def test_mention_candidate_carries_mention_count_and_first_offset():
+    n = _note(30, "resolver.py lock drops on scope exit; see resolver.py docs too")
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    c = _matcher(src, semantic_note=False, code_search=False).match(w)[0]
+    assert c.structural_tier == STRUCTURAL_TIER_MENTION
+    # The subject names its file twice, starting at character 0.
+    assert c.path_mention_count == 2
+    assert c.path_mention_first_offset == 0
+
+
+def test_gotcha_mention_candidate_carries_the_same_signals_midprose():
+    n = _note(31, "watch out near resolver.py: the retry timeout is 30s", kind="gotcha")
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    c = _matcher(src, semantic_note=False, code_search=False).match(w)[0]
+    assert c.structural_tier == STRUCTURAL_TIER_GOTCHA_MENTION
+    # "watch out near " is 15 characters.
+    assert c.path_mention_count == 1
+    assert c.path_mention_first_offset == 15
+
+
+def test_silent_anchored_note_keeps_the_inert_defaults():
+    """A declared anchor whose prose never spells the filename out has no
+    honest basename occurrence to count — the signals stay at their inert
+    defaults (count 0, offset -1) rather than being fabricated."""
+    n = _note(32, "the backoff cap here needs tuning")
+    n.anchors = [["resolver.py", None]]
+    src = _Source(structural=[n])
+    w = ProactiveWindow(text="", file_paths=["/abs/resolver.py"], symbols=[])
+    c = _matcher(src, semantic_note=False, code_search=False).match(w)[0]
+    assert c.structural_tier == STRUCTURAL_TIER_DECLARED_ANCHOR
+    assert c.path_mention_count == 0
+    assert c.path_mention_first_offset == -1
+
+
+def test_non_structural_candidates_never_carry_tiebreak_signals():
+    r = SearchResult(file_path="a.py", lines="1-2", symbol_name="", language="python",
+                     score=0.6, content="code")
+    src = _Source(semantic=[(_note(33, "workspace lock flow"), 0.8)], code=[r])
+    w = ProactiveWindow(text="how does the workspace lock work")
+    cands = _matcher(src, structural_note=False).match(w)
+    assert {c.kind for c in cands} == {"note_semantic", "code_semantic"}
+    for c in cands:
+        assert c.kind != "note_structural"
+        assert c.path_mention_count == 0
+        assert c.path_mention_first_offset == -1
 
 
 def test_semantic_note_respects_floor():

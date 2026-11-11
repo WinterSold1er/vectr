@@ -16,6 +16,10 @@ Verifies that:
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -125,17 +129,48 @@ class TestMainRenderingUnchanged:
         )
 
 
+@contextlib.contextmanager
+def _exclusive_source_tree_build():
+    """Serialize wheel builds of the source tree across CONCURRENT pytest processes.
+
+    `--outdir` isolates the OUTPUT, but the setuptools.build_meta backend still
+    works in the source tree: it writes `vectr.egg-info/` and `build/` under the
+    repo root, which is shared by every process building the same checkout. Two
+    full suites running at once (the sentinel workflow runs lane suites in
+    parallel by design) therefore race on those directories, and one build sees
+    the other's half-written state — observed as this test failing in a
+    concurrent pair while passing in isolation, which is the
+    UPG-TEST-CONCURRENT-SUITE-FLAKE shape.
+
+    A lock keeps the test building the REAL tree, which is the whole point of a
+    packaging test: copying a curated subset elsewhere would stop it catching
+    exactly the pyproject misconfiguration it exists to catch. The lock file
+    lives outside the repo (keyed by the repo path, so separate checkouts and
+    worktrees don't serialize against each other) and is never cleaned up: an
+    empty lock file is the cheap, race-free way to hold a cross-process flock.
+    """
+    key = hashlib.sha256(str(_REPO_ROOT).encode()).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"vectr-wheel-build-{key}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # releases the flock
+
+
 class TestPackagingIncludesTemplates:
     """agent/templates/*.* ship in the built wheel (not just present on the
     checkout's disk)."""
 
     def test_wheel_contains_all_template_files(self, tmp_path: Path) -> None:
-        result = subprocess.run(
-            [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path), str(_REPO_ROOT)],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        with _exclusive_source_tree_build():
+            result = subprocess.run(
+                [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path), str(_REPO_ROOT)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
         assert result.returncode == 0, f"wheel build failed:\n{result.stdout}\n{result.stderr}"
 
         wheels = list(tmp_path.glob("*.whl"))

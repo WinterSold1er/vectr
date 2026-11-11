@@ -42,8 +42,9 @@ from tests._proactive_upstream import MockUpstream
 
 _BASE = dict(
     enabled=True, min_similarity=0.35, max_items_per_event=3, max_chars_per_event=800,
-    cooldown_items=30, matcher_structural_note=True, matcher_semantic_note=True,
-    matcher_code_search=False, proxy_enabled=True, proxy_host="127.0.0.1", proxy_port=19000,
+    cooldown_items=30, cooldown_ttl_seconds=None,
+    matcher_structural_note=True, matcher_semantic_note=True,
+    matcher_code_search=False, proxy_host="127.0.0.1", proxy_port=19000,
     proxy_upstream_base_url="http://upstream", proxy_connect_timeout_s=10.0,
     proxy_read_timeout_s=600.0, proxy_inject=True, proxy_inject_budget_ms=20000,
     proxy_inject_provider_timeout_fraction=0.8, proxy_inject_provider_timeout_max_s=2.0,

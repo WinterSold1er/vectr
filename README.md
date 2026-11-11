@@ -11,10 +11,10 @@
 [![CI](https://github.com/swapnanil/vectr/actions/workflows/ci.yml/badge.svg)](https://github.com/swapnanil/vectr/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue.svg)](https://www.python.org/downloads/)
-[![Version 1.9.0](https://img.shields.io/badge/version-1.9.0-blue.svg)](CHANGELOG.md)
-[![MCP: 19 tools](https://img.shields.io/badge/MCP-19%20tools-blue.svg)](#19-mcp-tools)
+[![Version 1.12.0](https://img.shields.io/badge/version-1.12.0-blue.svg)](CHANGELOG.md)
+[![MCP: 23 tools](https://img.shields.io/badge/MCP-23%20tools-blue.svg)](#23-mcp-tools)
 
-Version 1.9.0 · Last updated 2026-08-07 · [CHANGELOG](CHANGELOG.md)
+Version 1.12.0 · Last updated 2026-09-03 · [CHANGELOG](CHANGELOG.md)
 
 ## In 30 seconds
 
@@ -161,7 +161,6 @@ Exposes port 8765. Docker does not auto-write IDE config files, so use the local
 | Cline | Manual, see below | Experimental |
 | Continue | Manual, see below | Experimental |
 | Codex CLI | Auto: `.codex/config.toml`, `AGENTS.md` guidance, and `.codex/hooks.json` (`vectr init --hooks`) | Experimental |
-| DeepSeek Harness | Auto: `~/.dsh/profiles/<profile>/cordis.patch.yml` (`mcp-client.vectr` insert row) + `AGENTS.md` guidance; session hooks via `vectr init --hooks` (`hooks-claude-code` bridge row, 4 of 6 events) | Experimental |
 
 "Verified" means the full integration (config, guidance, and hooks) has been exercised end to end. "Experimental" means the MCP config is written and works, but the integration has not been run through the same verification pass.
 
@@ -202,28 +201,6 @@ url = "http://localhost:8765/mcp"
 ```
 On its first run in the workspace, Codex shows a one-time interactive prompt to trust the project before it loads a project-scoped config. If you also ran `vectr init --hooks`, Codex shows a second one-time prompt to trust the hook commands. Both persist after you accept them once, and a config writer cannot clear them for you without weakening your security posture.
 
-**DeepSeek Harness (dsh)**, the active profile's `~/.dsh/profiles/<profile>/cordis.patch.yml` (written automatically by `vectr start` when `~/.dsh` exists; profile from `$DSH_PROFILE` / `$VECTR_DSH_PROFILE`, default `web`):
-```yaml
-- insert:
-    - id: mcp-client.vectr
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: vectr
-        transport: streamable-http
-        url: http://localhost:8765/mcp
-```
-Restart the dsh server (or reload its profile) once to pick up the new plugin row. The `AGENTS.md` vectr block written into the workspace doubles as dsh guidance, since dsh auto-loads `AGENTS.md`/`CLAUDE.md` from the workspace.
-
-**dsh session hooks** — `vectr init --hooks` also writes a `hooks-claude-code` bridge row into the same `cordis.patch.yml`, pointing dsh's Claude Code hook bridge at this workspace's `.claude/settings.json`:
-```yaml
-- insert:
-    - id: hooks-claude-code
-      name: '@deepseek-ai/dsh-hooks-claude-code'
-      config:
-        configPath: /absolute/path/to/workspace/.claude/settings.json
-```
-dsh runs vectr's `vectr hook <event>` commands on its own interception points (session start, per prompt, before read/edit, after tool use), so memory auto-injection and episode capture work as on Claude Code. **4 of 6 events** carry over: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` fire; `PreCompact` and `PostToolUseFailure` are not yet supported by dsh's bridge and are skipped. `configPath` is read once at dsh server load (process-level, not per-session), so restart the dsh server after `vectr init --hooks`.
-
 </details>
 
 ### Stdio transport
@@ -241,37 +218,16 @@ No port, no daemon: a single foreground process framed as newline-delimited JSON
 ## How it works
 
 1. **AST-aware chunking.** tree-sitter parses each file and splits at function, class, and method boundaries. No chunk breaks mid-logic.
-2. **Code embeddings.** `ibm-granite/granite-embedding-english-r2` by default (local, CPU-fast; any model or API provider can be configured — see *Choosing the embedding model*) maps natural-language queries to code symbols, so "JWT validation" finds `verify_jwt_token`. BM25 handles exact symbol names.
+2. **Code embeddings.** `ibm-granite/granite-embedding-english-r2` (local, CPU-fast, overridable) maps natural-language queries to code symbols, so "JWT validation" finds `verify_jwt_token`. BM25 handles exact symbol names.
 3. **Hybrid search.** Vector similarity and BM25 combined, weighted by codebase characteristics. Large and unfamiliar leans semantic, small and well-documented leans BM25.
 4. **Symbol graph.** Call edges, import chains, and HTTP routes (Flask, FastAPI, Express, Spring) are extracted and stored. `vectr_locate` resolves a name through a 6-strategy cascade: exact match, suffix, same-module, import-chain, substring, then fuzzy. A fuzzy answer is always rendered as explicitly inexact rather than presented as a confident match, because a confident wrong symbol is worse than a not-found.
 5. **Working memory.** `vectr_remember` stores structured notes to SQLite and ChromaDB. `vectr_recall` runs semantic search over notes rather than a SQL LIKE, so multi-word queries still find the relevant context.
 6. **Trigger evaluation.** Each note's conditions are checked deterministically by the daemon at lifecycle moments, with a per-session fire ledger and injection budgets, so a note resurfaces exactly when it applies and never twice in the same window.
-7. **MCP protocol.** 19 tools served over HTTP. Any MCP-compatible AI code editor connects without plugins.
-
-### Choosing the embedding model
-
-The embedding model is configuration, not a constant. The first of these that is set wins:
-
-1. `VECTR_EMBED_MODEL` (environment).
-2. `.vectr/config.yaml` in the workspace.
-3. `~/.vectr/config.yaml`.
-4. vectr's bundled default — `ibm-granite/granite-embedding-english-r2`, local and keyless.
-
-```yaml
-# .vectr/config.yaml
-embedding:
-  model: google/gemini-embedding-2  # the prefix selects the provider
-  output_dimensionality: 3072       # optional; null (default) keeps the provider's own size
-  api_key_env: GEMINI_API_KEY       # optional; the name of the key's environment variable
-```
-
-The spec picks the provider: a bare `org/model` runs locally through sentence-transformers, and `voyage*`, `openai/<model>` or `google/<model>` call their APIs. The Google provider calls `batchEmbedContents` and needs a key in `GEMINI_API_KEY` (or whatever `api_key_env` names) or in `~/.vectr/secrets.json` as `{"gemini_api_key": "..."}` — keep that file mode 600, and note the key value is never written to a log.
-
-Changing the model changes the vector space, so vectr rebuilds rather than mixing vectors: the code index is dropped and re-embedded, and working-memory note vectors are re-embedded in place from their SQLite rows. Your notes are never deleted by a model change.
+7. **MCP protocol.** 23 tools served over HTTP. Any MCP-compatible AI code editor connects without plugins.
 
 ---
 
-## 19 MCP tools
+## 23 MCP tools
 
 `vectr start` writes a guidance file into your workspace with this table, so your AI code editor knows which tool to reach for without being prompted.
 
@@ -292,7 +248,10 @@ Changing the model changes the vector space, so vectr rebuilds rather than mixin
 | Situation | Tool |
 |---|---|
 | Notes exist from a prior session | `vectr_recall(query)`, semantic vector search rather than substring match, two-tier (crisp index by default, expand one note with `note_id=N` or all bodies with `detail='full'`) |
+| One note must survive every recall regardless of the query | `vectr_pin(note_id=N)`, which places it in Tier 0 so it is injected on every `vectr_recall(query=...)` call. Bounded, so pin sparingly. `vectr_remember(..., pin=true)` does the same at write time |
 | You found something worth preserving | `vectr_remember(content, tags, priority, kind, title, agent)`. `kind` controls delivery: `directive` fires unconditionally every session, `task` carries current-work state, `gotcha` resurfaces when its file is touched, `operational` covers build and environment facts, `finding` (the default) is relevance-ranked, `reference` is a pointer, and `decision` is an architectural decision recallable as a chronological ADR-style timeline via `vectr_recall(kind="decision", sort_by="chronological")`. `title` labels the note in index output, and `agent` attributes it to a subagent or orchestrator |
+| A stored note turns out to be about a file you did not declare | `vectr_anchor(note_id=N, anchors=[...])`, attaching file anchors to an existing note without re-storing it. Idempotent, hashed at write time, and it emits no lifecycle event, so the note's history stays clean (also `vectr anchor --id N PATH...` on the CLI) |
+| A stored note was anchored to the wrong file, or the anchored file's relevance is gone | `vectr_unanchor(note_id=N, anchors=[...])`, the inverse of `vectr_anchor`. Removes file paths from a note's anchor set; a removed anchor simply stops being a staleness candidate, never a claim that the note is wrong. Idempotent, paths the note was never anchored to are reported back rather than treated as failures |
 | Starting a session, want to pick up where you left off | `vectr_resume()`, returning the most recent task note, the latest snapshot, and open gotchas with their file anchors in one call (also `vectr resume` on the CLI) |
 | Context is filling up | `vectr_evict_hint()`, which identifies chunks vectr can re-retrieve, with the exact re-fetch ids |
 | A chunk shown earlier has left your context | `vectr_fetch(ids=[...])`, a deterministic byte-verbatim re-fetch by id, with no re-search and no file re-read. Flags a truncation warning if the index itself stored a capped chunk |
@@ -302,6 +261,7 @@ Changing the model changes the vector space, so vectr rebuilds rather than mixin
 | An auto-captured note has been reviewed and still holds | `vectr_promote(note_id=N)`, raising its trust class one step from `auto` to `agent`. Promotion to `human` is reserved for user-side surfaces, never the agent's call |
 | Automatically captured failure-to-success moments are waiting | `vectr_distill()`, which renders pending arcs (a command failed, then passed after an edit) for review. Persist a lesson with `vectr_remember(..., distilled_from=[arc_id])` or dismiss with `vectr_distill(dismiss=[...], reason)` |
 | A stored note turned out to be wrong | `vectr_revoke(note_id=N, reason)`, which keeps the note visible as a deterrent ("previously believed ..., revoked ...") instead of deleting it, so the mistake is not silently re-derived. `vectr_remember(contradicts=N)` corrects and revokes in one step |
+| A note is simply out of date, not wrong | `vectr_supersede(note_id=N, successor_note_id=M)`, which retires it in favour of a newer note without revoke's "proven wrong" framing. The audit trail records post-hoc retirement distinctly from write-time supersession, and `vectr_reinstate` reverses it |
 | A revoked note was right after all | `vectr_reinstate(note_id=N)`, restoring the original content |
 
 ### Triggers: the delivery layer
@@ -341,11 +301,39 @@ vectr resume                          # most recent task note, latest snapshot, 
 vectr init --path .                   # write guidance file + MCP config without starting
 vectr init --exclude vendor           # exclude directories from indexing
 vectr forget --path .                 # delete all working-memory notes
+vectr memory export                   # render the working-memory store as a greppable, git-diffable markdown file (default MEMORY.md)
+vectr memory export --path notes.md   # write the export to a specific file
+vectr memory export --disable         # stop the auto-refresh that keeps the export file in sync
+vectr memory edit                     # open the working-memory store in your $EDITOR, one block per note
+vectr memory import                   # bring existing on-disk memory files into the working-memory store (see below)
+vectr memory import --path NOTES.md   # import a specific file instead of the default discovery list
+vectr memory import --dry-run         # preview what would be created (kind, title, source file, line range), change nothing
 vectr cache prune                     # remove empty per-workspace cache dirs (live instances skipped)
 vectr cache prune --dry-run           # preview what would be removed, delete nothing
 vectr proxy                           # experimental: localhost API proxy (see below)
 vectr mcp-stdio                       # foreground stdio MCP transport, no port or daemon (see above)
 ```
+
+### Importing existing memory
+
+`vectr memory export` and `vectr memory edit` are the one-way-out and check-out/check-in paths. `vectr memory import` is the one-way-in: it brings existing on-disk memory into the working-memory store without re-entering it by hand. This is the on-ramp for a new user who already has memory written down.
+
+**Discovery.** With no `--path`, the importer walks a closed list of default candidate files at the workspace root: `MEMORY.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md`. Pass `--path` (repeatable) to point at any other file or directory; a directory is walked recursively for `*.md` and `*.mdc` files. Files that don't exist are reported but never raised on, since most workspaces will not have every default file.
+
+**Granularity.** A source file is not one note and not one note per line. It is split at Markdown heading boundaries (`^#{1,6}\s+`), the same way a human skims a `MEMORY.md`. A heading-less file becomes one note. Headings inside fenced code blocks and HTML comment blocks are skipped, so a code example or the export-file header comment does not become a section boundary. A file previously exported by `vectr memory export` is detected by its `<!-- Generated by ... -->` header and parsed through the same block grammar `vectr memory edit` uses, recovering each original block as a note with its declared `kind`, `priority`, `tags`, and `provenance` carried forward.
+
+**Dry run.** `--dry-run` prints exactly what would be created (kind, title, source file, source-line range, provenance) and changes nothing. Memory is the one resource the user cannot easily reconstruct, so dry run is the path of first resort:
+
+```bash
+vectr memory import --dry-run
+# + [finding/auto] 'Project conventions'  (MEMORY.md:12-34)
+# + [operational/agent] 'Test runner'  (CLAUDE.md:5-9)
+# DRY RUN: would create 2 note(s), skip 0 already-imported, ...
+```
+
+**Idempotency.** Every imported note carries a `src:`, `src-sha:`, and `src-lines:` tag triple. A re-run of `vectr memory import` against an unchanged source file recognizes those tags and creates zero new notes. Editing a section of the source file produces a new body whose hash does not match the stored one, so it becomes a new note, and the old one is left untouched, since silently deleting a prior import behind the user's back is exactly the silent loss the design defends against on the export side.
+
+**Provenance.** Imported notes carry a source-file tag (`imported` and `src:FILENAME`, where FILENAME is the basename of the source file), so a recall that lists a note carrying `imported` is telling the user "this came from a file, not from this session's observations." The note's `provenance` defaults to `auto`, the class machine-captured facts with no reviewing judgment already carry, since a hand-written `MEMORY.md` is structurally indistinguishable from a generator's output to a parser. The exception is narrow and structural, not semantic: a note whose body contains imperative-rule markers (the closed keyword set `MUST`, `MUST NOT`, `NEVER`, `ALWAYS`, `DO NOT`, `DON'T`, `REQUIRED`, `FORBIDDEN`) is classified as `kind="directive"` and upgraded to `provenance="agent"`. The reason is the `auto + directive` write-time guard in `remember()`: an unreviewed standing rule is a contradiction in terms, and an imported rule is exactly that pair. Promoting to `agent` is the smallest possible deviation from `auto`, exactly enough to satisfy the guard, and the user promotes further with `vectr_promote` after review.
 
 ---
 

@@ -385,6 +385,8 @@ def _put_port_in_time_wait(port_hint: int = 0) -> int:
     then close from the server side first. Returns the port. Uses `port_hint`
     (default 0 = kernel-assigned ephemeral) so callers never hardcode a port
     that could collide with a live daemon."""
+    from tests.conftest import allow_loopback_port
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port_hint))
@@ -398,12 +400,16 @@ def _put_port_in_time_wait(port_hint: int = 0) -> int:
         time.sleep(0.2)
         c.close()
 
-    t = threading.Thread(target=_client)
-    t.start()
-    conn, _addr = srv.accept()
-    conn.recv(2)
-    conn.close()  # server side closes first -> this port lands in TIME_WAIT
-    t.join()
+    # The client dials this test's OWN just-bound listener — register it with
+    # the suite-wide socket guard (tests/conftest.py) for exactly the dance's
+    # duration, like every other test-owned loopback server.
+    with allow_loopback_port(port):
+        t = threading.Thread(target=_client)
+        t.start()
+        conn, _addr = srv.accept()
+        conn.recv(2)
+        conn.close()  # server side closes first -> this port lands in TIME_WAIT
+        t.join()
     srv.close()
     time.sleep(0.05)
     return port
@@ -431,3 +437,68 @@ def test_find_free_port_reuses_time_wait_port_end_to_end(registry):
     got = registry.find_free_port("aaa000000000", port)
 
     assert got == port
+
+
+# ---------------------------------------------------------------------------
+# UPG-TEST-REGISTRY-NOT-ISOLATED: a unit test must never see the developer's
+# real instance registry. The session-scoped `_isolated_instance_registry`
+# fixture (tests/conftest.py) wraps `InstanceRegistry.__init__` so a no-arg
+# `InstanceRegistry()` lands in a per-session tmp dir instead of
+# `Path.home() / ".vectr" / "instances.json`. This block pins that property:
+# (a) the no-arg default is NOT the developer's real path, and (b) tests
+# that pass an explicit `registry_path=` still get the path they asked for
+# (the wrapper does not silently redirect explicit callers).
+# ---------------------------------------------------------------------------
+
+def test_no_arg_default_is_not_developers_real_registry(tmp_path):
+    """`InstanceRegistry()` with no args must point at a per-session tmp
+    file, never at the developer's real `~/.vectr/instances.json`. A test
+    that builds the no-arg form and reads/writes it must not see the live
+    daemon's entry on port 8765 and must not corrupt the user's real file."""
+    from agent import instance_registry
+
+    real_default = instance_registry.REGISTRY_PATH
+
+    reg = InstanceRegistry()
+    assert reg._path != real_default, (
+        f"no-arg InstanceRegistry() fell through to the developer's real "
+        f"registry ({reg._path}); the _isolated_instance_registry fixture "
+        f"in tests/conftest.py did not redirect it."
+    )
+    # And: the redirected path must NOT live under Path.home()/.vectr/ — the
+    # whole point of the fixture is to keep the unit run off the developer's
+    # home tree.
+    home_vectr = Path.home() / ".vectr"
+    assert not (reg._path == home_vectr / "instances.json"), (
+        f"no-arg InstanceRegistry() still resolves under {home_vectr}; the "
+        f"session isolation did not engage."
+    )
+
+
+def test_explicit_registry_path_still_honored(tmp_path):
+    """An explicit `registry_path=` from a test or product caller must
+    win — the wrapper only substitutes when the caller passed nothing. A
+    test that names its own tmp_path must keep that path, not be silently
+    redirected to the session-default location."""
+    explicit = tmp_path / "explicit.json"
+    reg = InstanceRegistry(registry_path=explicit)
+    assert reg._path == explicit, (
+        f"explicit registry_path= was overridden: expected {explicit}, "
+        f"got {reg._path}"
+    )
+
+
+def test_no_arg_register_and_read_stays_within_isolated_path(tmp_path):
+    """End-to-end pin: a no-arg `InstanceRegistry()` registers an entry,
+    re-reads it, and the on-disk file is the redirected (tmp) path — not
+    the developer's real one. Proves the fixture covers the read+write
+    surface, not just the constructor."""
+    reg = InstanceRegistry()
+    reg.register("abc123456789", "/project/a", 8765, 12345)
+    # The write went to the redirected path, not the real one.
+    assert reg._path.exists(), f"expected write at {reg._path}"
+    real_path = Path.home() / ".vectr" / "instances.json"
+    assert reg._path != real_path, (
+        f"a unit test wrote to the developer's real registry ({real_path}); "
+        f"isolation failed."
+    )

@@ -49,8 +49,19 @@ from typing import Iterable, TypedDict
 # appending a `reinstated` event (no separate "un-expire" event kind
 # needed; `reinstated` already means "return to active" regardless of
 # which terminal state preceded it).
+# `superseded_post_hoc` (UPG-NOTE-RETIRE-POST-HOC): the same lifecycle
+# transition as `superseded` — a note retires because its substance was
+# replaced — but recorded when the link is asserted AFTER both notes
+# already existed (the replacement was written without supersedes=, and a
+# caller later judges the old note already-superseded-in-substance), via
+# `WorkingContextStore.supersede_note()` / `vectr_supersede`. A distinct
+# KIND, not a payload convention on `superseded`, so the audit trail stays
+# machine-queryable about which retirements were post-hoc judgments; it
+# folds to the SAME "superseded" state (no fourth lifecycle state is added),
+# so every rendering surface treats the two identically.
 NOTE_EVENT_KINDS: tuple[str, ...] = (
     "created", "superseded", "revoked", "stale_flagged", "reinstated", "promoted", "expired",
+    "superseded_post_hoc",
 )
 
 # Who proposed a transition. Vectr never decides a revocation/reinstatement
@@ -62,13 +73,16 @@ NOTE_EVENT_ACTORS: tuple[str, ...] = ("agent", "human", "system")
 
 # The subset of NOTE_EVENT_KINDS that changes fold()'s lifecycle state, and
 # the state each one sets. stale_flagged/promoted are intentionally absent —
-# see the NOTE_EVENT_KINDS docstring above.
+# see the NOTE_EVENT_KINDS docstring above. `superseded_post_hoc` lands on
+# the same "superseded" state as write-time `superseded` (UPG-NOTE-RETIRE-
+# POST-HOC) — only the audit kind differs, never the resulting state.
 _LIFECYCLE_STATE_AFTER: dict[str, str] = {
     "created": "active",
     "superseded": "superseded",
     "revoked": "revoked",
     "reinstated": "active",
     "expired": "expired",
+    "superseded_post_hoc": "superseded",
 }
 
 # The fold's possible lifecycle states — every note is exactly one of these

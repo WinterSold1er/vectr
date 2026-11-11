@@ -167,6 +167,41 @@ class TestRememberRoute:
         assert resp.status_code == 422
         assert resp.json()["detail"]["error"] == "invalid_memory_object"
 
+    # -- UPG-RELATED-REVOKED-DETERRENT ---------------------------------------
+
+    def test_remember_response_carries_revoked_related_field(self, client) -> None:
+        """`/v1/remember`'s response model exposes `revoked_related`
+        end-to-end from `RememberOutcome.revoked_related` (app/routes.py),
+        distinct from and alongside `related` — a REST-layer test, not just
+        the MCP dispatch/service-layer coverage in test_mcp_server.py and
+        test_remember_extras.py (MCP-green is not REST-green)."""
+        from api import app
+        from app.service import RememberOutcome
+        app.state.service.remember_with_extras.return_value = RememberOutcome(
+            note_id=42,
+            related=[],
+            revoked_related=[{
+                "note_id": 7, "title": "an older note that was revoked",
+                "similarity": 0.86, "revoked_date": "2026-08-01",
+                "reason": "turned out to be wrong",
+            }],
+            proxy_anchor_suggestions=[],
+        )
+        resp = client.post("/v1/remember", json={"content": "a new note"})
+        assert resp.status_code == 200
+        revoked = resp.json()["revoked_related"]
+        assert len(revoked) == 1
+        assert revoked[0] == {
+            "note_id": 7, "title": "an older note that was revoked",
+            "similarity": 0.86, "revoked_date": "2026-08-01",
+            "reason": "turned out to be wrong",
+        }
+
+    def test_remember_response_revoked_related_defaults_to_empty_list(self, client) -> None:
+        resp = client.post("/v1/remember", json={"content": "a plain note"})
+        assert resp.status_code == 200
+        assert resp.json()["revoked_related"] == []
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/recall
@@ -882,6 +917,128 @@ class TestReinstateRoute:
 
     def test_reinstate_nonexistent_note_returns_404(self, client_real_memory) -> None:
         resp = client_real_memory.post("/v1/reinstate", json={"note_id": 999999})
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/supersede (UPG-NOTE-RETIRE-POST-HOC)
+# ---------------------------------------------------------------------------
+
+class TestSupersedeRoute:
+    def test_supersede_returns_200_with_mocked_service(self, client) -> None:
+        resp = client.post(
+            "/v1/supersede", json={"note_id": 1, "superseded_by": 2, "reason": "replaced in substance"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["note_id"] == 1
+        assert "processing_ms" in data
+
+    def test_supersede_invalid_actor_returns_422(self, client) -> None:
+        # 'system' is reserved for the deterministic transitions — deciding a
+        # stored note is already-superseded is always a judgment call.
+        resp = client.post("/v1/supersede", json={"note_id": 1, "actor": "system"})
+        assert resp.status_code == 422
+
+    def test_supersede_missing_successor_returns_422(self, client_real_memory) -> None:
+        # Validated BEFORE any mutation: the target must be untouched.
+        client = client_real_memory
+        note_id = client.post("/v1/remember", json={"content": "a finding"}).json()["note_id"]
+        resp = client.post("/v1/supersede", json={"note_id": note_id, "superseded_by": 999999})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "invalid_supersedence"
+        recalled = client.post("/v1/recall", json={"detail": "full"}).json()["notes"]
+        assert "a finding" in recalled  # still active — nothing half-applied
+
+    def test_supersede_via_rest_excludes_from_default_recall(self, client_real_memory) -> None:
+        client = client_real_memory
+        old_id = client.post("/v1/remember", json={"content": "the API returns a list"}).json()["note_id"]
+        new_id = client.post("/v1/remember", json={"content": "the API returns a dict"}).json()["note_id"]
+        resp = client.post(
+            "/v1/supersede",
+            json={"note_id": old_id, "superseded_by": new_id, "actor": "human", "reason": "consolidated"},
+        )
+        assert resp.status_code == 200
+        default_recall = client.post("/v1/recall", json={}).json()["notes"]
+        assert "the API returns a list" not in default_recall
+
+    def test_supersede_human_actor_accepted_on_agent_provenance_note(self, client_real_memory) -> None:
+        # REST is the person-operated surface: actor="human" on an
+        # agent-provenance note is legal (only the reverse — agent actor on
+        # a human-provenance note — crosses the write boundary).
+        client = client_real_memory
+        note_id = client.post("/v1/remember", json={"content": "a finding"}).json()["note_id"]
+        resp = client.post("/v1/supersede", json={"note_id": note_id, "actor": "human"})
+        assert resp.status_code == 200
+
+    def test_reinstate_reverses_supersede_via_rest(self, client_real_memory) -> None:
+        client = client_real_memory
+        note_id = client.post("/v1/remember", json={"content": "wrongly retired"}).json()["note_id"]
+        other_id = client.post("/v1/remember", json={"content": "unrelated"}).json()["note_id"]
+        client.post("/v1/supersede", json={"note_id": note_id, "superseded_by": other_id})
+        resp = client.post("/v1/reinstate", json={"note_id": note_id, "reason": "retirement was wrong"})
+        assert resp.status_code == 200
+        recalled = client.post("/v1/recall", json={"detail": "full"}).json()["notes"]
+        assert "wrongly retired" in recalled
+
+    def test_supersede_nonexistent_note_returns_404(self, client_real_memory) -> None:
+        resp = client_real_memory.post("/v1/supersede", json={"note_id": 999999})
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/pin (UPG-RECALL-MISS-FLOOR part (b)) — explicit Tier 0 membership
+# ---------------------------------------------------------------------------
+
+class TestPinRoute:
+    def test_pin_returns_200_with_mocked_service(self, client) -> None:
+        resp = client.post("/v1/pin", json={"note_id": 1})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["note_id"] == 1
+        assert data["pinned"] is True
+        assert "processing_ms" in data
+
+    def test_pin_defaults_pinned_true(self, client) -> None:
+        resp = client.post("/v1/pin", json={"note_id": 1})
+        assert resp.status_code == 200
+        assert resp.json()["pinned"] is True
+
+    def test_unpin_via_rest(self, client) -> None:
+        resp = client.post("/v1/pin", json={"note_id": 1, "pinned": False})
+        assert resp.status_code == 200
+        assert resp.json()["pinned"] is False
+
+    def test_pin_via_rest_with_real_store(self, client_real_memory) -> None:
+        client = client_real_memory
+        note_id = client.post("/v1/remember", json={"content": "a finding to pin"}).json()["note_id"]
+        resp = client.post("/v1/pin", json={"note_id": note_id})
+        assert resp.status_code == 200
+        assert resp.json()["pinned"] is True
+
+    def test_unpin_via_rest_with_real_store(self, client_real_memory) -> None:
+        client = client_real_memory
+        note_id = client.post("/v1/remember", json={"content": "a finding to pin"}).json()["note_id"]
+        client.post("/v1/pin", json={"note_id": note_id})
+        resp = client.post("/v1/pin", json={"note_id": note_id, "pinned": False})
+        assert resp.status_code == 200
+        assert resp.json()["pinned"] is False
+
+    def test_pin_at_write_time_via_remember(self, client_real_memory) -> None:
+        """pin=True on /v1/remember is equivalent to a separate /v1/pin call
+        right after the write (UPG-RECALL-MISS-FLOOR part (b))."""
+        client = client_real_memory
+        resp = client.post("/v1/remember", json={"content": "pinned at write time", "pin": True})
+        assert resp.status_code == 200
+        # A second, independent /v1/pin(False) call must actually flip it back
+        # -- proof the write-time pin landed on the real note, not a no-op.
+        note_id = resp.json()["note_id"]
+        unpin = client.post("/v1/pin", json={"note_id": note_id, "pinned": False})
+        assert unpin.status_code == 200
+        assert unpin.json()["pinned"] is False
+
+    def test_pin_nonexistent_note_returns_404(self, client_real_memory) -> None:
+        resp = client_real_memory.post("/v1/pin", json={"note_id": 999999})
         assert resp.status_code == 404
 
 

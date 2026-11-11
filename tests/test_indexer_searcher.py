@@ -333,6 +333,108 @@ class TestCodeIndexer:
         indexer.index_file(path)
         assert path in indexer.indexed_file_paths
 
+    def test_indexed_file_count_reflects_persisted_collection_on_warm_start(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """UPG-STATUS-WARMSTART-FILES: on a warm start (a daemon restart over
+        an already-indexed workspace), `indexed_file_count` must report the
+        persisted corpus immediately — not 0 while `total_chunks` already
+        reports thousands, which made `/v1/status` internally inconsistent for
+        the whole warm-start window. It now derives from the SAME seeded
+        per-language metadata cache `indexed_language_stats()` reads (actual
+        chunk metadata), i.e. exactly what `total_chunks` counts."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+        from tests.conftest import _DummyEmbedProvider
+
+        monkeypatch.setattr(
+            idx_module, "get_embed_provider", lambda _model: _DummyEmbedProvider()
+        )
+        make_py(tmp_path, "a.py", "def a(): pass")
+        make_py(tmp_path, "b.py", "def b(): pass")
+        db = str(tmp_path / "chroma")
+
+        first = CodeIndexer(str(tmp_path), db_path=db)
+        first.index_workspace()
+        assert first.total_chunks > 0
+
+        # The "warm start": a brand-new indexer over the same persisted db,
+        # before anything has been walked in this one.
+        warm = CodeIndexer(str(tmp_path), db_path=db)
+        assert warm.total_chunks > 0
+        assert warm._indexed_files == set()  # nothing walked in this process yet
+        assert warm.indexed_file_count == 2  # was 0 before the fix
+        # Same source of truth as total_chunks: the collection's chunk metadata.
+        stats = warm.indexed_language_stats()
+        assert warm.indexed_file_count == sum(s["files"] for s in stats.values())
+
+    def test_indexed_file_paths_reflect_persisted_collection_on_warm_start(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """UPG-WARMSTART-FINGERPRINT-STARVATION: on a daemon restart over an
+        already-indexed workspace, `indexed_file_paths` must report the
+        persisted corpus immediately. It previously returned `_indexed_files`
+        (the walk-scoped set of files THIS process has walked), which stays
+        empty until an in-process index run touches it — so across the whole
+        warm-start window the strategy fingerprint behind /v1/status and
+        vectr_map's passport render were silently computed from ZERO files,
+        indistinguishable from a genuinely fileless workspace."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+        from tests.conftest import _DummyEmbedProvider
+
+        monkeypatch.setattr(
+            idx_module, "get_embed_provider", lambda _model: _DummyEmbedProvider()
+        )
+        make_py(tmp_path, "a.py", "def a(): pass")
+        make_py(tmp_path, "b.py", "def b(): pass")
+        db = str(tmp_path / "chroma")
+
+        first = CodeIndexer(str(tmp_path), db_path=db)
+        first.index_workspace()
+        assert first.total_chunks > 0
+
+        # The "warm start": a brand-new indexer over the same persisted db,
+        # before anything has been walked in this one.
+        warm = CodeIndexer(str(tmp_path), db_path=db)
+        assert warm._indexed_files == set()  # nothing walked in this process yet
+        paths = warm.indexed_file_paths
+        assert len(paths) == 2, paths
+        assert any(p.endswith("a.py") for p in paths)
+        assert any(p.endswith("b.py") for p in paths)
+        # One source of truth with indexed_file_count (UPG-STATUS-WARMSTART-FILES):
+        # exactly one path per counted file — the two properties can never
+        # disagree again.
+        assert len(paths) == warm.indexed_file_count
+
+    def test_indexed_file_paths_tracks_delta_maintenance(
+        self, indexer, tmp_path,
+    ) -> None:
+        """The metadata-derived indexed_file_paths must keep tracking the
+        incremental `_apply_chunk_delta` maintenance on index/delete, not just
+        the construction-time seed."""
+        path_a = make_py(tmp_path, "a.py", "def a(): pass")
+        indexer.index_file(path_a)
+        assert [p for p in indexer.indexed_file_paths if p.endswith("a.py")]
+        indexer.delete_file(path_a)
+        assert not any(p.endswith("a.py") for p in indexer.indexed_file_paths)
+
+    def test_indexed_file_count_falls_with_total_chunks_through_rebuild(
+        self, indexer, tmp_path,
+    ) -> None:
+        """UPG-STATUS-WARMSTART-FILES: indexed_file_count and total_chunks
+        share one source of truth (the body collection), so a forced
+        `_recreate_collections()` rebuild resets them TOGETHER — the count may
+        never get stuck at its pre-rebuild value while chunks climb back from
+        zero."""
+        make_py(tmp_path, "a.py", "def a(): pass")
+        indexer.index_workspace()
+        assert indexer.indexed_file_count == 1
+        assert indexer.total_chunks > 0
+        indexer._recreate_collections()
+        assert indexer.total_chunks == 0
+        assert indexer.indexed_file_count == 0
+
     def test_indexed_languages_lists_distinct_sorted(self, indexer, tmp_path) -> None:
         # UPG-3.1: ground-truth language set comes from chunk metadata, not a fixed list.
         make_py(tmp_path, "a.py", "def x(): pass")
@@ -408,6 +510,60 @@ class TestCodeIndexer:
             "instead of reading the incrementally-maintained cache"
         )
 
+    def test_chunk_delta_partial_delete_keeps_file_until_last_chunk(
+        self, indexer, tmp_path,
+    ) -> None:
+        """UPG-CHUNK-DELTA-PARTIAL-FILE-DISCARD: `_apply_chunk_delta(sign=-1)`
+        must drop a file from its per-language bucket only when its LAST body
+        chunk goes — never on any deletion batch that merely touches the file.
+        Today every delete site is whole-file (`_delete_chunks_for_file`), so
+        no production path can build the partial batch this test simulates;
+        exercising the bookkeeping directly pins the invariant any future
+        partial-chunk deletion path (incremental re-chunk, per-symbol
+        invalidation, quality-based eviction) must preserve."""
+        path = make_py(tmp_path, "multi.py", "def a(): pass\ndef b(): pass\ndef c(): pass\n")
+        indexer.index_file(path)
+        stats_before = indexer.indexed_language_stats()
+        n_chunks = stats_before["python"]["chunks"]
+        assert n_chunks >= 2, "fixture must produce multiple chunks to split a deletion"
+
+        # Remove all but one of the file's chunks in a single batch.
+        indexer._apply_chunk_delta(
+            [{"language": "python", "file_path": path} for _ in range(n_chunks - 1)],
+            sign=-1,
+        )
+        stats = indexer.indexed_language_stats()
+        assert stats["python"]["files"] == 1, (
+            "a partial-chunk deletion batch must not discard the surviving file"
+        )
+        assert stats["python"]["chunks"] == 1
+        assert path in indexer.indexed_file_paths
+
+        # Removing the last chunk drops the file from its bucket (the
+        # whole-file behaviour every current delete site relies on).
+        indexer._apply_chunk_delta([{"language": "python", "file_path": path}], sign=-1)
+        stats = indexer.indexed_language_stats()
+        assert stats["python"]["files"] == 0
+        assert path not in indexer.indexed_file_paths
+
+    def test_delete_file_whole_file_still_discards_bucket(
+        self, indexer, tmp_path,
+    ) -> None:
+        """Regression guard alongside the partial-delete fix: the public
+        whole-file path (`delete_file` → `_delete_chunks_for_file`) must keep
+        discarding the file from its bucket exactly as before."""
+        path_a = make_py(tmp_path, "a.py", "def a(): pass")
+        path_b = make_py(tmp_path, "b.py", "def b(): pass")
+        indexer.index_file(path_a)
+        indexer.index_file(path_b)
+        assert len(indexer.indexed_file_paths) == 2
+
+        indexer.delete_file(path_a)
+        paths = indexer.indexed_file_paths
+        assert not any(p.endswith("a.py") for p in paths)
+        assert any(p.endswith("b.py") for p in paths)
+        assert indexer.indexed_language_stats()["python"]["files"] == 1
+
     def test_get_all_documents_returns_indexed_content(self, indexer, tmp_path) -> None:
         make_py(tmp_path, "fn.py", """
             def my_special_function():
@@ -450,21 +606,29 @@ class TestCodeIndexer:
         ids, docs, _ = indexer.get_all_documents()
         assert any("v2" in d for d in docs), "Modified file was not re-indexed"
 
-    def test_mtime_cache_persists_across_instances(self, tmp_path) -> None:
-        """A new CodeIndexer pointed at the same workspace must respect the mtime cache."""
+    def test_mtime_cache_persists_across_instances(self, tmp_path, monkeypatch) -> None:
+        """A new CodeIndexer pointed at the same workspace must respect the mtime cache.
+
+        Patches the provider factory rather than assigning `_embed_provider`
+        after construction: `CodeIndexer.__init__` builds a provider eagerly, so
+        post-hoc assignment still pays a real Hugging Face model download first
+        (which made CI fail on an HF 429).
+        """
+        import agent.indexer as idx_module
         from agent.indexer import CodeIndexer
         from tests.conftest import _DummyEmbedProvider
 
+        monkeypatch.setattr(
+            idx_module, "get_embed_provider", lambda _model: _DummyEmbedProvider()
+        )
         db = str(tmp_path / "db")
         make_py(tmp_path, "cached.py", "def cached(): pass")
 
         idx1 = CodeIndexer(str(tmp_path), db_path=db)
-        idx1._embed_provider = _DummyEmbedProvider()
         idx1.index_workspace()
         count_after_first = idx1.total_chunks
 
         idx2 = CodeIndexer(str(tmp_path), db_path=db)
-        idx2._embed_provider = _DummyEmbedProvider()
         idx2.index_workspace()
         assert idx2.total_chunks == count_after_first
 
@@ -2092,6 +2256,219 @@ class TestTxtRstSectionHeadingChunking:
 
 
 # ---------------------------------------------------------------------------
+# UPG-WINDOW-CHUNK-BYTE-CAP — a character cap alongside every line-based cap.
+# A single long source line (minified JS bundle, generated SQL dump, one
+# giant data-fixture line) defeats the window walker's 200-LINE window and
+# produced an unbounded chunk: reproduced on main with django's
+# raster.numpy.txt, which chunks into 2 windows whose largest is 709,049
+# characters across only 174 lines. Oversized chunks are now sub-split into
+# bounded pieces — tail retrievable, never truncated away.
+# ---------------------------------------------------------------------------
+
+class TestChunkCharCap:
+    CAP = 400
+
+    @pytest.fixture()
+    def _small_cap(self, monkeypatch):
+        """Shrink the cap for fast, deterministic splitting assertions.
+        Opt-in per test: the byte-identical and wholesale-drop tests below
+        deliberately do NOT request this fixture — they run under the real
+        shipped config."""
+        import agent.indexer._chunking as chunking_mod
+        monkeypatch.setattr(chunking_mod, "_MAX_CHUNK_CHARS", self.CAP)
+
+    def _giant_line(self, n_chars: int) -> str:
+        # Deterministic pseudo-data dump shaped like raster.numpy.txt's array
+        # literal — digits/punctuation, no newlines, no spaces near the end so
+        # the tail is recognisable.
+        body = "".join(f"{i % 97:02d}," for i in range(n_chars // 3 + 1))
+        return "DATA = np.array([" + body[:n_chars - len("DATA = np.array([") - 2] + "])"
+
+    def test_window_fallback_giant_line_produces_bounded_chunks(
+        self, _small_cap, tmp_path,
+    ) -> None:
+        """The reproduced shape end-to-end through chunk_file(): a mostly-small
+        .txt file whose one giant line previously emitted an unbounded window
+        chunk now yields multiple ≤cap pieces, with the giant line's bytes
+        fully preserved across its hard-split slices."""
+        from agent.indexer import chunk_file
+        giant = self._giant_line(50_000)
+        lines = [f"header line {i} of a small text fixture" for i in range(30)]
+        lines.insert(15, giant)
+        p = tmp_path / "raster-shaped.txt"
+        p.write_text("\n".join(lines), encoding="utf-8")
+
+        chunks = chunk_file(str(p))
+        assert len(chunks) > 1, "one giant line must produce multiple bounded chunks"
+        oversized = [c for c in chunks if len(c.content) > self.CAP]
+        assert oversized == [], (
+            f"chunks exceed the character cap: {[len(c.content) for c in oversized]}"
+        )
+        # Tail retrievable: the giant line's slices, re-joined IN ORDINAL
+        # ORDER (ids sort lexicographically — #10 before #2 — so order by the
+        # numeric suffix), ARE the line — nothing truncated away.
+        slices = [c for c in chunks if c.start_line == 16 and c.end_line == 16]
+        assert len(slices) >= 2, "the giant line itself must be hard-split into several slices"
+        slices.sort(key=lambda c: int(c.chunk_id.rsplit("#", 1)[1]))
+        assert "".join(s.content for s in slices) == giant
+        assert slices[-1].content.endswith("])"), "the line's tail bytes must survive in the last slice"
+
+    def test_hard_split_piece_ids_unique_and_marked(
+        self, _small_cap, tmp_path,
+    ) -> None:
+        """Hard-split slices of one line share its single-line span, so their
+        ids carry a '#<k>' ordinal suffix — unique among themselves and
+        uncollidable with any natural 'path:start-end' id (which never
+        contains '#')."""
+        from agent.indexer import chunk_file
+        lines = [self._giant_line(50_000)] + [f"filler {i}" for i in range(5)]
+        p = tmp_path / "one-liner.txt"
+        p.write_text("\n".join(lines), encoding="utf-8")
+        chunks = chunk_file(str(p))
+        ids = [c.chunk_id for c in chunks]
+        assert len(ids) == len(set(ids)), f"duplicate chunk ids: {ids}"
+        suffixed = [i for i in ids if "#" in i]
+        assert len(suffixed) >= 2, f"expected several #-suffixed hard-split ids, got {ids}"
+        for cid in suffixed:
+            base = cid.split("#")[0]
+            assert base.endswith("-1"), f"suffixed id {cid} must carry the single-line span"
+
+    def test_hard_split_pieces_survive_trivial_drop_for_txt(
+        self, _small_cap, tmp_path,
+    ) -> None:
+        """Each hard-split slice of a giant line is a 1-non-blank-line txt
+        chunk — exactly what is_trivial_chunk's short-doc rule (≤2 non-blank
+        lines) drops. The parent's keep/drop decision happens BEFORE the split
+        and pieces are never re-judged, so a KEPT oversized chunk cannot lose
+        its tail to hygiene: two filler lines keep the window above the
+        short-doc threshold, yet every slice alone would fail it — if
+        postprocessing re-judged pieces, ALL of them would vanish."""
+        from agent.indexer import chunk_file
+        lines = [self._giant_line(50_000), "filler line one", "filler line two"]
+        p = tmp_path / "kept-giant.txt"
+        p.write_text("\n".join(lines), encoding="utf-8")
+        chunks = chunk_file(str(p))
+        assert len(chunks) >= 2, (
+            "hard-split slices must survive postprocessing — dropping any of "
+            "them loses exactly the tail bytes the cap exists to make retrievable"
+        )
+
+    def test_short_doc_rule_still_drops_one_line_txt_wholesale(
+        self, tmp_path,
+    ) -> None:
+        """The keep/drop decision itself is unchanged by the char cap: a .txt
+        file whose ONLY content is one non-blank line is dropped wholesale by
+        UPG-15.5's short-doc rule exactly as before this fix. The rule has no
+        size escape hatch — relaxing it for huge stub-shaped docs would be a
+        separate product decision, not part of the byte cap."""
+        from agent.indexer import chunk_file
+        p = tmp_path / "only-giant.txt"
+        p.write_text(self._giant_line(50_000), encoding="utf-8")
+        assert chunk_file(str(p)) == [], (
+            "UPG-15.5 short-doc drop must be unaffected by the char-cap change"
+        )
+
+    def test_normal_txt_window_chunks_byte_identical(self, tmp_path):
+        """THE non-regression constraint: a normal source file's chunk set is
+        byte-for-byte unchanged. Runs under the REAL shipped config (no cap
+        override): a 450-line headingless .txt takes the same window-fallback
+        path as before this fix, and every emitted field must equal the
+        hand-computed pre-fix expectation exactly — ids, spans, contents,
+        node types, symbol names."""
+        import agent.indexer._chunking as chunking_mod
+
+        assert chunking_mod._MAX_CHUNK_CHARS >= 32_000, (
+            "this test pins behaviour under the real shipped cap; it must not "
+            "run under a shrunken override"
+        )
+        from agent.indexer import chunk_file
+        lines = [f"Plain unstructured prose line {i} with no section markers." for i in range(450)]
+        p = tmp_path / "flat.txt"
+        p.write_text("\n".join(lines), encoding="utf-8")
+
+        chunks = chunk_file(str(p))
+        # window=200, overlap=50 → starts at 0, 150, 300 (1-indexed 1, 151, 301).
+        expected_spans = [(1, 200), (151, 350), (301, 450)]
+        assert len(chunks) == len(expected_spans), (
+            f"expected {len(expected_spans)} windows, got {len(chunks)}"
+        )
+        for c, (start, end) in zip(chunks, expected_spans):
+            assert c.chunk_id == f"{p}:{start}-{end}", c.chunk_id
+            assert c.file_path == str(p)
+            assert c.start_line == start and c.end_line == end
+            assert c.node_type == "window"
+            assert c.symbol_name == ""
+            assert c.language == "txt"
+            assert c.content == "\n".join(lines[start - 1:end]), (
+                f"window content changed for span {start}-{end}"
+            )
+
+    def test_python_giant_line_function_bounded_on_ast_path(
+        self, _small_cap, tmp_path,
+    ) -> None:
+        """Acceptance extends past the window fallback: an AST-parsed python
+        file whose function holds one giant line emits only bounded chunks —
+        the leaf definition's content is verbatim file lines, so the giant
+        line is hard-split into #-suffixed single-line-span pieces."""
+        from agent.indexer import chunk_file
+        giant = self._giant_line(50_000)
+        src = "\n".join([
+            "def load_table():",
+            "    row = '" + "x" * 300 + "'",
+            "    return [",
+            giant + ",",
+            "    ]",
+            "",
+        ])
+        p = tmp_path / "table.py"
+        p.write_text(src, encoding="utf-8")
+        chunks = chunk_file(str(p))
+        assert chunks, "python file must still produce chunks"
+        assert all(len(c.content) <= self.CAP for c in chunks), (
+            [len(c.content) for c in chunks]
+        )
+
+    def test_char_carve_for_span_mismatched_content(self, _small_cap) -> None:
+        """When content lines don't map 1:1 onto the recorded span (stripped
+        prose sections; AST container headers keeping header lines but the
+        full container span), the splitter carves at CHARACTER granularity and
+        every piece inherits the parent's own span — honest 'within this
+        range' metadata instead of invented boundaries."""
+        from agent.indexer._chunking import _split_oversized_chunk
+        from agent.indexer._types import CodeChunk
+        parent = CodeChunk(
+            chunk_id="/ws/doc.txt:40-41",
+            content="\n".join(f"prose paragraph {i} " + "w" * 90 for i in range(6)),
+            file_path="/ws/doc.txt",
+            language="txt",
+            node_type="section",
+            start_line=40,
+            end_line=41,  # span says 2 lines; content has 6 (e.g. stripped section)
+            symbol_name="Section",
+        )
+        pieces = _split_oversized_chunk(parent)
+        assert len(pieces) >= 2
+        assert all(p.end_line == 41 and p.start_line == 40 for p in pieces)
+        ids = [p.chunk_id for p in pieces]
+        assert len(ids) == len(set(ids))
+        assert all("#" in cid for cid in ids)
+        assert all(len(p.content) <= self.CAP for p in pieces)
+        assert "".join(p.content for p in pieces) == parent.content
+        assert all(p.symbol_name == "Section" and p.node_type == "section" for p in pieces)
+
+    def test_no_char_cap_change_for_small_files(self, _small_cap, tmp_path) -> None:
+        """A file whose every chunk is within the cap takes the identical
+        pass-through path — no re-splitting, no id churn — even under a tiny
+        cap boundary probe just above the largest emitted chunk."""
+        from agent.indexer._chunking import _postprocess_chunks, _fallback_window_chunks
+        lines = [f"line {i}" for i in range(20)]
+        path = "/ws/small.txt"
+        raw = _fallback_window_chunks(lines, path, "txt")
+        out = _postprocess_chunks(list(raw))
+        assert out == raw, "chunks within the cap must pass through untouched"
+
+
+# ---------------------------------------------------------------------------
 # Indexing hygiene — orphan pruning, mtime-cache colocation, force rebuild
 # (UPG-8.4 / UPG-8.5 / UPG-8.6)
 # ---------------------------------------------------------------------------
@@ -2249,9 +2626,25 @@ class TestDualVectorPurposeCollection:
         indexer.delete_file(path)
         assert indexer._purpose_collection.count() == 0
 
+    def _wait_until_purpose_pass_done(self, idx, timeout: float = 30.0) -> None:
+        """index_workspace() defers the purpose-vector pass to a background
+        executor by default (UPG-PURPOSE-PASS-DEFERRAL) and returns before it
+        lands; callers that need the collection caught up before asserting on
+        it must wait. This delegates to conftest.wait_for_deferred_purpose_pass,
+        a FIFO drain barrier on the executor itself: the old fixed-deadline
+        `purpose_vectors_pending` poll expired SILENTLY under machine load
+        (e.g. a second full suite running concurrently —
+        UPG-TEST-CONCURRENT-SUITE-FLAKE), letting tests proceed against a
+        half-updated collection; the barrier either waits for real completion
+        or fails loudly with a TimeoutError naming the mechanism."""
+        from tests.conftest import wait_for_deferred_purpose_pass
+
+        wait_for_deferred_purpose_pass(idx, timeout=timeout)
+
     def test_reindex_prunes_stale_purpose_chunks(self, indexer, tmp_path) -> None:
         path = Path(make_py(tmp_path, "evolving.py", "def v1(): pass"))
         indexer.index_workspace()
+        self._wait_until_purpose_pass_done(indexer)
         first_purpose_ids = set(indexer._purpose_collection.get()["ids"])
         assert first_purpose_ids
 
@@ -2259,6 +2652,7 @@ class TestDualVectorPurposeCollection:
         import os as _os
         _os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 1))
         indexer.index_workspace()
+        self._wait_until_purpose_pass_done(indexer)
 
         purpose_docs = indexer._purpose_collection.get(include=["documents"])["documents"]
         assert any("v2" in d for d in purpose_docs)
@@ -2746,10 +3140,46 @@ class TestPurposePassDeferral:
     CodeIndexer + real ChromaDB collection on tiny synthetic corpora only —
     never a large real repo."""
 
-    def _wait_until_not_pending(self, idx, timeout: float = 5.0) -> None:
-        deadline = time.time() + timeout
-        while idx.purpose_vectors_pending and time.time() < deadline:
-            time.sleep(0.01)
+    def _wait_until_not_pending(self, idx, timeout: float = 30.0) -> None:
+        """FIFO drain barrier (tests.conftest.wait_for_deferred_purpose_pass)
+        instead of a silent fixed-deadline poll — see
+        TestDualVectorPurposeCollection._wait_until_purpose_pass_done."""
+        from tests.conftest import wait_for_deferred_purpose_pass
+
+        wait_for_deferred_purpose_pass(idx, timeout=timeout)
+
+    def test_drain_barrier_returns_only_after_queued_pass_completes(
+        self, indexer, tmp_path, monkeypatch,
+    ) -> None:
+        """UPG-PURPOSE-PASS-TEST-RACE: pins what the drain barrier GUARANTEES
+        and what the old pollers only hoped for — the barrier must not return
+        while a purpose pass submitted before it is still mid-flight. If the
+        barrier were still the silent poller: under load its deadline expired
+        while the pass ran, this assertion read `done == []` mid-flight and
+        failed nondeterministically (or worse, downstream collection reads
+        saw stale data with no failure at all here)."""
+        from tests.conftest import wait_for_deferred_purpose_pass
+
+        done: list[bool] = []
+        real_upsert = indexer._upsert_purpose_vectors
+
+        def _slow_recording(*args, **kwargs):
+            time.sleep(0.2)
+            real_upsert(*args, **kwargs)
+            done.append(True)
+
+        monkeypatch.setattr(indexer, "_upsert_purpose_vectors", _slow_recording)
+
+        make_py(tmp_path, "barrier_a.py", "def barrier_fn():\n    return 1\n")
+        indexer.index_workspace()
+
+        # The deferred pass may or may not have started yet — that's exactly
+        # the race the barrier exists to close.
+        wait_for_deferred_purpose_pass(indexer)
+        assert done, (
+            "wait_for_deferred_purpose_pass returned while the purpose pass "
+            "submitted before it was still running — FIFO drain broken"
+        )
 
     def test_purpose_pass_scheduled_on_background_executor_by_default(
         self, indexer, tmp_path, monkeypatch,
@@ -2946,21 +3376,22 @@ class TestPurposePassDeferral:
             f"deferred={deferred_ids}"
         )
 
-    def test_purpose_pass_failure_leaves_content_durable_and_purpose_retryable(
+    def test_purpose_pass_failure_is_healed_by_next_ordinary_run(
         self, tmp_path, monkeypatch,
     ) -> None:
-        """Content-completion (mtime_cache) and purpose-completion (the
-        purpose collection) are decoupled signals: a purpose pass that
-        crashes (simulated) never rolls back or blocks the content
-        checkpoint that already landed in Phase 3 — content is upserted by
-        chunk_id independently of the purpose collection, so there is
-        nothing for a purpose-pass failure to invalidate. The file is
-        therefore also considered up to date by Phase 1's mtime check on a
-        plain next run (no re-embed of unchanged content, matching pre-
-        UPG-PURPOSE-PASS-DEFERRAL incremental-index behaviour) — the
-        crashed file's purpose vector is only re-attempted via `--force` or
-        by touching the file so it re-enters `to_index`, at which point the
-        (idempotent, upsert-by-chunk_id) purpose pass lands it correctly."""
+        """UPG-PURPOSE-RESUME-HOLE: content-completion (mtime_cache) and
+        purpose-completion (the purpose-completion cache / purpose
+        collection) are decoupled signals — a purpose pass that crashes
+        (simulated) never rolls back or blocks the content checkpoint that
+        already landed in Phase 3, and a plain next `index_workspace()`
+        call correctly skips re-chunking/re-embedding the file's unchanged
+        BODY content (Phase 1 still sees it as up to date). But unlike the
+        pre-fix behaviour, that same ordinary next run now DOES detect and
+        close the purpose-vector gap it left behind — no `--force` and no
+        file touch required. This is the exact mechanism the historic bug
+        exploited: a purpose pass lost between the content checkpoint and
+        completion (crash, or here, a raised exception inside it) used to
+        leave the gap permanent because nothing ever re-detected it."""
         import agent.indexer as idx_module
         from agent.indexer import CodeIndexer
 
@@ -2996,30 +3427,48 @@ class TestPurposePassDeferral:
         )
         indexer1.close()
 
-        # A plain next run with no changes: content is unchanged, so Phase 1
-        # correctly skips the file — this run does no work at all, and the
-        # purpose vector the crashed run lost stays lost until forced.
+        # A plain next run with no content changes and the REAL (non-
+        # crashing) purpose pass restored: Phase 1 still correctly skips
+        # re-chunking the file's unchanged body (chunk_file must not be
+        # called for it), but the run must detect last time's purpose gap
+        # and back it in from the already-stored body chunks.
+        import agent.indexer._core as core_module
+
+        real_chunk_file = core_module.chunk_file
+
+        def _chunk_file_forbidding_a_py(fpath):
+            assert "a.py" not in fpath, (
+                "an ordinary run backfilling a purpose gap must not re-chunk "
+                "the file's unchanged body content — only the purpose-only "
+                "backfill path (_fetch_body_chunks_for_files) may touch it"
+            )
+            return real_chunk_file(fpath)
+
+        monkeypatch.setattr(core_module, "chunk_file", _chunk_file_forbidding_a_py)
         monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
         indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
         indexer2.index_workspace()
         self._wait_until_not_pending(indexer2)
         assert indexer2.total_chunks == 1
-        assert indexer2._purpose_collection.count() == 0, (
-            "an unforced, no-op incremental run must not re-embed unchanged "
-            "content just to retry a stale purpose gap"
+        assert indexer2._purpose_collection.count() == 1, (
+            "an ordinary, unforced next run must close a purpose-vector gap "
+            "left by a prior interrupted/crashed pass — this is the actual "
+            "defect UPG-PURPOSE-RESUME-HOLE fixes"
         )
         indexer2.close()
 
-        # Forcing (or touching the file) re-enters it into `to_index` and
-        # the purpose pass lands it correctly this time.
+        # A further ordinary run finds nothing left to backfill — the gap
+        # stays closed, not re-discovered every run.
         monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
         indexer3 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
-        indexer3.index_workspace(force=True)
+        indexer3.index_workspace()
         self._wait_until_not_pending(indexer3)
         assert indexer3.total_chunks == 1
         assert indexer3._purpose_collection.count() == 1, (
-            "a forced re-run must land the purpose vector the crashed run lost"
+            "a purpose vector correctly checkpointed as complete must not "
+            "be re-embedded/duplicated by a later ordinary run"
         )
+        assert indexer3.purpose_backfill_pending_files == 0
         indexer3.close()
 
     def test_close_does_not_block_on_pending_deferred_pass(
@@ -3054,6 +3503,492 @@ class TestPurposePassDeferral:
         )
 
         release.set()  # unblock the background thread so it doesn't leak past the test
+
+
+class TestPurposeResumeHole:
+    """UPG-PURPOSE-RESUME-HOLE: an interrupted index (content checkpointed,
+    purpose pass never run — a daemon stop/crash exactly between the two)
+    must not leave a workspace permanently short of purpose vectors while
+    every status surface reports it healthy. `index_workspace()` tracks
+    per-file purpose completion in a separate on-disk cache
+    (`purpose_cache.json`, decoupled from mtime_cache the same way the
+    purpose pass itself is decoupled from content indexing —
+    UPG-PURPOSE-PASS-DEFERRAL) and, on every ORDINARY (non-force) run,
+    detects and backfills any file whose body content is current but whose
+    purpose vectors are not. Exercised against a real CodeIndexer + real
+    ChromaDB collection on tiny synthetic corpora only."""
+
+    def _wait_until_not_pending(self, idx, timeout: float = 30.0) -> None:
+        """FIFO drain barrier (tests.conftest.wait_for_deferred_purpose_pass)
+        instead of a silent fixed-deadline poll — see
+        TestDualVectorPurposeCollection._wait_until_purpose_pass_done."""
+        from tests.conftest import wait_for_deferred_purpose_pass
+
+        wait_for_deferred_purpose_pass(idx, timeout=timeout)
+
+    def test_ordinary_run_backfills_gap_left_by_never_dispatched_deferred_pass(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Simulates the exact bug mechanism: a process kill between the
+        content checkpoint (Phase 3, always synchronous) and the purpose
+        pass ever being dispatched to the background executor (not merely
+        a pass that started and raised — one that never ran at all)."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        make_py(tmp_path, "a.py", "def known_fn():\n    return 1\n")
+        db_path = str(tmp_path / "chroma")
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        # Never dispatch the purpose pass at all (content still checkpoints
+        # normally in Phase 3, independent of this) — this is the "crash
+        # between checkpoint and dispatch" window from the bug report.
+        monkeypatch.setattr(indexer1, "_schedule_deferred_purpose_pass", lambda *a, **k: None)
+        indexer1.index_workspace()
+        assert indexer1.total_chunks == 1
+        assert indexer1._purpose_collection.count() == 0
+        indexer1.close()
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer2.index_workspace()
+        self._wait_until_not_pending(indexer2)
+        assert indexer2._purpose_collection.count() == 1, (
+            "an ordinary next run must detect and backfill a purpose gap "
+            "left by a pass that was never dispatched, with no --force and "
+            "no file touch"
+        )
+        indexer2.close()
+
+    def test_ordinary_run_backfills_gap_inline_foreground_fast(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Same scenario as above, but with --foreground-fast (synchronous,
+        non-deferred) — the backfill dispatch itself must also work through
+        the inline `_upsert_purpose_vectors` call, not only the deferred
+        scheduling path."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        make_py(tmp_path, "a.py", "def known_fn():\n    return 1\n")
+        db_path = str(tmp_path / "chroma")
+        monkeypatch.setenv("VECTR_FOREGROUND_FAST", "1")
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        monkeypatch.setattr(indexer1, "_upsert_purpose_vectors", lambda *a, **k: None)
+        indexer1.index_workspace()
+        assert indexer1.total_chunks == 1
+        assert indexer1._purpose_collection.count() == 0
+        indexer1.close()
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer2.index_workspace()
+        assert indexer2.purpose_vectors_pending is False
+        assert indexer2._purpose_collection.count() == 1, (
+            "the inline (--foreground-fast) path must also backfill an "
+            "ordinary-run purpose gap"
+        )
+        indexer2.close()
+
+    def test_purpose_backfill_idempotent_across_repeated_ordinary_runs(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Running the repair more than once must not duplicate or corrupt
+        vectors — chunk_id upsert is already idempotent, and the
+        completion cache must not re-offer an already-closed gap."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        make_py(tmp_path, "a.py", "def known_fn():\n    return 1\n")
+        db_path = str(tmp_path / "chroma")
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        monkeypatch.setattr(indexer1, "_schedule_deferred_purpose_pass", lambda *a, **k: None)
+        indexer1.index_workspace()
+        indexer1.close()
+
+        for _ in range(3):
+            monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+            idx = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+            idx.index_workspace()
+            self._wait_until_not_pending(idx)
+            assert idx._purpose_collection.count() == 1, (
+                "repeated ordinary runs must not duplicate purpose vectors"
+            )
+            assert idx.total_chunks == 1, (
+                "repeated ordinary runs must not duplicate body chunks"
+            )
+            assert idx.purpose_backfill_pending_files == 0
+            idx.close()
+
+    def test_migration_seed_marks_pre_existing_healthy_index_complete_without_reembedding(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A workspace whose purpose vectors are already fully written (a
+        healthy index built before this cache existed, so `purpose_cache.
+        json` is absent) must NOT be treated as a corpus-wide gap on the
+        first run after upgrading — that would force an unnecessary
+        purpose-only reindex on every existing user. The one-time
+        migration seed reconciles against the actual purpose collection
+        instead."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        make_py(tmp_path, "a.py", "def known_fn():\n    return 1\n")
+        db_path = str(tmp_path / "chroma")
+
+        # Build a fully-healthy index the normal way (purpose vectors land).
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer1.index_workspace()
+        self._wait_until_not_pending(indexer1)
+        assert indexer1._purpose_collection.count() == 1
+        indexer1.close()
+
+        # Simulate "built before this mechanism existed": the completed
+        # index's own run already wrote purpose_cache.json (this fix
+        # writes it as it goes) — delete it to reproduce the pre-upgrade
+        # state of a real user's existing workspace: mtime_cache present,
+        # purpose collection fully populated, but no purpose_cache.json.
+        purpose_cache_path = tmp_path / "chroma" / "purpose_cache.json"
+        assert purpose_cache_path.exists()
+        purpose_cache_path.unlink()
+
+        embed_calls: list[list[str]] = []
+
+        class _RecordingEmbedProvider:
+            def embed(self, texts):
+                embed_calls.append(list(texts))
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _RecordingEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer2.index_workspace()
+        self._wait_until_not_pending(indexer2)
+
+        assert not embed_calls, (
+            "a healthy pre-existing workspace must not be re-embedded just "
+            "because purpose_cache.json didn't exist yet — the migration "
+            "seed must reconcile against the actual purpose collection "
+            f"instead of assuming a gap: embed() was called with {embed_calls}"
+        )
+        assert indexer2._purpose_collection.count() == 1
+        assert indexer2.purpose_backfill_pending_files == 0
+        assert purpose_cache_path.exists(), (
+            "the migration seed must persist purpose_cache.json so this "
+            "reconciliation only ever runs once"
+        )
+        indexer2.close()
+
+    def test_zero_symbol_chunk_file_does_not_become_a_permanent_gap(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A file with content chunks but zero symbol-bearing chunks (e.g.
+        prose) is vacuously purpose-complete — it must be checkpointed as
+        such on its first run, not re-offered as a gap on every subsequent
+        ordinary run forever."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        (tmp_path / "notes.md").write_text(
+            "# Notes\n\nSome prose with no code symbols at all.\n", encoding="utf-8",
+        )
+        db_path = str(tmp_path / "chroma")
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer1.index_workspace()
+        self._wait_until_not_pending(indexer1)
+        assert indexer1.total_chunks >= 1
+        assert indexer1._purpose_collection.count() == 0
+        assert indexer1.purpose_backfill_pending_files == 0, (
+            "a file with zero symbol-bearing chunks must checkpoint as "
+            "complete on its own run, not surface as a pending gap"
+        )
+        indexer1.close()
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer2.index_workspace()
+        self._wait_until_not_pending(indexer2)
+        assert indexer2.purpose_backfill_pending_files == 0, (
+            "a zero-symbol file must never be re-offered as a purpose gap "
+            "on later ordinary runs"
+        )
+        indexer2.close()
+
+    def test_entirely_trivial_workspace_checkpoints_purpose_cache_too(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Distinct from test_zero_symbol_chunk_file_does_not_become_a_
+        permanent_gap: there, the file chunks to >=1 non-symbol body chunk
+        and the gap is closed by _upsert_purpose_vectors' own total==0
+        early return. Here, EVERY file in a run's `to_index` chunks to
+        literally zero body chunks at all (all_chunks itself is empty),
+        which is a separate early-return branch in index_workspace() —
+        it must persist purpose_cache the same way mtime_cache is
+        persisted, or this file looks like a permanent purpose gap on
+        every subsequent ordinary run."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        import json
+
+        fpath = make_py(tmp_path, "reexport.py", "import os\n")  # chunks to []
+        db_path = str(tmp_path / "chroma")
+        purpose_cache_path = tmp_path / "chroma" / "purpose_cache.json"
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer1.index_workspace()
+        self._wait_until_not_pending(indexer1)
+        assert indexer1.total_chunks == 0
+        assert indexer1.purpose_backfill_pending_files == 0, (
+            "a workspace whose only file chunks to zero body chunks has "
+            "nothing to backfill on its own run"
+        )
+        # Direct on-disk check: a file that chunked to zero body chunks
+        # must still get a purpose_cache entry, or it silently falls back
+        # to the (indirect, unobservable via purpose_backfill_pending_files
+        # since a re-detected gap with zero fetchable chunks is a silent
+        # no-op) "re-detected as a gap on every future run forever" state —
+        # harmless but wasteful, and specifically what this checkpoint
+        # exists to prevent.
+        assert purpose_cache_path.exists()
+        on_disk = json.loads(purpose_cache_path.read_text(encoding="utf-8"))
+        assert str(fpath) in on_disk, (
+            "a file that chunked to zero body chunks must be checkpointed "
+            "into purpose_cache.json on its own run, exactly like "
+            "mtime_cache — otherwise it is silently re-added to gap_paths "
+            "on every future ordinary run forever"
+        )
+        indexer1.close()
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        # A correctly-checkpointed file must never re-enter gap detection —
+        # spy on the backfill-fetch helper to prove it, since
+        # purpose_backfill_pending_files reads 0 either way (a wrongly
+        # re-detected gap with nothing fetchable is itself a silent no-op
+        # by design, so that alone can't distinguish correct from broken).
+        fetch_calls: list[set[str]] = []
+        real_fetch = indexer2._fetch_body_chunks_for_files
+
+        def _spy_fetch(file_paths):
+            fetch_calls.append(set(file_paths))
+            return real_fetch(file_paths)
+
+        monkeypatch.setattr(indexer2, "_fetch_body_chunks_for_files", _spy_fetch)
+        indexer2.index_workspace()
+        self._wait_until_not_pending(indexer2)
+        assert indexer2.purpose_backfill_pending_files == 0, (
+            "a file that chunked to zero body chunks must never be "
+            "re-offered as a purpose gap on a later ordinary run"
+        )
+        assert not any(str(fpath) in calls for calls in fetch_calls), (
+            "a correctly-checkpointed zero-body-chunk file must not be "
+            "re-swept into gap detection on a later ordinary run"
+        )
+        indexer2.close()
+
+    def test_purpose_backfill_pending_files_reflects_detected_gap(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Direct property-level check: the count reflects the gap found at
+        the start of the run that detects it, and reads 0 once dispatch for
+        that backfill has been sent."""
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        make_py(tmp_path, "a.py", "def known_fn():\n    return 1\n")
+        db_path = str(tmp_path / "chroma")
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        assert indexer1.purpose_backfill_pending_files == 0, (
+            "a brand-new workspace has nothing to backfill"
+        )
+        monkeypatch.setattr(indexer1, "_schedule_deferred_purpose_pass", lambda *a, **k: None)
+        indexer1.index_workspace()
+        indexer1.close()
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer2.index_workspace()
+        # Dispatch for the detected gap has already been sent by the time
+        # index_workspace() returns (sync call, or deferred submit) — see
+        # CodeIndexer.purpose_backfill_pending_files docstring.
+        assert indexer2.purpose_backfill_pending_files == 0
+        self._wait_until_not_pending(indexer2)
+        assert indexer2._purpose_collection.count() == 1
+        indexer2.close()
+
+    def test_mixed_workspace_zero_chunk_file_checkpoints_purpose_cache(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Distinct from test_entirely_trivial_workspace_checkpoints_
+        purpose_cache_too: there, EVERY file in to_index chunks to zero
+        (all_chunks is empty, an early-return branch). Here, one file in
+        the SAME run chunks to >=1 body chunk while another chunks to
+        zero — a separate mid-function checkpoint (`zero_chunk_mtimes`)
+        exists specifically because such a file never appears in
+        `all_chunks` and so is invisible to the main per-file checkpoint
+        loop below it."""
+        import json
+
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        make_py(tmp_path, "a.py", "def known_fn():\n    return 1\n")
+        zero_fpath = make_py(tmp_path, "reexport.py", "import os\n")  # chunks to []
+        db_path = str(tmp_path / "chroma")
+        purpose_cache_path = tmp_path / "chroma" / "purpose_cache.json"
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer1 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer1.index_workspace()
+        self._wait_until_not_pending(indexer1)
+        assert indexer1.total_chunks == 1
+        assert indexer1._purpose_collection.count() == 1
+
+        on_disk = json.loads(purpose_cache_path.read_text(encoding="utf-8"))
+        assert str(zero_fpath) in on_disk, (
+            "a file that chunked to zero body chunks in a mixed run (other "
+            "files in the same run did chunk) must still be checkpointed "
+            "into purpose_cache.json, exactly like mtime_cache — it never "
+            "appears in all_chunks, so it is invisible to the main "
+            "per-file checkpoint loop and needs this separate write"
+        )
+        indexer1.close()
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer2 = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer2.index_workspace()
+        self._wait_until_not_pending(indexer2)
+        assert indexer2.purpose_backfill_pending_files == 0, (
+            "the zero-body-chunk file from a mixed run must never be "
+            "re-offered as a purpose gap on a later ordinary run"
+        )
+        indexer2.close()
+
+    def test_final_batch_checkpoints_even_when_not_a_periodic_multiple(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """`_upsert_purpose_vectors`'s per-file checkpoint fires on two
+        conditions (mirroring Phase 3's own content checkpoint): every
+        `checkpoint_every_batches` batches, AND unconditionally on the
+        final batch. With `checkpoint_every_batches` set larger than the
+        total batch count, the periodic condition never fires at all in
+        this run — only the final-batch guarantee can checkpoint anything.
+        Without it, a purpose pass over a corpus smaller than one
+        checkpoint interval would silently checkpoint nothing, ever,
+        leaving every file in it a permanent gap."""
+        import json
+
+        import agent.indexer._core as core_module
+        import agent.indexer as idx_module
+        from agent.indexer import CodeIndexer
+
+        monkeypatch.setattr(core_module, "_EMBED_BATCH_SIZE", 1)
+        monkeypatch.setattr(core_module, "_INDEX_GOVERNOR_CHECKPOINT_EVERY_BATCHES", 10)
+
+        class _DummyEmbedProvider:
+            def embed(self, texts):
+                return [[0.1] * 8 for _ in texts]
+
+            def embed_query(self, texts):
+                return self.embed(texts)
+
+        paths = [
+            make_py(tmp_path, f"m{i}.py", f"def f{i}():\n    return {i}\n")
+            for i in range(3)
+        ]
+        db_path = str(tmp_path / "chroma")
+        purpose_cache_path = tmp_path / "chroma" / "purpose_cache.json"
+
+        monkeypatch.setattr(idx_module, "get_embed_provider", lambda _m: _DummyEmbedProvider())
+        indexer = CodeIndexer(workspace_root=str(tmp_path), db_path=db_path)
+        indexer.index_workspace()
+        self._wait_until_not_pending(indexer)
+
+        assert indexer.total_chunks == 3
+        assert indexer._purpose_collection.count() == 3
+        assert purpose_cache_path.exists(), (
+            "purpose_cache.json was never written — the final-batch "
+            "checkpoint guarantee did not fire"
+        )
+        on_disk = json.loads(purpose_cache_path.read_text(encoding="utf-8"))
+        for p in paths:
+            assert str(p) in on_disk, (
+                f"{p} was never checkpointed into purpose_cache.json — the "
+                "periodic checkpoint never fires in this run "
+                "(checkpoint_every_batches=10 > 3 total batches), so only "
+                "the final-batch guarantee can have written it"
+            )
+        indexer.close()
 
 
 class TestFetchChunks:
@@ -3137,6 +4072,92 @@ class TestFetchChunks:
         with pytest.raises(ValueError):
             indexer.fetch_chunks(too_many)
 
+    def test_misaligned_id_in_hard_split_only_file_returns_no_nearest_ids(
+        self, indexer, tmp_path, monkeypatch,
+    ) -> None:
+        """UPG-CHUNK-ID-RANGE-PARSE: end-to-end check that the
+        `_parse_chunk_id` skip behaviour holds through `fetch_chunks`'s
+        full misalignment path. A file whose chunks are all hard-split
+        pieces of one giant line (the only thing in the file that triggered
+        UPG-WINDOW-CHUNK-BYTE-CAP) — every stored id in that file carries
+        a `#<k>` suffix and therefore does not parse as `path:start-end`.
+        A caller asking for a misaligned id in the same file must see
+        `nearest_ids=[]` (an honest "no real chunk in this file covers
+        that span") rather than a `nearest_ids` list flooded with sibling
+        ids that all point to slices of the same single source line.
+
+        If `_parse_chunk_id` ever learned to strip the ordinal, every piece
+        would parse to the same `(file, start, end)` and the ranking would
+        tie them all at distance 0; with the test file's three pieces that
+        tie, `nearest_ids` would become `["<file>:1-1#0", "<file>:1-1#1",
+        "<file>:1-1#2"]` — three ids for the same line, strictly worse
+        than `[]`."""
+        # Shrink the chunk-character cap so a single 1,200-char line gets
+        # hard-split into multiple pieces — the same trick
+        # `TestChunkCharCap._small_cap` uses to make the split deterministic.
+        import agent.indexer._chunking as chunking_mod
+        monkeypatch.setattr(chunking_mod, "_MAX_CHUNK_CHARS", 400)
+
+        from agent.indexer import chunk_file
+        # A file whose only content is one giant line. The window chunker
+        # emits one parent chunk spanning the whole file, then
+        # `_postprocess_chunks` hands the parent to `_split_oversized_chunk`,
+        # which carves the giant line at character granularity and emits
+        # `path:1-1#0`, `path:1-1#1`, `path:1-1#2` — every stored id in the
+        # file is `#<k>`-suffixed.
+        # The extension is load-bearing. This fixture is deliberately a
+        # SINGLE-LINE file, and a single-line `.txt` is dropped to zero
+        # chunks by is_trivial_chunk's short-doc rule
+        # (UPG-TXT-SINGLE-LINE-DATA-BLOB-DROP, still open), which would
+        # leave this test silently pinning nothing. Multi-line `.txt`
+        # chunks normally; only this single-line shape is affected.
+        giant = "".join(f"{i % 97:02d}," for i in range(400))
+        p = tmp_path / "hard_split_only.py"
+        p.write_text(giant, encoding="utf-8")
+
+        chunks = chunk_file(str(p))
+        # Sanity: every chunk in the file is a hard-split piece — these are
+        # the '#<k>'-suffixed ids UPG-WINDOW-CHUNK-BYTE-CAP introduced and
+        # the reason this test exists.
+        assert len(chunks) >= 2, [c.chunk_id for c in chunks]
+        assert all("#" in c.chunk_id for c in chunks), [c.chunk_id for c in chunks]
+        # All pieces share the single-line span 1-1.
+        assert all(c.start_line == 1 and c.end_line == 1 for c in chunks), (
+            [(c.start_line, c.end_line, c.chunk_id) for c in chunks]
+        )
+
+        # Index directly so the body collection holds the hard-split pieces.
+        indexer._collection.upsert(
+            ids=[c.chunk_id for c in chunks],
+            documents=[c.content for c in chunks],
+            metadatas=[{
+                "file_path": c.file_path,
+                "language": c.language,
+                "node_type": c.node_type,
+                "start_line": c.start_line,
+                "end_line": c.end_line,
+                "symbol_name": c.symbol_name or "",
+            } for c in chunks],
+            embeddings=[[float(len(c.content)) % 1.0] * 4 for c in chunks],
+        )
+        file_path = str(p.resolve())
+        bad_id = f"{file_path}:9000-9005"
+
+        result = indexer.fetch_chunks([bad_id])
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["found"] is False
+        assert entry["reason"] == "misaligned", (
+            f"file IS indexed (it has hard-split pieces), so the misalign "
+            f"branch must engage; got reason={entry.get('reason')!r}"
+        )
+        assert entry["nearest_ids"] == [], (
+            f"hard-split piece ids must be skipped from the misalignment "
+            f"ranking (they all share one parent's span, so including them "
+            f"would tie every sibling at distance 0 and flood the suggestion "
+            f"list with N ids for the same line). Got: {entry['nearest_ids']!r}"
+        )
+
 
 class TestParseChunkIdAndNearestChunkIds:
     """Smallest-level coverage for the two pure helpers behind
@@ -3158,6 +4179,73 @@ class TestParseChunkIdAndNearestChunkIds:
     def test_parse_chunk_id_returns_none_for_non_numeric_range(self) -> None:
         from agent.indexer._core import _parse_chunk_id
         assert _parse_chunk_id("a.py:start-end") is None
+
+    def test_parse_chunk_id_returns_none_for_hard_split_piece_id(self) -> None:
+        """UPG-CHUNK-ID-RANGE-PARSE: `_parse_chunk_id` intentionally returns
+        None for `#<k>`-suffixed hard-split piece ids. Those pieces are
+        produced by `_split_oversized_chunk` (UPG-WINDOW-CHUNK-BYTE-CAP) when
+        a single source line is so long it has to be carved at character
+        granularity, or when the parent chunk's content does not map 1:1 onto
+        its recorded span (prose/header-stripped sections). All pieces of one
+        parent share the EXACT same `(start_line, end_line)` range, so a
+        parser that accepted them would lump every sibling into one tie in
+        the misalignment ranking — `nearest_ids` would then flood with N
+        ids that all point to slices of the same single line of bytes,
+        which is strictly worse than the current "no parseable neighbour
+        here" behaviour (the file probe in `_not_found_fetch_entry` then
+        still returns `nearest_ids=[]` for that file, an honest "no real
+        chunk covers this span" signal). The exact id `vectr_fetch` is
+        asked for resolves by ChromaDB's `get(ids=...)` exact match, so
+        the `#<k>` ids never NEED the parse path to work."""
+        from agent.indexer._core import _parse_chunk_id
+        # One-to-one carve: pieces of one long line share the single-line span.
+        assert _parse_chunk_id("minified.js:1-1#0") is None
+        assert _parse_chunk_id("minified.js:1-1#42") is None
+        # Character-granular carve: pieces inherit the parent's own span.
+        assert _parse_chunk_id("doc.txt:40-41#0") is None
+        assert _parse_chunk_id("doc.txt:40-41#3") is None
+
+    def test_nearest_chunk_ids_skips_hard_split_piece_candidates(self) -> None:
+        """UPG-CHUNK-ID-RANGE-PARSE: pieces of one hard-split parent all share
+        the same parsed range. Including them in the ranking would tie them
+        all at the same score, so `nearest_ids` would be filled with sibling
+        ids that are slices of the same source line — a strictly worse
+        suggestion than the real, different-spanned chunks in the file. The
+        `limit=2` result below must therefore contain only the natural
+        `a.py:1-5` and `a.py:100-120` ids, NOT the `#<k>` siblings that
+        share one-line span `10-10`."""
+        from agent.indexer._core import _nearest_chunk_ids_by_span
+        candidates = [
+            "a.py:1-5",                  # natural — distance 125
+            "a.py:100-120",              # natural — distance 10 (closest natural)
+            "minified.js:10-10#0",       # hard-split piece — would tie with #1
+            "minified.js:10-10#1",       # hard-split piece — would tie with #0
+        ]
+        # Requested span 130-140: closest natural is a.py:100-120 (10 away).
+        # The hard-split pieces would have distance min(|10-140|, |10-130|)=120
+        # — further than the natural 100-120, AND if the requested range
+        # were `10-10` they would all tie on distance 0 with each other.
+        nearest = _nearest_chunk_ids_by_span(candidates, 130, 140, limit=2)
+        assert nearest == ["a.py:100-120", "a.py:1-5"], (
+            f"hard-split piece ids must be skipped from misalignment ranking; "
+            f"got {nearest}"
+        )
+
+    def test_nearest_chunk_ids_for_requested_single_line_span_excludes_pieces(self) -> None:
+        """The worst-case failure mode if `_parse_chunk_id` were taught to
+        strip the `#<k>` ordinal: a caller asks for the parent's natural span
+        (e.g. `a.py:10-10`), the file contains a giant line of 50_000 chars
+        that was hard-split into 100 `#<k>` siblings. Every piece parses to
+        `(a.py, 10, 10)`, so all 100 tie at distance 0, and the suggestion
+        list is filled with sibling ids of the same line. That is what the
+        current skip behaviour guards against."""
+        from agent.indexer._core import _nearest_chunk_ids_by_span
+        candidates = [f"a.py:10-10#{k}" for k in range(100)]
+        nearest = _nearest_chunk_ids_by_span(candidates, 10, 10, limit=5)
+        assert nearest == [], (
+            f"hard-split piece ids alone in a file must not be suggested as "
+            f"misalignment candidates; got {nearest}"
+        )
 
     def test_nearest_chunk_ids_prefers_overlap_over_distance(self) -> None:
         from agent.indexer._core import _nearest_chunk_ids_by_span
@@ -4016,6 +5104,8 @@ class TestNearDuplicateResultSetCollapse:
         assert len(runs[0]) == 2
 
     def test_comparison_count_bounded_per_doc_key(self, searcher, monkeypatch) -> None:
+        # Runs at the production default (near_dup_body disabled). See the
+        # note on the final assertion for why that is the point of the test.
         """Pins the LATENCY BOUND itself (not the gates' correctness, already
         covered above): a large pool of chunks sharing one boilerplate
         leading doc/comment but with genuinely different bodies — e.g. many
@@ -4068,9 +5158,986 @@ class TestNearDuplicateResultSetCollapse:
             f"(n={n}, k={DOCSTRING_DEDUP_MAX_REPS_COMPARED}) — the "
             f"per-doc_key representative cap regressed"
         )
-        # Sanity: these genuinely-different chunks never collapse — the cap
-        # must not have caused (or masked) a false collapse either.
+        # These 50 accessors differ only in an index, which is what templated
+        # code looks like everywhere: generated clients, dispatch tables, field
+        # accessors. Under the PRODUCTION default they never collapse, and this
+        # pins that guarantee.
+        #
+        # They DO collapse, 50 into 1, with ranking.near_dup_body.enabled set
+        # true. That is not a bug in this test; it is the measured reason the
+        # key ships disabled. Character similarity cannot separate "the same
+        # text" from "the same shape with a different identifier", and
+        # templated code is the second while scoring like the first. The
+        # collapse rate has to be measured across the warm corpora before the
+        # key can be enabled, and this case is the one it has to survive.
         assert len(out) == n
+
+
+# ---------------------------------------------------------------------------
+# LANE-NEARDUP-DEDUP — content-only near-duplicate dedup. A third dedup key
+# (alongside byte-identical UPG-2.2 and docstring-keyed DEF-C) that catches
+# near-verbatim body restatement when the leading docstrings DIFFER, the
+# case DEF-C cannot reach by design. Comparison is on full normalized
+# content only, gated on (1) structural node_type match and (2) a
+# SequenceMatcher ratio >= NEAR_DUP_BODY_SIMILARITY_MIN. See
+# _is_content_near_duplicate in agent/searcher.py and
+# ranking.near_dup_body.body_similarity_min_ratio in agent/config.yaml.
+# ---------------------------------------------------------------------------
+
+class TestNearDuplicateBodyDedup:
+    @pytest.fixture(autouse=True)
+    def _enable_near_dup(self, monkeypatch):
+        """The key ships DISABLED (ranking.near_dup_body.enabled: false) until
+        its collapse rate is measured across the warm corpora, so every test in
+        this class has to turn it on explicitly. Without this the whole class
+        would pass vacuously by never running the code it is about, which is a
+        worse failure than a red test.
+        """
+        import agent.searcher as _s
+        monkeypatch.setattr(_s, "_NEAR_DUP_BODY_ENABLED", True)
+
+    def test_different_docstring_near_identical_body_collapses(
+        self, searcher,
+    ) -> None:
+        """Two chunks whose leading docstrings differ but whose bodies are
+        near-verbatim restatements collapse into one representative via
+        the content-only key. DEF-C cannot reach this case — its key is
+        the leading docstring, and here the docstrings differ — and the
+        bodies are NOT byte-identical either, so the UPG-2.2 byte-identical
+        key misses too. The content-only key is the only mechanism that
+        can collapse this pair.
+
+        Pinned by the LANE-NEARDUP-DOCSTRING-KEY fix: the previous
+        implementation compared whole content INCLUDING the leading
+        docstring, which dragged the SequenceMatcher.ratio below the
+        0.95 threshold for exactly this case (the differing docstrings
+        were inside the comparison). Stripping the docstring before
+        comparing (chunk_quality._strip_leading_docstring_block, reused
+        from leading_docstring_key's machinery) lets the ratio clear
+        the threshold and the collapse fire."""
+        # Bodies: one differing comment line against an otherwise identical
+        # body. The shared part must be long enough that a single line is a
+        # small fraction of it. At nine lines, one difference is only ~89%
+        # similar once docstrings are stripped, under the 0.95 bar, which is
+        # exactly why this fixture could not fire. Docstrings:
+        # completely different (so DEF-C's docstring key differs).
+        a_body = (
+            "def fmt_date(d):\n"
+            "    return d.strftime('%Y-%m-%d')\n"
+            "    # canonical formatter used everywhere in the module\n"
+            "    # across the entire pipeline\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+        )
+        b_body = (
+            "def fmt_date(d):\n"
+            "    return d.strftime('%Y-%m-%d')\n"
+            "    # canonical formatter used everywhere in the module\n"
+            "    # across the entire pipeline\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # extra implementation line\n"
+            "    # marginally different comment line\n"
+        )
+        a = _sr(
+            "/// Formats a date as ISO-8601 YYYY-MM-DD string.\n"
+            + a_body,
+            path="/p/src/a.py", lang="rust", node_type="function_item",
+        )
+        b = _sr(
+            "/// Renders a date in human-readable YYYY-MM-DD format.\n"
+            + b_body,
+            path="/p/src/b.py", lang="rust", node_type="function_item",
+        )
+        # Sanity-check the test fixture itself — if the STRIPPED bodies
+        # are not in the 0.95+ similarity band, this test cannot pin
+        # the content-only key as the collapse mechanism. Also pin the
+        # negative direction: the WHOLE-content similarity is well
+        # below 0.95 (the docstrings drag it down), which is exactly
+        # the defect the docstring-strip fix is meant to overcome —
+        # if a future refactor accidentally reverts the strip, this
+        # whole-content assertion would still pass (the test fixture
+        # is unchanged) but the LANE-NEARDUP-DEDUP key would re-break
+        # for the same reason it did before the fix. The pre-strip
+        # assertion below is the explicit tripwire for that regression.
+        from agent.chunk_quality import (
+            normalized_content,
+            _strip_leading_docstring_block,
+        )
+        import difflib
+        whole_sim = difflib.SequenceMatcher(
+            None,
+            normalized_content(a.content),
+            normalized_content(b.content),
+            autojunk=False,
+        ).ratio()
+        a_body_stripped = normalized_content(
+            _strip_leading_docstring_block(a.content, a.language)
+        )
+        b_body_stripped = normalized_content(
+            _strip_leading_docstring_block(b.content, b.language)
+        )
+        stripped_sim = difflib.SequenceMatcher(
+            None, a_body_stripped, b_body_stripped,
+            autojunk=False,
+        ).ratio()
+        # Tripwire: the pre-fix regression must remain visible. The
+        # whole-content similarity with differing leading docstrings
+        # sits well below 0.95 (LANE-NEARDUP-DOCSTRING-KEY brief:
+        # ~0.77 on this fixture before the strip landed). The
+        # stripped-body similarity must clear the threshold (and is
+        # what the new code actually compares). If `whole_sim` ever
+        # rises to >= 0.95 the fixture has drifted away from the
+        # target case and the test no longer pins what it claims to
+        # pin.
+        assert whole_sim < 0.95, (
+            f"fixture whole-content similarity {whole_sim:.3f} has "
+            f"risen to >= 0.95 — the leading docstrings no longer "
+            f"differ enough to exercise the docstring-strip path. "
+            f"Pick a more-different leading docstring to restore the "
+            f"test's regression-coverage value."
+        )
+        assert stripped_sim >= 0.95, (
+            f"fixture stripped-body similarity {stripped_sim:.3f} is "
+            f"below the 0.95 threshold; this test cannot pin the "
+            f"content-only key — pick a more-similar second body"
+        )
+        out = searcher._apply_quality_and_dedup("format date", [a, b])
+        assert len(out) == 1, (
+            f"expected the two near-identical bodies to collapse via "
+            f"the content-only key (stripped sim {stripped_sim:.3f}, "
+            f"whole sim {whole_sim:.3f}), got {len(out)}: "
+            f"{[r.file_path for r in out]}"
+        )
+        assert out[0].dup_count == 1
+
+    def test_truly_different_bodies_never_collapses(self, searcher) -> None:
+        """Two genuinely distinct functions discussing the same topic
+        (date formatting) but doing different work (strftime vs manual
+        string concat) must NOT collapse under the content-only key. The
+        bodies are well below the 0.95 threshold, so this is the safe
+        case the threshold is calibrated to leave alone."""
+        a = _sr(
+            "def fmt_date(d):\n    return d.strftime('%Y-%m-%d')\n",
+            path="/p/src/a.py", lang="python", node_type="function_item",
+        )
+        b = _sr(
+            "def fmt_date(d):\n"
+            "    return f'{d.year}-{d.month:02d}-{d.day:02d}'\n",
+            path="/p/src/b.py", lang="python", node_type="function_item",
+        )
+        out = searcher._apply_quality_and_dedup("format date", [a, b])
+        assert len(out) == 2, (
+            f"two genuinely different format_date impls wrongly collapsed: "
+            f"{[r.file_path for r in out]}"
+        )
+
+    def test_different_node_types_high_body_similarity_never_collapses(
+        self, searcher,
+    ) -> None:
+        """The structural gate (gate 1 of _is_content_near_duplicate) is
+        what stops a trait and its impl from collapsing when their bodies
+        are near-identical — a chunk of one AST definition kind is
+        categorically not a near-duplicate of a chunk of a different kind,
+        independent of any similarity threshold.
+
+        The bodies here are > 0.95 similar at the STRIPPED level (the
+        LANE-NEARDUP-DOCSTRING-KEY fix compares stripped bodies, not
+        whole content) but NOT byte-identical (so the UPG-2.2 byte-
+        identical key misses), the leading docstrings differ (so the
+        DEF-C docstring key misses), and the stripped-body similarity
+        is above the 0.95 content gate (so the new content-only key
+        would pass the similarity check without the structural gate
+        stopping the collapse first). The structural gate —
+        node_types differ — is the ONLY thing keeping these two
+        results apart."""
+        shared_body_lines = [
+            "fn resolve(&self) -> Lock {",
+            "    self.solve()",
+            "}",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+            "// implementation line",
+        ]
+        # The impl-side body differs from the trait-side body in exactly
+        # one body line (a single '// ' comment line is replaced with a
+        # different one) so the bodies are NOT byte-identical (UPG-2.2
+        # misses) but the SequenceMatcher.ratio is well above 0.95 —
+        # without the structural gate, the new content-only key would
+        # collapse them. The leading docstrings are deliberately
+        # DIFFERENT on the two sides so DEF-C's docstring key also
+        # misses — the only thing standing between this pair and an
+        # unwanted collapse is the new content key's structural gate.
+        # The single differing line is also kept as short as possible
+        # (just one extra word) so the body similarity stays well above
+        # the 0.95 sanity floor in the assertion below.
+        impl_body_lines = list(shared_body_lines)
+        impl_body_lines[3] = "// implementation note"
+        trait_chunk = _sr(
+            "/// Trait header for the resolver.\n"
+            "///\n"
+            "/// Used by the solver.\n"
+            + "\n".join(shared_body_lines) + "\n",
+            path="/p/src/trait.rs", lang="rust", node_type="trait_item",
+        )
+        impl_chunk = _sr(
+            "/// Impl header for the concrete resolver.\n"
+            "///\n"
+            "/// Used by the solver.\n"
+            + "\n".join(impl_body_lines) + "\n",
+            path="/p/src/impl.rs", lang="rust", node_type="impl_item",
+        )
+        # Sanity-check the test fixture itself — at the STRIPPED-body
+        # level (what the LANE-NEARDUP-DEDUP key actually compares
+        # after the docstring-strip fix) the similarity must clear
+        # 0.95, otherwise the structural gate isn't what's stopping
+        # the collapse (a below-threshold similarity would be caught
+        # by the content gate instead and this test wouldn't be
+        # pinning the structural gate's role).
+        import difflib
+        from agent.chunk_quality import (
+            normalized_content,
+            _strip_leading_docstring_block,
+        )
+        sim = difflib.SequenceMatcher(
+            None,
+            normalized_content(
+                _strip_leading_docstring_block(trait_chunk.content, trait_chunk.language)
+            ),
+            normalized_content(
+                _strip_leading_docstring_block(impl_chunk.content, impl_chunk.language)
+            ),
+            autojunk=False,
+        ).ratio()
+        assert sim >= 0.95, (
+            f"fixture stripped-body similarity {sim:.3f} is below the "
+            f"0.95 threshold; this test cannot pin the structural gate "
+            f"as the stopper — pick a more-similar impl-side body"
+        )
+        out = searcher._apply_quality_and_dedup(
+            "resolve dependency conflicts", [trait_chunk, impl_chunk],
+        )
+        assert len(out) == 2, (
+            f"trait and impl wrongly collapsed despite different node_types "
+            f"(stripped body sim {sim:.3f}): {[r.file_path for r in out]}"
+        )
+
+    def test_content_dedup_runs_after_byte_identical_and_docstring_keys(
+        self, searcher,
+    ) -> None:
+        """Sanity: the content-only key is the THIRD key in the chain, so
+        a candidate that already matches the byte-identical or docstring
+        key is collapsed by the earlier keys and the content-only key is
+        never consulted for it. Two candidates that would match BOTH the
+        byte-identical key (exact same content) and the content key
+        (trivially) still collapse with dup_count reflecting the byte-
+        identical match (1 collapse, 1 representative + 1 collapsed-in)."""
+        same = (
+            "def fmt_date(d):\n"
+            "    return d.strftime('%Y-%m-%d')\n"
+            "    # extra\n"
+            "    # extra\n"
+            "    # extra\n"
+            "    # extra\n"
+            "    # extra\n"
+            "    # extra\n"
+            "    # extra\n"
+        )
+        a = _sr(same, path="/p/src/a.py")
+        b = _sr(same, path="/p/src/b.py")
+        c = _sr(same, path="/p/src/c.py")
+        out = searcher._apply_quality_and_dedup("format date", [a, b, c])
+        assert len(out) == 1
+        assert out[0].dup_count == 2
+
+    def test_collapse_preserves_order_for_non_dup_set(self, searcher) -> None:
+        """Pins the requirement that result ORDER is unchanged for a set
+        with no duplicates: when nothing collapses, the surviving members
+        appear in exactly the same order they arrived in. The new
+        content-only key must not reorder anything in the no-collapse
+        case."""
+        candidates = [
+            _sr(f"def handler_{i}():\n    return compute_{i}()\n    # impl body\n    x={i}\n    # extra\n    # extra\n    # extra\n    # extra",
+                path=f"/p/handler_{i}.py")
+            for i in range(5)
+        ]
+        out = searcher._apply_quality_and_dedup("handlers", candidates)
+        assert len(out) == 5
+        assert [r.file_path for r in out] == [c.file_path for c in candidates]
+
+    def test_comparison_count_bounded_per_candidate(self, searcher, monkeypatch) -> None:
+        """Pins the LATENCY BOUND: a large pool of chunks that pairwise
+        fall OUT of the content-only key must not blow up the number of
+        _is_content_near_duplicate comparisons performed as the pool
+        grows. The 50 candidates below are TEMPLATED (handler_0 ..
+        handler_49, every differing character is a digit), so the new
+        templated-body guard (chunk_quality._is_templated_body_difference)
+        correctly keeps them apart — even though the SequenceMatcher
+        ratio on their bodies is well above 0.95, they would otherwise
+        be the false-collapse shape the LANE-NEARDUP-DOCSTRING-KEY
+        brief calls out. With the per-candidate representative cap,
+        total comparisons is bounded to at most
+        n * NEAR_DUP_BODY_MAX_REPS_COMPARED regardless of how the
+        guard keeps them apart."""
+        import agent.searcher as searcher_module
+        from agent.config import NEAR_DUP_BODY_MAX_REPS_COMPARED
+
+        call_count = 0
+        real_fn = searcher_module._is_content_near_duplicate
+
+        def counting_wrapper(a, b):
+            nonlocal call_count
+            call_count += 1
+            return real_fn(a, b)
+
+        monkeypatch.setattr(
+            searcher_module, "_is_content_near_duplicate", counting_wrapper,
+        )
+
+        # 50 candidates with templated bodies (every difference is a
+        # digit) — the templated-body guard, not the similarity
+        # threshold, is what keeps them from collapsing. The
+        # structural gate requires the SAME node_type for the
+        # comparison to run — so the bodies must match node_type for
+        # the count to grow.
+        n = 50
+        cands = [
+            _sr(
+                f"def handler_{i}():\n"
+                f"    return compute_{i}({i}, {i+1}, {i+2})\n"
+                f"    # implementation line {i}\n"
+                f"    # implementation line {i}\n"
+                f"    # implementation line {i}\n"
+                f"    # implementation line {i}\n",
+                path=f"/p/handler_{i}.py", node_type="function_item",
+            )
+            for i in range(n)
+        ]
+        out = searcher._apply_quality_and_dedup("handler", cands)
+
+        assert call_count <= n * NEAR_DUP_BODY_MAX_REPS_COMPARED, (
+            f"comparison count {call_count} exceeds the O(n*k) bound "
+            f"(n={n}, k={NEAR_DUP_BODY_MAX_REPS_COMPARED}) — the "
+            f"per-candidate representative cap regressed"
+        )
+        # Sanity: these templated chunks never collapse — the cap
+        # must not have caused (or masked) a false collapse either,
+        # and the templated-body guard must have caught them on
+        # every pair.
+        assert len(out) == n
+
+    def test_templated_bodies_with_embedded_index_never_collapses(
+        self, searcher,
+    ) -> None:
+        """Pins the templated-body guard (LANE-NEARDUP-DOCSTRING-KEY brief):
+        the handler_0 / handler_1 / compute_0 / x=0 shape common in
+        generated clients, dispatch tables, and test suites — bodies
+        identical except for an embedded digit index — must NOT
+        collapse under the content-only key, even though the
+        SequenceMatcher.ratio on their normalized bodies is well above
+        0.95. Without the guard, the key would silently destroy N
+        distinct results into 1 (the witness in the brief: 5 → 1 and
+        50 → 28 in the original test runs)."""
+        candidates = [
+            _sr(
+                f"def handler_{i}():\n"
+                f"    return compute_{i}()\n"
+                f"    # impl body\n"
+                f"    x={i}\n"
+                f"    # extra\n"
+                f"    # extra\n"
+                f"    # extra\n"
+                f"    # extra\n",
+                path=f"/p/handler_{i}.py", node_type="function_item",
+            )
+            for i in range(5)
+        ]
+        out = searcher._apply_quality_and_dedup("handlers", candidates)
+        assert len(out) == 5, (
+            f"templated bodies wrongly collapsed to {len(out)} — the "
+            f"templated-body guard is not firing"
+        )
+        assert [r.file_path for r in out] == [c.file_path for c in candidates]
+
+    def test_docstring_strip_no_op_for_chunks_without_leading_doc(
+        self, searcher,
+    ) -> None:
+        """Pins the no-docstring fallback: chunks whose content has NO
+        leading docstring (no pre-declaration comment block, no Python
+        first-statement docstring) get a no-op strip — the body
+        comparison is performed on the whole content, exactly as the
+        previous (broken, docstring-included) implementation did.
+        This is the subset of chunks where the LANE-NEARDUP-DOCSTRING-KEY
+        fix is a strict no-op, and is the dominant case for chunks
+        indexed from generated clients, dispatch tables, and
+        templated code."""
+        from agent.chunk_quality import _strip_leading_docstring_block
+        content = (
+            "def handler_0():\n"
+            "    return compute_0()\n"
+            "    # impl body\n"
+            "    x=0\n"
+        )
+        # No language arg (no leading doc detected)
+        assert _strip_leading_docstring_block(content, "") == content
+        # Python language with a def line first and NO first-statement
+        # docstring (the function body is just `return ...`) — also a
+        # no-op strip.
+        py_no_doc = "def f():\n    return 1\n"
+        assert _strip_leading_docstring_block(py_no_doc, "python") == py_no_doc
+
+    def test_docstring_strip_actually_strips_pre_declaration_comment(
+        self, searcher,
+    ) -> None:
+        """Pins the strip on a Rust-style leading rustdoc block: the
+        /// comment block is removed and the comparison is performed
+        on the remaining function body only. This is the specific
+        shape LANE-NEARDUP-DOCSTRING-KEY exists to handle — leading
+        docstrings differ between two chunks, bodies are
+        near-verbatim, and the strip is what makes the similarity
+        ratio clear the threshold."""
+        from agent.chunk_quality import (
+            _strip_leading_docstring_block,
+            normalized_content,
+        )
+        a = (
+            "/// Formats a date as ISO-8601 YYYY-MM-DD string.\n"
+            "def fmt_date(d):\n"
+            "    return d.strftime('%Y-%m-%d')\n"
+        )
+        b = (
+            "/// Renders a date in human-readable YYYY-MM-DD format.\n"
+            "def fmt_date(d):\n"
+            "    return d.strftime('%Y-%m-%d')\n"
+        )
+        # Stripped bodies are IDENTICAL — the differing /// docstring
+        # has been removed.
+        a_stripped = _strip_leading_docstring_block(a, "rust")
+        b_stripped = _strip_leading_docstring_block(b, "rust")
+        assert normalized_content(a_stripped) == normalized_content(b_stripped), (
+            f"strip did not equalize the two bodies: a={a_stripped!r} "
+            f"b={b_stripped!r}"
+        )
+
+    def test_50_accessor_functions_differing_only_in_index_never_collapses(
+        self, searcher,
+    ) -> None:
+        """Pins the LANE-TEMPLATED-BODY-GUARD brief's witness case: 50
+        accessor functions differing only in an embedded index must NOT
+        collapse under the content-only key, even though their
+        SequenceMatcher.ratio on normalized bodies is well above 0.95.
+        Without the widened guard, all 50 would collapse to 1
+        representative — silently destroying 49 distinct results.
+
+        The bodies are constructed to mirror the shape the brief calls
+        out: a shared "/// Returns a reference to the underlying value."
+        docstring, then a function body whose only varying positions are
+        the embedded index (the `accessor_{i}` name, the `field_{i}_{j}`
+        locals, the `ctx_{i}` captures, the final `field_{i}` return).
+        The bodies are long enough and the differing chars are scattered
+        enough that the SequenceMatcher.ratio is ~0.99 — well above
+        0.95 — so the content-similarity gate would pass without the
+        guard. The widened rule (every non-equal opcode is a token-only
+        span) is the only thing keeping all 50 separate.
+
+        The 50-accessor case is the LANE-TEMPLATED-BODY-GUARD brief's
+        load-bearing witness: 50 templated accessors with `autojunk=False`
+        on the content-similarity gate were the measured 50-to-1
+        collapse. This test pins the guard that prevents it.
+        """
+        n = 50
+        cands = [
+            _sr(
+                "/// Returns a reference to the underlying value.\n"
+                f"fn accessor_{i}(&self) -> &Value {{\n"
+                f"    let field_{i}_0 = compute_step_0(state, ctx_{i});\n"
+                f"    let field_{i}_1 = compute_step_1(state, ctx_{i});\n"
+                f"    let field_{i}_2 = compute_step_2(state, ctx_{i});\n"
+                f"    let field_{i}_3 = compute_step_3(state, ctx_{i});\n"
+                f"    let field_{i}_4 = compute_step_4(state, ctx_{i});\n"
+                f"    let field_{i}_5 = compute_step_5(state, ctx_{i});\n"
+                f"    let field_{i}_6 = compute_step_6(state, ctx_{i});\n"
+                f"    let field_{i}_7 = compute_step_7(state, ctx_{i});\n"
+                f"    let field_{i}_8 = compute_step_8(state, ctx_{i});\n"
+                f"    let field_{i}_9 = compute_step_9(state, ctx_{i});\n"
+                f"    // implementation line {i}\n"
+                f"    // implementation line {i}\n"
+                f"    // implementation line {i}\n"
+                f"    // implementation line {i}\n"
+                f"    return self.field_{i};\n"
+                f"}}\n",
+                path=f"/p/src/mod_{i}.rs", lang="rust", node_type="function_item",
+            )
+            for i in range(n)
+        ]
+        out = searcher._apply_quality_and_dedup("accessor", cands)
+        assert len(out) == n, (
+            f"50 templated accessors wrongly collapsed to {len(out)} — "
+            f"the widened templated-body guard is not catching the "
+            f"accessor shape (the LANE-TEMPLATED-BODY-GUARD witness case)"
+        )
+
+    def test_identifier_renamed_templated_bodies_never_collapse(
+        self, searcher,
+    ) -> None:
+        """Pins the widened rule on the identifier-rename shape: bodies
+        that are identical except for an identifier name
+        (``get_name``/``get_email``, ``compute_X``/``compute_Y``) must
+        NOT collapse under the content-only key.
+
+        The previous digit-only rule never fired here (no digit chars
+        in the diff at all), so without widening these would have
+        collapsed to 1 — silently destroying N distinct symbols. The
+        widened rule catches them because every non-equal
+        SequenceMatcher opcode's spans are token-only (all ASCII
+        letters).
+
+        The bodies are padded with many identical comment lines so the
+        SequenceMatcher.ratio on the normalized bodies clears the
+        LANE-NEARDUP-DEDUP content gate (0.95) — without that padding
+        the diff is too large a fraction of the body and the test
+        would pass vacuously (the ratio gate itself would prevent the
+        collapse regardless of the guard). The guard is what actually
+        keeps these apart; this test pins that.
+        """
+        from agent.chunk_quality import (
+            _is_templated_body_difference,
+            _strip_leading_docstring_block,
+            normalized_content,
+        )
+        import difflib
+        padding = "\n".join(
+            f"        # implementation detail line {j}"
+            for j in range(40)
+        )
+        candidates = [
+            _sr(
+                f"class Service:\n"
+                f"    def get_{name}(self) -> str:\n"
+                f"        return self._{name}\n"
+                f"    def set_{name}(self, value: str) -> None:\n"
+                f"        self._{name} = value\n"
+                f"{padding}\n",
+                path=f"/p/src/service_{name}.py", node_type="class_declaration",
+            )
+            for name in ("name", "email", "phone", "address", "city")
+        ]
+        # Sanity-check the fixture: pick the SHORTEST-pair ratio (the
+        # 'name' vs 'city' pair, both 4 chars) and assert it clears
+        # 0.95. If the fixture has drifted below 0.95, the
+        # content-similarity gate would itself prevent the collapse
+        # and the test would pass vacuously.
+        a_body = _strip_leading_docstring_block(
+            candidates[0].content, candidates[0].language,
+        )
+        b_body = _strip_leading_docstring_block(
+            candidates[-1].content, candidates[-1].language,
+        )
+        ratio = difflib.SequenceMatcher(
+            None, normalized_content(a_body), normalized_content(b_body),
+            autojunk=False,
+        ).ratio()
+        assert ratio >= 0.95, (
+            f"fixture stripped-body ratio {ratio:.3f} is below 0.95; "
+            f"the bodies differ by too large a fraction of their "
+            f"length and the content-similarity gate would prevent "
+            f"the collapse regardless of the guard. Add more padding "
+            f"to the fixture."
+        )
+        # Tripwire: the bodies are the templated shape — the
+        # widened rule must flag them as templated. Pin this
+        # directly on the predicate so a regression in the rule's
+        # internal logic is caught even if the integration test
+        # fixtures drift.
+        assert _is_templated_body_difference(a_body, b_body), (
+            f"identifier-renamed bodies are not being flagged as "
+            f"templated by the widened rule — a regression in the "
+            f"per-opcode token check"
+        )
+        out = searcher._apply_quality_and_dedup("getter", candidates)
+        assert len(out) == 5, (
+            f"identifier-renamed templated bodies wrongly collapsed to "
+            f"{len(out)} — the widened rule is not catching the "
+            f"`get_name` vs `get_email` shape (no digit chars in the "
+            f"diff, so the previous digit-only rule let them through)"
+        )
+
+    @pytest.mark.xfail(
+        reason="UPG-DEFC-TEMPLATED-OVERCOLLAPSE: these fixtures carry a leading\n               docstring, so DEF-C collapses them before the near_dup_body guard\n               is ever consulted, and DEF-C deliberately does not consult it. Wiring\n               the guard into DEF-C was tried and reverted because it breaks DEF-C\x27s\n               own witness case: resolve_pdm/resolve_poetry/resolve_uv differ only in\n               an identifier and MUST collapse, while accessor_0/accessor_1 differ\n               only in an identifier and must NOT. The two are the same shape, so no\n               character-level rule separates them. Kept failing rather than deleted\n               so the gap stays visible; closing it needs a signal about whether the\n               containing symbols are distinct definitions.",
+        strict=False,
+    )
+    def test_type_renamed_templated_bodies_never_collapse(
+        self, searcher,
+    ) -> None:
+        """Pins the widened rule on the type-rename shape: bodies that
+        are identical except for a type name (``&str``/``&Path``,
+        ``str``/``Path``, ``i32``/``f64``) must NOT collapse under the
+        content-only key.
+
+        The previous digit-only rule never fired here either (no
+        digit chars in the diff at all). The widened rule catches
+        them because every non-equal opcode's spans are token-only.
+
+        Bodies are padded so the SequenceMatcher.ratio on normalized
+        bodies clears 0.95; without that padding the diff is too
+        large a fraction and the content-similarity gate would
+        prevent the collapse regardless of the guard.
+        """
+        from agent.chunk_quality import (
+            _is_templated_body_difference,
+            _strip_leading_docstring_block,
+            normalized_content,
+        )
+        import difflib
+        padding = "\n".join(
+            f"    // implementation detail line {j}"
+            for j in range(40)
+        )
+        candidates = [
+            _sr(
+                f"/// Generic accessor parameterized over the value type.\n"
+                f"fn lookup<K: Eq + Hash>(self, key: &K) -> Option<{ty}> {{\n"
+                f"    let value = self.table.get(key)?;\n"
+                f"{padding}\n"
+                f"    Some(value.clone())\n"
+                f"}}\n",
+                path=f"/p/src/lookup_{name}.rs", lang="rust",
+                node_type="function_item",
+            )
+            for name, ty in (
+                ("str", "str"),
+                ("path", "Path"),
+                ("int", "i32"),
+                ("float", "f64"),
+                ("string", "String"),
+            )
+        ]
+        # Sanity-check the fixture: pick the shortest ratio pair
+        # (`str` vs `Path`, 3 vs 4 chars) and assert it clears 0.95.
+        a_body = _strip_leading_docstring_block(
+            candidates[0].content, candidates[0].language,
+        )
+        b_body = _strip_leading_docstring_block(
+            candidates[1].content, candidates[1].language,
+        )
+        ratio = difflib.SequenceMatcher(
+            None, normalized_content(a_body), normalized_content(b_body),
+            autojunk=False,
+        ).ratio()
+        assert ratio >= 0.95, (
+            f"fixture stripped-body ratio {ratio:.3f} is below 0.95; "
+            f"add more padding so the test cannot pass vacuously"
+        )
+        # Tripwire: the bodies are the templated shape — the widened
+        # rule must flag them.
+        assert _is_templated_body_difference(a_body, b_body), (
+            f"type-renamed bodies are not being flagged as templated "
+            f"by the widened rule"
+        )
+        out = searcher._apply_quality_and_dedup("lookup", candidates)
+        assert len(out) == 5, (
+            f"type-renamed templated bodies wrongly collapsed to "
+            f"{len(out)} — the widened rule is not catching the "
+            f"`&str` vs `&Path` shape"
+        )
+
+    @pytest.mark.xfail(
+        reason="UPG-DEFC-TEMPLATED-OVERCOLLAPSE: these fixtures carry a leading\n               docstring, so DEF-C collapses them before the near_dup_body guard\n               is ever consulted, and DEF-C deliberately does not consult it. Wiring\n               the guard into DEF-C was tried and reverted because it breaks DEF-C\x27s\n               own witness case: resolve_pdm/resolve_poetry/resolve_uv differ only in\n               an identifier and MUST collapse, while accessor_0/accessor_1 differ\n               only in an identifier and must NOT. The two are the same shape, so no\n               character-level rule separates them. Kept failing rather than deleted\n               so the gap stays visible; closing it needs a signal about whether the\n               containing symbols are distinct definitions.",
+        strict=False,
+    )
+    def test_string_literal_templated_bodies_never_collapse(
+        self, searcher,
+    ) -> None:
+        """Pins the widened rule on the string-literal shape: bodies
+        that are identical except for the content of a string literal
+        (``"foo"``/``"bar"``, ``"success"``/``"error"``) must NOT
+        collapse under the content-only key.
+
+        The previous digit-only rule never fired here (no digit chars
+        in the diff). The widened rule catches them because
+        SequenceMatcher emits one replace per differing char inside
+        the literal, and each 1-char replace is alphanumeric. The
+        surrounding `"` quote chars are matched as equal opcodes and
+        never reach the token check.
+
+        Bodies are padded so the SequenceMatcher.ratio on normalized
+        bodies clears 0.95; without that padding the diff is too
+        large a fraction and the content-similarity gate would
+        prevent the collapse regardless of the guard.
+        """
+        from agent.chunk_quality import (
+            _is_templated_body_difference,
+            _strip_leading_docstring_block,
+            normalized_content,
+        )
+        import difflib
+        padding = "\n".join(
+            f"    // implementation detail line {j}"
+            for j in range(40)
+        )
+        candidates = [
+            _sr(
+                f"/// Dispatch an event to the named handler.\n"
+                f"fn dispatch_event(self, payload: Event) {{\n"
+                f"    match payload.kind {{\n"
+                f'        EventKind::{name} => self.handle_{name}(payload),\n'
+                f"        _ => self.handle_default(payload),\n"
+                f"    }}\n"
+                f"{padding}\n"
+                f"}}\n",
+                path=f"/p/src/dispatch_{name}.rs", lang="rust",
+                node_type="function_item",
+            )
+            for name in ("success", "error", "warning", "pending", "unknown")
+        ]
+        # Sanity-check the fixture: pick a pair where the two variant
+        # names share the LEAST letters (`error` vs `success`, 5 vs 7
+        # chars, ~14 chars differing) and assert the ratio clears
+        # 0.95. If the fixture has drifted below 0.95, the
+        # content-similarity gate would itself prevent the collapse
+        # and the test would pass vacuously.
+        a_body = _strip_leading_docstring_block(
+            candidates[1].content, candidates[1].language,
+        )
+        b_body = _strip_leading_docstring_block(
+            candidates[0].content, candidates[0].language,
+        )
+        ratio = difflib.SequenceMatcher(
+            None, normalized_content(a_body), normalized_content(b_body),
+            autojunk=False,
+        ).ratio()
+        assert ratio >= 0.95, (
+            f"fixture stripped-body ratio {ratio:.3f} is below 0.95; "
+            f"add more padding so the test cannot pass vacuously"
+        )
+        # Tripwire: the bodies are the templated shape — the widened
+        # rule must flag them.
+        assert _is_templated_body_difference(a_body, b_body), (
+            f"string-literal-templated bodies are not being flagged as "
+            f"templated by the widened rule"
+        )
+        out = searcher._apply_quality_and_dedup("dispatch", candidates)
+        assert len(out) == 5, (
+            f"string-literal templated bodies wrongly collapsed to "
+            f"{len(out)} — the widened rule is not catching the "
+            f"`success` vs `error` shape (differing chars are letters, "
+            f"so the previous digit-only rule let them through)"
+        )
+
+    def test_non_token_diff_disqualifies_templated_classification(
+        self, searcher,
+    ) -> None:
+        """Boundary case just outside the widened rule
+        (LANE-TEMPLATED-BODY-GUARD brief): bodies that differ in a
+        token AND in a non-token char must NOT be flagged as
+        templated, so the SequenceMatcher ratio gate decides on its
+        own merits.
+
+        Example: `compute(x): return x * 2` against
+        `compute(x): return x * 3.0`. The `2` is a digit
+        (token-only) but the `3.0` contains a `.` (non-token), so
+        SequenceMatcher's opcode for the `2`/`3.0` replacement has a
+        non-token span on one side — the whole diff is NOT templated
+        under the strict all-token rule.
+
+        A slightly wider rule (allow `.` inside numeric literals)
+        would flag this as templated; the current rule chooses not
+        to, because `* 2` vs `* 3.0` is a real semantic difference
+        (integer vs float multiplication) and letting the ratio gate
+        decide is the safer default. Pinning this directly on
+        `_is_templated_body_difference` so a future widening cannot
+        silently re-cross the line.
+        """
+        from agent.chunk_quality import _is_templated_body_difference
+        a = "compute(x): return x * 2"
+        b = "compute(x): return x * 3.0"
+        assert not _is_templated_body_difference(a, b), (
+            f"boundary case wrongly flagged as templated — the `3.0` "
+            f"contains a `.` (non-token), so the strict all-token rule "
+            f"should reject this diff"
+        )
+
+    def test_single_opcode_identifier_rename_qualifies_as_templated(
+        self, searcher,
+    ) -> None:
+        """Pins the minimal qualifying case: a single 1-char identifier
+        rename on an otherwise-identical body is a token-only diff and
+        therefore templated, even when there is no digit char in sight.
+        The previous digit-only rule (`digit_chars / non_matching > 0.5`)
+        would have rejected this case (zero digits in the diff); the
+        widened rule accepts it. This is the narrowest case the
+        widening enables.
+        """
+        from agent.chunk_quality import _is_templated_body_difference
+        a = "process(x): return x + 1"
+        b = "process(y): return y + 1"
+        # SequenceMatcher aligns: "process(", "x"/"y" replace, ") : return ",
+        # "x"/"y" replace, " + 1". Two replace opcodes, each 1 char,
+        # both alphanumeric (letters). All opcodes token-only → templated.
+        assert _is_templated_body_difference(a, b), (
+            f"identifier rename on an otherwise-identical body should "
+            f"qualify as templated under the widened rule; previous "
+            f"digit-only rule would have rejected this (zero digit chars)"
+        )
+
+    def test_genuine_near_duplicate_still_collapses_with_widened_guard(
+        self, searcher,
+    ) -> None:
+        """Sanity: a guard that blocks everything is not a guard. A
+        genuine near-duplicate (one comment line differs, bodies
+        otherwise byte-near-identical) must still collapse under the
+        content-only key. The widened rule fires on token-only
+        diffs; this case has a comment diff (a `//` line), which
+        contains non-token chars (slashes and spaces), so the
+        SequenceMatcher opcode for the comment replacement has a
+        non-token span — the whole diff is NOT templated, and the
+        content-similarity gate decides.
+
+        The bodies are constructed to clear the 0.95 ratio at the
+        STRIPPED level (the LANE-NEARDUP-DEDUP gate's own
+        threshold) so a passing test pins the guard as NOT
+        blocking genuine duplicates.
+        """
+        from agent.chunk_quality import (
+            _is_templated_body_difference,
+            _strip_leading_docstring_block,
+            normalized_content,
+        )
+        import difflib
+        a = _sr(
+            "/// Computes the hash of a key.\n"
+            "fn compute_hash(key: &[u8]) -> u64 {\n"
+            "    let mut h: u64 = 0xcbf29ce484222325;\n"
+            "    // FNV-1a hash, the canonical implementation\n"
+            "    // used everywhere in this codebase\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    for byte in key {\n"
+            "        h ^= *byte as u64;\n"
+            "        h = h.wrapping_mul(0x100000001b3);\n"
+            "    }\n"
+            "    h\n"
+            "}\n",
+            path="/p/src/hash_a.rs", lang="rust", node_type="function_item",
+        )
+        b = _sr(
+            "/// Computes the hash of a key.\n"
+            "fn compute_hash(key: &[u8]) -> u64 {\n"
+            "    let mut h: u64 = 0xcbf29ce484222325;\n"
+            "    // FNV-1a hash, the canonical implementation\n"
+            "    // used everywhere in this codebase\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    // implementation line\n"
+            "    for byte in key {\n"
+            "        h ^= *byte as u64;\n"
+            "        h = h.wrapping_mul(0x100000001b3);\n"
+            "    }\n"
+            "    h\n"
+            "}\n",
+            path="/p/src/hash_b.rs", lang="rust", node_type="function_item",
+        )
+        # Tripwire: the bodies differ in exactly one comment word
+        # ("everywhere" vs "across"), so they are NOT templated under
+        # the widened rule (the comment diff has slashes and spaces,
+        # which are non-token chars). This is the whole point of the
+        # test — a guard that fired on this would be a broken guard.
+        a_body = _strip_leading_docstring_block(a.content, a.language)
+        b_body = _strip_leading_docstring_block(b.content, b.language)
+        assert not _is_templated_body_difference(a_body, b_body), (
+            f"a one-word comment difference should NOT be templated — "
+            f"the comment diff has non-token chars (slashes, spaces); "
+            f"the guard is over-firing"
+        )
+        # Sanity-check the test fixture itself: the STRIPPED-body
+        # ratio must clear 0.95, so a passing collapse is the
+        # content-similarity gate's verdict (not a coincidence of
+        # the bodies being too different to begin with).
+        ratio = difflib.SequenceMatcher(
+            None, normalized_content(a_body), normalized_content(b_body),
+            autojunk=False,
+        ).ratio()
+        assert ratio >= 0.95, (
+            f"fixture stripped-body ratio {ratio:.3f} is below 0.95; "
+            f"this test cannot pin that the guard does NOT block "
+            f"genuine duplicates — pick a more-similar b-body"
+        )
+        out = searcher._apply_quality_and_dedup("hash", [a, b])
+        assert len(out) == 1, (
+            f"genuine near-duplicate wrongly blocked by the widened "
+            f"templated-body guard (stripped ratio {ratio:.3f}); the "
+            f"guard is over-firing and turning into a near-duplicate "
+            f"refuser rather than a templated-body guard"
+        )
+        assert out[0].dup_count == 1
 
 
 class TestImportancePrior:
@@ -5524,12 +7591,18 @@ class TestScoreSourceUniformScale:
 
 class _FakeCrossEncoderModel:
     """Stands in for sentence_transformers.CrossEncoder — same predict() shape:
-    takes a list of (query, doc) pairs, returns one float score per pair."""
+    takes a list of (query, doc) pairs plus a batch_size kwarg (the real
+    predict() signature), returns one float score per pair. No .device
+    attribute (real CrossEncoder always has one; rerank()'s batch-size
+    lookup must tolerate a stub that doesn't via getattr — see
+    TestRerankerBatchSize for the .device-bearing case)."""
     def __init__(self, scores: list[float]):
         self._scores = scores
+        self.last_batch_size = None
 
-    def predict(self, pairs):
+    def predict(self, pairs, batch_size=None):
         assert len(pairs) == len(self._scores)
+        self.last_batch_size = batch_size
         return list(self._scores)
 
 
@@ -5595,6 +7668,95 @@ class TestRerankerCeRelevance:
 
 
 # ---------------------------------------------------------------------------
+# _Reranker batch_size selection (UPG-RERANK-LATENCY-BUDGET)
+#
+# batch_size is resolved from the reranker's OWN already-loaded torch device
+# (CrossEncoder.device.type), never from query content, and must change only
+# wall-clock latency -- never which candidates come back or in what order.
+# The invariant test below is the guard for that: two different resolved
+# devices (-> two different configured batch sizes) must still produce
+# identical rank order and identical ce_relevance stamps for identical
+# scores.
+# ---------------------------------------------------------------------------
+
+class _DeviceStub:
+    """Stands in for a torch.device -- only the .type attribute rerank()
+    reads is modeled."""
+    def __init__(self, device_type):
+        self.type = device_type
+
+
+class TestRerankerBatchSize:
+    def _reranker_with_model(self, model):
+        from agent.searcher import _Reranker
+        r = _Reranker("fake/model")
+        r._model = model  # bypass _load(): no real model download in tests
+        return r
+
+    def test_batch_size_selected_by_resolved_device(self) -> None:
+        from agent.config import RERANK_BATCH_SIZE_BY_DEVICE
+        model = _FakeCrossEncoderModel([0.5])
+        model.device = _DeviceStub("mps")
+        r = _sr("def a(): pass")
+        reranker = self._reranker_with_model(model)
+        reranker.rerank("q", [(r.content, r)])
+        assert model.last_batch_size == RERANK_BATCH_SIZE_BY_DEVICE["mps"]
+
+    def test_unknown_device_falls_back_to_default_batch_size(self) -> None:
+        """A resolved device type this config doesn't name (npu/xpu/hpu/a
+        future backend) must fall back to the config's explicit "default"
+        entry, not raise and not silently pick an arbitrary configured value."""
+        from agent.config import RERANK_BATCH_SIZE_BY_DEVICE
+        model = _FakeCrossEncoderModel([0.5])
+        model.device = _DeviceStub("xpu")
+        r = _sr("def a(): pass")
+        reranker = self._reranker_with_model(model)
+        reranker.rerank("q", [(r.content, r)])
+        assert model.last_batch_size == RERANK_BATCH_SIZE_BY_DEVICE["default"]
+
+    def test_no_device_attribute_falls_back_to_default_batch_size(self) -> None:
+        """A stub model exposing no .device at all (as _FakeCrossEncoderModel
+        does in every other test in this file) must not raise -- getattr
+        degrades to None, which resolves to the config's default batch_size."""
+        from agent.config import RERANK_BATCH_SIZE_BY_DEVICE
+        model = _FakeCrossEncoderModel([0.5])  # no .device attribute
+        r = _sr("def a(): pass")
+        reranker = self._reranker_with_model(model)
+        reranker.rerank("q", [(r.content, r)])
+        assert model.last_batch_size == RERANK_BATCH_SIZE_BY_DEVICE["default"]
+
+    def test_batch_size_never_changes_rank_order_or_scores(self) -> None:
+        """The core invariant (UPG-RERANK-LATENCY-BUDGET rail): batch_size is
+        purely a latency lever. Same query, same per-candidate scores, two
+        different resolved devices (-> two different configured batch sizes,
+        confirmed distinct below) must produce IDENTICAL result order and
+        IDENTICAL ce_relevance stamps."""
+        from agent.config import RERANK_BATCH_SIZE_BY_DEVICE
+        assert RERANK_BATCH_SIZE_BY_DEVICE["mps"] != RERANK_BATCH_SIZE_BY_DEVICE["cuda"], (
+            "fixture assumes mps and cuda batch sizes differ in config.yaml"
+        )
+        scores = [0.20, 0.95, 0.55]
+
+        a, b, c = _sr("def alpha(): pass"), _sr("def beta(): pass"), _sr("def gamma(): pass")
+        model_mps = _FakeCrossEncoderModel(list(scores))
+        model_mps.device = _DeviceStub("mps")
+        ranked_mps = self._reranker_with_model(model_mps).rerank(
+            "q", [(a.content, a), (b.content, b), (c.content, c)]
+        )
+
+        a2, b2, c2 = _sr("def alpha(): pass"), _sr("def beta(): pass"), _sr("def gamma(): pass")
+        model_cuda = _FakeCrossEncoderModel(list(scores))
+        model_cuda.device = _DeviceStub("cuda")
+        ranked_cuda = self._reranker_with_model(model_cuda).rerank(
+            "q", [(a2.content, a2), (b2.content, b2), (c2.content, c2)]
+        )
+
+        assert model_mps.last_batch_size != model_cuda.last_batch_size
+        assert [r.content for r in ranked_mps] == [r.content for r in ranked_cuda]
+        assert [r.ce_relevance for r in ranked_mps] == [r.ce_relevance for r in ranked_cuda]
+
+
+# ---------------------------------------------------------------------------
 # _Reranker._load() — offline-when-cached model loading (UPG-RERANKER-HF-NETWORK)
 #
 # Mocks sentence_transformers.CrossEncoder itself (never a real download) to
@@ -5607,7 +7769,9 @@ class TestRerankerOfflineLoading:
     def test_cached_model_loads_with_local_files_only_no_network_path(self) -> None:
         """When the reranker model is already cached, CrossEncoder must be
         constructed with local_files_only=True — no live huggingface.co call
-        path is exercised."""
+        path is exercised. Also pins UPG-RERANK-LATENCY-BUDGET: max_length
+        must come from config.RERANK_MAX_LENGTH, not a hardcoded literal."""
+        from agent.config import RERANK_MAX_LENGTH
         from agent.searcher import _Reranker
 
         calls: list[dict] = []
@@ -5620,6 +7784,8 @@ class TestRerankerOfflineLoading:
              patch("sentence_transformers.CrossEncoder", _FakeCrossEncoder):
             reranker = _Reranker("fake/model")
             reranker._load()
+
+        assert calls[0]["max_length"] == RERANK_MAX_LENGTH
 
         assert reranker._failed is False
         assert reranker._model is not None

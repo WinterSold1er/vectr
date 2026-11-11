@@ -1,5 +1,5 @@
 """
-Trigger engine wave 1 (TRIGGER-ENGINE, bm2-design-skeleton.md §1/§2/§3/§5).
+Trigger engine (TRIGGER-ENGINE).
 
 vectr's working memory is not just a note store — each memory declares WHEN it
 is relevant to resurface, so the caller LLM does not have to guess or ask for
@@ -21,23 +21,26 @@ resolved, and M is a single precomputed boolean the caller already derived
 from a cosine-vs-threshold check (agent/working_context_store/_store.py's
 `fire()` — the only place a prompt or a vector is ever touched).
 
-Write-time contradiction detection (bm2-design-skeleton.md §8) remains
-out of scope this wave.
+Write-time contradiction detection remains out of scope here.
 
-Live delivery surface (TRIGGER-ENGINE wave 2a): `evaluate_note()`/`fire()`
-below, `WorkingContextStore.fire()`/`fire_and_format()`
-(agent/working_context_store/_store.py), and `VectrService.fire_triggers()`/
-`fire_and_recall()` (app/service.py) are wired into the live hook pipeline.
+Live delivery surface: `evaluate_note()`/`fire()` below and
+`WorkingContextStore.fire()`/`fire_and_format()`
+(agent/working_context_store/_store.py), driven by the hook branches of
+`VectrService.recall` (app/service.py), are wired into the live hook
+pipeline. (`VectrService.fire_triggers()`/`fire_and_recall()` exist but have
+no live caller — not part of this surface.)
 `main.py`'s `cmd_hook` maps its own hook-name vocabulary (`session-start`,
 `user-prompt-submit`, `pre-tool-use`, `pre-compact`) onto this module's
 EVENT_VALUES (`session-start`, `prompt-submit`, `pre-edit`, `pre-run`,
 `pre-commit`, `post-compaction`) and calls `/v1/recall` (boot mode, now
 engine-driven) and `/v1/trigger/reset` (PreCompact) — see `cmd_hook`'s
-docstring for the exact mapping table and rationale. `pre-run`/`pre-commit`
-have no live hook caller yet (no lifecycle moment maps to them this wave —
-"declared but inert", never an error, bm2-design-skeleton.md §2) — a note
-with an explicit `triggers=[{"event": "pre-run"}]` override simply never
-fires today, exactly like an unrecognised kind falls back to its default.
+docstring for the exact mapping table and rationale. `pre-run` is live via
+the pre-tool-use command lane (cmd_hook posts a Bash call and the service's
+command branch fires event="pre-run" with the normalized verb); `pre-commit`
+alone remains declared-but-inert (no lifecycle moment maps to it — never an
+error): a note with an explicit `triggers=[{"event": "pre-commit"}]`
+override simply never fires today, exactly like an unrecognised kind falls
+back to its default.
 """
 from __future__ import annotations
 
@@ -62,7 +65,7 @@ from agent.working_context_store._types import (
     WorkingNote,
 )
 
-# Kinds that inject full-text (design doc §3 two-tier budget); every other
+# Kinds that inject full-text under the two-tier injection budget; every other
 # kind injects its index-tier one-liner. Not config.yaml: this is the kind
 # taxonomy's own injection policy, the same closed-vocabulary category as
 # VALID_KINDS/EVENT_VALUES, not a tunable weight.
@@ -77,8 +80,7 @@ def validate_trigger(trigger: dict) -> None:
     """Raise ValueError if `trigger` is not a well-formed P/S/M/E/T/command primitive.
 
     A trigger must declare at least one of 'path' (P), 'event' (E), 'symbol'
-    (S — TRIGGER-ENGINE wave 2b, bm2-design-skeleton.md §2), 'semantic'
-    (M — wave 2b, §8), or 'command' (wave 3, UPG-MEMORY-STATE-MACHINE §5.2) —
+    (S), 'semantic' (M), or 'command' (UPG-MEMORY-STATE-MACHINE §5.2) —
     T (not_before/expires_visibility/cooldown) is a modifier only and can
     never fire a trigger by itself.
 
@@ -152,7 +154,7 @@ def validate_triggers(triggers: list[dict] | None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Kind-default bundles (bm2-design-skeleton.md §1)
+# Kind-default bundles
 # ---------------------------------------------------------------------------
 
 def default_bundle_for_kind(
@@ -168,7 +170,7 @@ def default_bundle_for_kind(
                  at ANY priority — matches the legacy `boot_recall()`'s own
                  unfiltered directive query.
     - task:      fires at session-start (current-work state), until closed —
-                 but ONLY at priority=='high' (TRIGGER-ENGINE wave 2a fix):
+                 but ONLY at priority=='high':
                  the legacy `boot_recall()` this bundle replaces filters task
                  notes with `AND priority = 'high'` in SQL; a medium/low
                  priority task gets NO default trigger here (an explicit
@@ -177,15 +179,15 @@ def default_bundle_for_kind(
                  has always surfaced, not a new restriction on the note
                  itself). `priority` is a caller-resolved note property
                  (never a query string) — same category as `anchors` below.
-    - gotcha:    one path trigger per declared anchor, at pre-edit — the
-                 symbol-ref half of this bundle (§1: "path-match on anchor
-                 OR symbol-ref on anchor") is wave-2 (S primitive). A gotcha
+    - gotcha:    one path trigger per declared anchor, at pre-edit — a
+                 symbol-ref default is deliberately absent (the S primitive
+                 exists but no kind's default bundle uses it). A gotcha
                  note with NO structured anchors gets no default bundle here
                  (empty list) — it continues to be served exactly as today by
                  WorkingContextStore.recall_for_path()'s unrelated content-
                  substring match, left untouched by this engine.
-    - finding/reference/decision: wave-2 M-territory (θ-gated semantic
-                 trigger) — no wave-1 default bundle. Their current
+    - finding/reference/decision: M-primitive territory (θ-gated semantic
+                 trigger) — no default bundle. Their current
                  relevance-rank recall() injection is unchanged and
                  unaffected by this engine. `decision` (UPG-DECISION-
                  TIMELINE) is deliberately NOT boot-privileged — an
@@ -198,9 +200,10 @@ def default_bundle_for_kind(
                  (unlike them) given a real default bundle since
                  operational facts are meant to resurface proactively, not
                  only on an explicit `triggers[]` override. The secondary
-                 PreToolUse command-family surface (§5.2, the 'command'
-                 axis) is opt-in only — a caller that wants a note to also
-                 fire beside a specific command family declares an explicit
+                 PreToolUse command-family surface (UPG-MEMORY-STATE-MACHINE
+                 §5.2, the 'command' axis) is opt-in only — a caller that
+                 wants a note to also fire beside a specific command family
+                 declares an explicit
                  `triggers=[{"command": "..."}]` override, which fully
                  replaces this default bundle rather than adding to it (the
                  same replace-not-merge rule every kind's explicit
@@ -292,14 +295,15 @@ class FireResult:
     explanation: str
     trigger_index: int | None = None
     # T:expires_visibility passed — the note still fired (T never blocks P/E),
-    # but the caller should rank/pack it as faded (bm2-design-skeleton.md §2).
+    # but the caller should rank/pack it as faded.
     faded: bool = False
     # Filled in by the caller (WorkingContextStore.fire()) from the existing
     # staleness machinery — never computed here, this module never touches
     # the filesystem (evaluate_note is pure).
     stale_paths: list[str] = field(default_factory=list)
-    # Whether the WINNING trigger declared the M (semantic) axis (wave 3,
-    # §5.5) — lets the caller apply the semantic-only session cooldown
+    # Whether the WINNING trigger declared the M (semantic) axis (UPG-
+    # MEMORY-STATE-MACHINE §5.5) — lets the caller apply the semantic-only
+    # session cooldown
     # (TriggerFireLedger.eligible(..., semantic=True)) without re-deriving
     # which trigger index matched or re-walking default_bundle_for_kind()
     # itself; this module already knows it at match time.
@@ -333,7 +337,7 @@ def _trigger_matches(
 
     `resolved_symbols` is the set of symbol names defined in or referenced by
     the current lifecycle's target file — resolved ONCE per `fire()` call by
-    the caller (a single symbol-graph lookup, TRIGGER-ENGINE wave 2b §2),
+    the caller (a single symbol-graph lookup),
     never here: this function only ever does an O(1) set-membership check, no
     graph access. `resolved_symbols=None` means the symbol graph is
     unavailable this call (a memory-only daemon, a warm-up window before the
@@ -344,14 +348,14 @@ def _trigger_matches(
 
     `semantic_matched` is the precomputed cosine(activity, note_vector) >=
     theta[kind] boolean for THIS note — computed once by the caller from ONE
-    per-call activity embedding and the note's own already-stored vector
-    (TRIGGER-ENGINE wave 2b §8); this function never sees a vector or prompt
-    text, only the boolean outcome. `None` means "not evaluated this call"
+    per-call activity embedding and the note's own already-stored vector;
+    this function never sees a vector or prompt text, only the boolean
+    outcome. `None` means "not evaluated this call"
     (no embedder attached, embedder still warming up, or the note declares
     no semantic axis) — a trigger declaring 'semantic' then deterministically
     does not match; never an error.
 
-    `command_verb` (wave 3, UPG-MEMORY-STATE-MACHINE §5.2) is the NORMALIZED
+    `command_verb` (UPG-MEMORY-STATE-MACHINE §5.2) is the NORMALIZED
     verb of the Bash command about to run, resolved ONCE per `fire()` call
     by the caller via `app.cmdnorm.normalize_command()` (this module never
     parses a raw command string itself — purity invariant, same category as
@@ -410,13 +414,13 @@ def scope_permits(
     branch: str | None = None,
     file_path: str | tuple[str, ...] | None = None,
 ) -> tuple[bool, str]:
-    """Whether `note`'s declared `scope` (bm2-design-skeleton.md §1) permits it
+    """Whether `note`'s declared `scope` permits it
     to be considered at all for the given lifecycle context. Operates ONLY on
     the note's own stored scope/session_id/branch/anchors plus caller-resolved
     lifecycle state (a session id, a branch name, a file path) — never a query
     string (no-query-heuristics rule).
 
-    "workspace" (default) and "repo" are true no-ops this wave — see
+    "workspace" (default) and "repo" are true no-ops — see
     SCOPE_VALUES in _types.py for why "repo" isn't yet a real cross-store
     scope. "session" and "branch" need the caller to supply the matching
     lifecycle value; if the caller doesn't supply one (e.g. plain recall()
@@ -480,9 +484,9 @@ def evaluate_note(
     """Deterministic, total (never raises for well-formed input), linear-in-
     triggers evaluation of whether `note` fires for the given lifecycle state.
 
-    A tombstoned note (`valid_until` set — explicitly superseded, §1) never
+    A tombstoned note (`valid_until` set — explicitly superseded) never
     fires. A note whose declared `scope` does not permit this lifecycle
-    context (`scope_permits()`, §1) never fires either — checked before the
+    context (`scope_permits()`) never fires either — checked before the
     trigger loop, since an out-of-scope note has nothing to evaluate.
     Otherwise: explicit `triggers[]` fully replace the kind's default
     bundle; an empty/absent `triggers[]` falls back to
@@ -508,13 +512,13 @@ def evaluate_note(
     needed there. This module still never resolves or normalizes a path
     itself, that is entirely the caller's job (purity invariant).
 
-    `resolved_symbols` (TRIGGER-ENGINE wave 2b) is passed straight through to
-    `_trigger_matches()` for the S primitive — see its docstring; this
-    function never touches the symbol graph itself, only a caller-resolved
-    set of names. `semantic_matched` (wave 2b, §8) is likewise passed
-    straight through for the M primitive — a single precomputed boolean for
-    this note, never a vector or prompt text. `command_verb` (wave 3, §5.2)
-    is likewise passed straight through for the 'command' primitive — the
+    `resolved_symbols` is passed straight through to `_trigger_matches()`
+    for the S primitive — see its docstring; this function never touches
+    the symbol graph itself, only a caller-resolved set of names.
+    `semantic_matched` is likewise passed straight through for the M
+    primitive — a single precomputed boolean for this note, never a vector
+    or prompt text. `command_verb` (UPG-MEMORY-STATE-MACHINE §5.2) is
+    likewise passed straight through for the 'command' primitive — the
     caller-normalized Bash verb, never a raw command string."""
     if now is None:
         now = time.time()
@@ -564,7 +568,7 @@ def evaluate_note(
 
 # ---------------------------------------------------------------------------
 # One total order — reused for fire precedence, injection ordering, AND
-# budget eviction (bm2-design-skeleton.md §2/§3/§4: "one implementation").
+# budget eviction (one shared implementation by design).
 # ---------------------------------------------------------------------------
 
 def total_order_key(note: WorkingNote) -> tuple[int, int, float, int]:
@@ -605,7 +609,7 @@ def total_order_key(note: WorkingNote) -> tuple[int, int, float, int]:
 
 
 # ---------------------------------------------------------------------------
-# Per-session fire ledger (bm2-design-skeleton.md §3 dedup window)
+# Per-session fire ledger (per-session dedup window)
 # ---------------------------------------------------------------------------
 
 class TriggerFireLedger:
@@ -621,21 +625,22 @@ class TriggerFireLedger:
     genuinely new reason to resurface it and is never suppressed here.
 
     `reset()` clears all suppression state for this session — call it on a
-    compaction event (pre-compact/post-compaction resets eligibility, §3).
+    compaction event (pre-compact/post-compaction resets eligibility).
     A brand-new session simply gets a brand-new ledger instance, so session
     end needs no explicit handling here.
 
-    Also tracks the per-session CUMULATIVE injection spend (§3): the
+    Also tracks the per-session CUMULATIVE injection spend: the
     per-session token cap bounds the total tokens injected across every
-    `fire_triggers`/`fire_and_format` call in one session, not each call in
+    `fire()`/`fire_and_format()` call in one session, not each call in
     isolation. `record_spend()` is called once per delivery with however many
     tokens that delivery actually packed; `remaining_budget()` is what the
     next delivery has left to spend. `reset()` also zeroes the spend —
     compaction makes the whole budget available again, consistent with
     previously-fired memories becoming re-eligible.
 
-    Serving-policy hardening (wave 3, §5.5): the M (semantic) axis gets a
-    DIFFERENT re-eligibility rule than every other axis — "probabilistic
+    Serving-policy hardening (UPG-MEMORY-STATE-MACHINE §5.5): the M
+    (semantic) axis gets a DIFFERENT re-eligibility rule than every other
+    axis — "probabilistic
     (semantic) hits get a per-note session cooldown (~10 turns)" rather than
     "fires once per session, ever". `eligible()`/`record_fire()` accept an
     optional `semantic=True` + `cooldown_turns=N`: when both are given, the
@@ -645,7 +650,7 @@ class TriggerFireLedger:
     anchored) axes are unaffected — they keep the plain forever-this-session
     suppression above, which already serves as their debounce (every
     lifecycle moment a session-scoped ledger instance covers is bounded by
-    the next compaction reset, same as before this wave)."""
+    the next compaction reset, unchanged)."""
 
     def __init__(self) -> None:
         self._fired: dict[int, set[int]] = {}
@@ -757,7 +762,7 @@ class TurnInjectionLedger:
 
 
 # ---------------------------------------------------------------------------
-# Provenance framing (bm2-design-skeleton.md §5)
+# Provenance framing
 # ---------------------------------------------------------------------------
 
 # Fixed protocol strings, not tunables (same category as the pre-existing
@@ -771,20 +776,67 @@ _HUMAN_FRAME = "Recorded by the user: "
 # words is bound to this note's content) and lets the reader draw the
 # conclusion, rather than asserting endorsement nobody verified.
 _USER_STATED_FRAME = "User-stated (verbatim excerpt bound, transcribed by an AI session): "
+# UPG-PROVENANCE-AUTOBIND-SPAN: the counterpart frame for a note whose bound
+# `user_quote` is a SUB-SPAN of a larger, agent-authored body (e.g. `USER
+# DIRECTIVE 2026-07-12: "<the user's actual words>"`, where the label and
+# quotation marks are the writing agent's, only the inner clause the user's)
+# rather than the note's whole content. `_USER_STATED_FRAME` above applies
+# that same unqualified "user-stated" reading to the ENTIRE line that
+# follows it; doing that here would launder the agent-authored framing
+# around the quote into user authority — exactly the trust-laundering this
+# frame exists to prevent. Names the bound span explicitly and states in the
+# frame itself, not just in the note body, that the remainder is agent
+# context.
+_USER_STATED_SPAN_FRAME_TEMPLATE = (
+    "User-stated in part — only this exact excerpt is confirmed the user's "
+    'own words, bound verbatim by an AI session: "{quote}". The rest of '
+    "this note is agent-added context around that excerpt, not itself "
+    "user-endorsed: "
+)
 _AGENT_FRAME = "Memory to verify (recorded by an AI session, not human-endorsed): "
 _AUTO_FRAME = "Auto-captured (weakest confidence, no reviewing judgment applied — verify before relying on this): "
 
 
-def frame_prefix(provenance: str, kind: str) -> str:
+def _is_whole_note_quote(user_quote: str, content: str) -> bool:
+    """True when the bound `user_quote` covers the note's ENTIRE content
+    (whitespace-normalized) rather than a genuine sub-span of it — the
+    boundary between `_USER_STATED_FRAME` (unqualified — the whole line
+    really is the user's transcribed words) and
+    `_USER_STATED_SPAN_FRAME_TEMPLATE` (qualified — only the named excerpt
+    is). Deferred import: agent/working_context_store/_user_quote.py is
+    imported here rather than at module load time for the same reason
+    `_format_full_block()` already imports `frame_prefix` lazily —
+    agent/working_context_store/_store.py imports this module at load time,
+    so a top-level import back would cycle."""
+    from agent.working_context_store._user_quote import normalize_for_binding
+
+    return normalize_for_binding(user_quote) == normalize_for_binding(content)
+
+
+def frame_prefix(provenance: str, kind: str, *, user_quote: str = "", content: str = "") -> str:
     """The imperative/hedged framing prefix for one injected memory block.
     Only human-provenance directives ever render as an unhedged imperative;
     user-stated provenance names its bound verbatim excerpt; agent-provenance
-    is framed as memory to verify; auto-provenance carries the weakest framing
-    (bm2-design-skeleton.md §5). Immutable per note — this is a pure function
-    of the note's own stored (provenance, kind)."""
+    is framed as memory to verify; auto-provenance carries the weakest framing.
+    Immutable per note — this is a pure function
+    of the note's own stored (provenance, kind), plus the two new optional
+    keyword arguments below.
+
+    `user_quote`/`content` (UPG-PROVENANCE-AUTOBIND-SPAN, both optional,
+    default "" — every existing 2-argument call keeps today's framing
+    unchanged): disambiguate the two shapes a `user-stated` note can take.
+    When the bound quote covers the note's entire (whitespace-normalized)
+    content, the whole line genuinely is the user's transcribed words and
+    keeps the unqualified `_USER_STATED_FRAME`. When the quote is a strict
+    sub-span of a larger, agent-authored body (the harness's span auto-bind
+    — see `bind_user_quote_auto()`), `_USER_STATED_SPAN_FRAME_TEMPLATE`
+    names the bound span explicitly and states the remainder is agent
+    context, not user-endorsed."""
     if provenance == "human":
         return _HUMAN_DIRECTIVE_FRAME if kind == "directive" else _HUMAN_FRAME
     if provenance == USER_STATED_PROVENANCE:
+        if user_quote and content and not _is_whole_note_quote(user_quote, content):
+            return _USER_STATED_SPAN_FRAME_TEMPLATE.format(quote=user_quote)
         return _USER_STATED_FRAME
     if provenance == "auto":
         return _AUTO_FRAME
@@ -792,7 +844,7 @@ def frame_prefix(provenance: str, kind: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Two-tier injection budget + pack (bm2-design-skeleton.md §3)
+# Two-tier injection budget + pack
 # ---------------------------------------------------------------------------
 
 def token_estimate(text: str) -> int:
@@ -890,8 +942,8 @@ def pack_injection(
     even if it would have fit in the leftover budget.
 
     Passing the session ledger's `remaining_budget()` here is what makes the
-    per-session cap CUMULATIVE across every `fire_triggers`/`fire_and_format`
-    call in one session (§3) rather than a fresh allowance each call."""
+    per-session cap CUMULATIVE across every `fire()`/`fire_and_format()`
+    call in one session rather than a fresh allowance each call."""
     ordered = sorted(items, key=lambda triple: total_order_key(triple[0]))
     budget = MEMORY_TRIGGER_PER_SESSION_TOKEN_CAP if budget is None else max(0, budget)
     packed: list[PackedItem] = []
@@ -900,10 +952,10 @@ def pack_injection(
         text, tier = (full_text, "full") if prefer_full else (index_text, "index")
         tokens = token_estimate(text)
 
-        # Per-kind cap (§5.4's research table: directive<=400, gotcha<=100,
-        # operational<=250) overrides the flat per-injection cap for kinds
-        # that declare one; a kind absent from the override falls back to
-        # the single global cap, unchanged from before this wave.
+        # Per-kind cap (directive<=400, gotcha<=100, operational<=250)
+        # overrides the flat per-injection cap for kinds that declare one;
+        # a kind absent from the override falls back to the single global
+        # cap.
         per_injection_cap = MEMORY_TRIGGER_PER_KIND_TOKEN_CAP.get(
             note.kind, MEMORY_TRIGGER_PER_INJECTION_TOKEN_CAP
         )

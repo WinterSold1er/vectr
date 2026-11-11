@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
+from agent.working_context_store import SORT_BY_VALUES
+
 
 # ---------------------------------------------------------------------------
 # Shared
@@ -221,6 +223,19 @@ class StatusResponse(BaseModel):
     # this makes a possible ranking-quality dip explainable instead of
     # silent. False once the pass completes, or if deferral never ran.
     purpose_vectors_pending: bool = False
+    # UPG-PURPOSE-RESUME-HOLE: purpose (ARCH-4 dual-vector) chunk count,
+    # surfaced alongside total_chunks so a caller can see the two diverge
+    # instead of a green status hiding a gap (e.g. an interrupted deferred
+    # pass leaving most of the corpus without purpose vectors). Was already
+    # computed (CodeIndexer.total_purpose_chunks) but never rendered on any
+    # status surface before this field existed.
+    total_purpose_chunks: int = 0
+    # Count of files the most recent index_workspace() run found with
+    # current body content but incomplete purpose vectors, as of the START
+    # of that run — 0 once dispatch for that backfill has been sent (not
+    # necessarily landed for the deferred/background case; see
+    # purpose_vectors_pending above for "still in flight").
+    purpose_backfill_pending_files: int = 0
     # UPG-STDIO-MEMORY-READY: additive warm-up signals. `fully_ready` is True
     # once phase 2 (embedder/indexer/searcher/watcher/symbol-graph) has
     # completed — search/locate/trace/map/fetch are gated on it across every
@@ -292,6 +307,22 @@ _EVENT_VALUES = ("session-start", "prompt-submit", "pre-edit", "pre-run", "pre-c
 # a separate, explicit call (PromoteRequest below) once a person has endorsed
 # the note.
 _REST_PROVENANCE_VALUES = ("agent", "auto")
+# UPG-REST-SORTBY-UNVALIDATED — mirrors recall()'s sort_by contract
+# (agent/working_context_store/_store.py::recall). Same local-tuple
+# convention as _VALID_KINDS above; MCP (tool schema enum) and CLI
+# (argparse choices) already enforce this vocabulary — without this tuple
+# the REST surface accepted any string and the store silently treated an
+# unknown value as relevance.
+#
+# UPG-SORTBY-SHARED-VOCAB: this is no longer a local definition — it is the
+# same SORT_BY_VALUES constant the MCP dispatch, MCP tool schema, and CLI
+# also import. Re-aliased under the historical private name (a handful of
+# existing in-module call sites read `_SORT_BY_VALUES`) so that adding a
+# fifth sort mode at the source automatically tightens the REST validator
+# here, alongside the other three surfaces. Kept the private alias purely
+# to minimise the diff at the two in-module consumers below; the
+# authoritative declaration lives in agent.working_context_store._types.
+_SORT_BY_VALUES = SORT_BY_VALUES
 
 
 class RememberRequest(BaseModel):
@@ -314,7 +345,14 @@ class RememberRequest(BaseModel):
         ),
     )
     tags: list[str] | None = Field(default=None, description="Topic tags")
-    priority: str = Field(default="medium", description="high | medium | low")
+    priority: str = Field(
+        default="medium",
+        description=(
+            "high | medium | low. Session-start/resume surfaces show only "
+            "priority='high' kind='task' notes — a checkpoint meant for "
+            "resume needs priority='high' (UPG-RESUME-TASK-PRIORITY-VISIBILITY)."
+        ),
+    )
     kind: str = Field(default="finding", description="directive | task | gotcha | finding | reference | decision | operational")
     session_id: str | None = Field(default=None)
     title: str = Field(default="", description="Short label for index-tier display (optional; derived from first content line if empty)")
@@ -419,6 +457,17 @@ class RememberRequest(BaseModel):
             "the response, never an error (idempotent)."
         ),
     )
+    pin: bool = Field(
+        default=False,
+        description=(
+            "UPG-RECALL-MISS-FLOOR part (b): pin this note into Tier 0 at "
+            "write time — equivalent to a separate POST /v1/pin call right "
+            "after this write. Pinned notes are injected unconditionally "
+            "on every vectr_recall(query=...) call, alongside "
+            "kind='directive' notes, up to the configured Tier 0 bound. "
+            "Default False changes nothing about existing callers."
+        ),
+    )
 
     @field_validator("priority")
     @classmethod
@@ -475,6 +524,22 @@ class RelatedNoteModel(BaseModel):
     created_at: float
 
 
+class RevokedRelatedNoteModel(BaseModel):
+    """The nearest EXISTING note to a fresh write whose folded lifecycle
+    state is currently `revoked` (agent/working_context_store/_related.py
+    `revoked_related_notes()`, UPG-RELATED-REVOKED-DETERRENT) — a deterrent,
+    not a similarity nudge like `RelatedNoteModel` above: it means an agent
+    is about to write something close to a note the user or a prior agent
+    turn already marked wrong. `revoked_date`/`reason` come from the
+    revocation event itself, not the note's original metadata."""
+
+    note_id: int
+    title: str
+    similarity: float
+    revoked_date: str
+    reason: str
+
+
 class RememberResponse(BaseModel):
     note_id: int
     message: str
@@ -493,6 +558,18 @@ class RememberResponse(BaseModel):
             "contradiction verdict; the caller judges whether one is now stale."
         ),
     )
+    revoked_related: list[RevokedRelatedNoteModel] = Field(
+        default_factory=list,
+        description=(
+            "The nearest EXISTING note to the one just written whose folded "
+            "lifecycle state is currently 'revoked' (agent/working_context_store/"
+            "_related.py revoked_related_notes(), UPG-RELATED-REVOKED-DETERRENT) — "
+            "empty unless memory_write.related_notes.revoked_enabled and a "
+            "candidate clears the configured similarity floor. A deterrent, not a "
+            "similarity nudge: it means this write is close to something already "
+            "marked wrong."
+        ),
+    )
     proxy_anchor_suggestions: list[str] = Field(
         default_factory=list,
         description=(
@@ -500,7 +577,7 @@ class RememberResponse(BaseModel):
             "(agent/proxy_anchors.py) — empty unless memory_write."
             "proxy_anchor_suggestions.enabled, kind='operational', and this call "
             "passed no anchors. Presence is glob-detected only, never content-read; "
-            "re-store with anchors=[...] to attach one."
+            "attach one with vectr_anchor(note_id=<this note>, anchors=[<path>])."
         ),
     )
 
@@ -575,6 +652,16 @@ class RecallRequest(BaseModel):
     def validate_kind(cls, v: str | None) -> str | None:
         if v is not None and v not in _VALID_KINDS:
             raise ValueError(f"kind must be one of: {', '.join(_VALID_KINDS)}")
+        return v
+
+    @field_validator("sort_by")
+    @classmethod
+    def validate_sort_by(cls, v: str) -> str:
+        # UPG-REST-SORTBY-UNVALIDATED: reject unknown values with a 422 at
+        # the REST boundary instead of letting the store silently treat
+        # them as relevance (same precedent as validate_kind above).
+        if v not in _SORT_BY_VALUES:
+            raise ValueError(f"sort_by must be one of: {', '.join(_SORT_BY_VALUES)}")
         return v
 
     @field_validator("surface")
@@ -668,6 +755,88 @@ class PromoteResponse(BaseModel):
     processing_ms: int
 
 
+class PinRequest(BaseModel):
+    """Explicit Tier 0 membership toggle (UPG-RECALL-MISS-FLOOR part (b)):
+    set or clear a note's `pinned` flag. Pinned notes are injected
+    unconditionally alongside kind='directive' notes on every
+    vectr_recall(query=...) call, regardless of query content, up to the
+    configured Tier 0 bound (recall_floor.tier0_max_notes). Never inferred
+    from content, usage, or query history — always an explicit caller
+    decision."""
+
+    note_id: int = Field(..., description="Note to pin/unpin")
+    pinned: bool = Field(default=True, description="True to pin (join Tier 0), False to unpin")
+
+
+class PinResponse(BaseModel):
+    note_id: int
+    pinned: bool
+    message: str
+    processing_ms: int
+
+
+class AnchorRequest(BaseModel):
+    """Attach anchor paths to an EXISTING note post-write
+    (UPG-ANCHOR-ATTACH) — the first-class replacement for the
+    re-store-with-supersedes workaround. Anchors are delivery-shaping
+    staleness probes, never a claim about note correctness: check_staleness()
+    compares their write-time hashes against the live files on every check.
+    See WorkingContextStore.attach_anchors() for the pair format and
+    idempotency contract."""
+
+    note_id: int = Field(..., description="Note to attach anchors to")
+    anchors: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Workspace-relative file paths to anchor this note to (at least one)",
+    )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Calling session's identity — threads into the "
+            "UPG-ANCHOR-UNOBSERVED-BINDING tri-state observation verdict "
+            "recorded per attached path (True/False when this session has "
+            "an observation ledger, None when none exists)"
+        ),
+    )
+
+
+class AnchorResponse(BaseModel):
+    note_id: int
+    attached: list[str] = Field(default_factory=list, description="Paths actually added, in request order")
+    already_present: list[str] = Field(default_factory=list, description="Requested paths the note was already anchored to (idempotent no-ops)")
+    message: str
+    processing_ms: int
+
+
+class UnanchorRequest(BaseModel):
+    """Remove anchor paths from an EXISTING note post-write
+    (UPG-ANCHOR-DETACH) — the inverse of `AnchorRequest` and the
+    single-call replacement for the re-store-with-supersedes workaround's
+    mirror case. Anchors are delivery-shaping staleness probes, never a
+    claim about note correctness: a removed anchor simply stops being a
+    candidate in the next check_staleness() check. See
+    `WorkingContextStore.detach_anchors()` for the idempotency contract
+    and the path-equality rule (exact-string on element 0, matching
+    `attach_anchors()` so a note is detachable by the same spelling that
+    anchored it)."""
+
+    note_id: int = Field(..., description="Note to remove anchors from")
+    anchors: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Workspace-relative file paths to detach this note from (at least one)",
+    )
+
+
+class UnanchorResponse(BaseModel):
+    note_id: int
+    removed: list[str] = Field(default_factory=list, description="Paths actually removed, in request order")
+    not_present: list[str] = Field(default_factory=list, description="Requested paths the note was not anchored to (idempotent no-ops)")
+    message: str
+    processing_ms: int
+
+
 # 'system' is not settable via these REST requests — reserved for the one
 # deterministic, non-judgment transition (stale_flagged, anchor drift);
 # every REVOKE/REINSTATE call here is, definitionally, a judgment call, so
@@ -720,6 +889,39 @@ class ReinstateRequest(BaseModel):
 
 
 class ReinstateResponse(BaseModel):
+    note_id: int
+    message: str
+    processing_ms: int
+
+
+class SupersedeRequest(BaseModel):
+    """Post-hoc supersession (UPG-NOTE-RETIRE-POST-HOC) — retire an
+    already-stored note as superseded, for a replacement that was written
+    without `supersedes=`. Appends a `superseded_post_hoc` event and sets
+    the same tombstone columns as the write-time path, so the note stops
+    being a default recall/fire candidate and renders with the factual
+    "[superseded ...]" badge — never the revoked deterrent. Reversible via
+    /v1/reinstate."""
+
+    note_id: int = Field(..., description="Note to retire as superseded")
+    superseded_by: int | None = Field(
+        default=None,
+        description="Optional ID of the replacement note; must already exist in this workspace",
+    )
+    reason: str | None = Field(
+        default=None, description="Optional: why this note is being retired as superseded"
+    )
+    actor: str = Field(default="agent", description="agent | human")
+
+    @field_validator("actor")
+    @classmethod
+    def validate_actor(cls, v: str) -> str:
+        if v not in _NOTE_EVENT_ACTOR_VALUES:
+            raise ValueError(f"actor must be one of: {', '.join(_NOTE_EVENT_ACTOR_VALUES)}")
+        return v
+
+
+class SupersedeResponse(BaseModel):
     note_id: int
     message: str
     processing_ms: int

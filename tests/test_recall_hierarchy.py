@@ -389,6 +389,24 @@ class TestServiceNoteIdExpand:
         result = svc.recall(detail="full")
         assert body in result
 
+    def test_service_recall_note_id_body_is_verbatim(self, tmp_path) -> None:
+        """UPG-RECALL-NOTE-ID-NO-EXPAND acceptance: note_id=N is a LOOKUP —
+        the note's stored content comes back verbatim, not a ranked subset."""
+        svc = self._make_service(tmp_path)
+        body = "VERBATIM_BODY_7f3d: def acquire_lock(): acquire(workspace)  # unique"
+        nid = svc.remember(body, title="verbatim check")
+        result = svc.recall(note_id=nid)
+        assert body in result
+
+    def test_service_recall_note_id_overrides_detail_index(self, tmp_path) -> None:
+        """note_id= is an expand path: detail='index' must NOT downgrade it
+        to a listing — a lookup wins over the presentation tier."""
+        svc = self._make_service(tmp_path)
+        body = "FULL_BODY_HIDDEN_FROM_INDEX_TIER"
+        nid = svc.remember(body, title="tier check")
+        result = svc.recall(note_id=nid, detail="index")
+        assert body in result
+
 
 # ---------------------------------------------------------------------------
 # (4) Hook injection emits index-tier text
@@ -499,6 +517,30 @@ class TestRESTHierarchy:
         resp = client_real_memory.post("/v1/recall", json={"max_age_days": 1.0, "detail": "full"})
         assert resp.status_code == 200
 
+    def test_recall_rest_note_id_with_detail_index_still_expands(self, client_real_memory) -> None:
+        """UPG-RECALL-NOTE-ID-NO-EXPAND: detail='index' does not downgrade
+        the note_id lookup to an index listing — REST threads both through,
+        and the lookup wins."""
+        r = client_real_memory.post("/v1/remember", json={"content": "OVERRIDE_TIER_BODY"})
+        nid = r.json()["note_id"]
+        resp = client_real_memory.post("/v1/recall", json={"note_id": nid, "detail": "index"})
+        assert resp.status_code == 200
+        assert "OVERRIDE_TIER_BODY" in resp.json()["notes"]
+
+    def test_recall_rest_unknown_sort_by_rejected_with_422(self, client_real_memory) -> None:
+        """UPG-REST-SORTBY-UNVALIDATED: an out-of-vocabulary sort_by is a
+        422 naming the allowed values — never a silent relevance fallback
+        at the store layer."""
+        client_real_memory.post("/v1/remember", json={"content": "note A"})
+        resp = client_real_memory.post("/v1/recall", json={"sort_by": "newest"})
+        assert resp.status_code == 422
+        assert "sort_by must be one of" in resp.text
+
+    def test_recall_rest_every_documented_sort_value_accepted(self, client_real_memory) -> None:
+        for value in ("relevance", "recency", "priority", "chronological"):
+            resp = client_real_memory.post("/v1/recall", json={"sort_by": value})
+            assert resp.status_code == 200, value
+
     def test_recall_rest_defaults_to_mcp_form_expand_hint(self, client_real_memory) -> None:
         """POST /v1/recall without surface keeps the MCP tool-call hint —
         the REST route is also used by hook-injected recall, whose reader is
@@ -530,6 +572,90 @@ class TestRESTHierarchy:
         message = resp.json()["message"]
         assert "vectr_recall" not in message
         assert "vectr recall" in message
+
+
+class TestRestAnchorAttach:
+    """UPG-ANCHOR-ATTACH: POST /v1/anchor — first-class post-write
+    anchoring over the REAL store-backed service."""
+
+    def test_attach_round_trip(self, client_real_memory) -> None:
+        r = client_real_memory.post("/v1/remember", json={"content": "how the deploy pipeline works"})
+        nid = r.json()["note_id"]
+        resp = client_real_memory.post("/v1/anchor", json={
+            "note_id": nid, "anchors": ["Dockerfile"],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        # A nonexistent path gets a null hash, never an error (same contract
+        # as remember(anchors=...)).
+        assert data["attached"] == ["Dockerfile"]
+        assert data["already_present"] == []
+        assert f"#{nid}" in data["message"]
+
+    def test_attach_is_idempotent(self, client_real_memory) -> None:
+        r = client_real_memory.post("/v1/remember", json={"content": "idempotent anchor note"})
+        nid = r.json()["note_id"]
+        client_real_memory.post("/v1/anchor", json={"note_id": nid, "anchors": ["Dockerfile"]})
+        resp = client_real_memory.post("/v1/anchor", json={"note_id": nid, "anchors": ["Dockerfile"]})
+        assert resp.status_code == 200
+        assert resp.json()["attached"] == []
+        assert resp.json()["already_present"] == ["Dockerfile"]
+
+    def test_attach_unknown_note_is_404_not_a_silent_ok(self, client_real_memory) -> None:
+        """Lookup semantics on a write surface too: an unknown id says so
+        explicitly (mirrors /v1/pin's 404 shape)."""
+        resp = client_real_memory.post("/v1/anchor", json={"note_id": 999999, "anchors": ["x.py"]})
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error"] == "note_not_found"
+
+    def test_attach_empty_anchors_is_422(self, client_real_memory) -> None:
+        resp = client_real_memory.post("/v1/anchor", json={"note_id": 1, "anchors": []})
+        assert resp.status_code == 422
+
+
+class TestRestUnanchorDetach:
+    """UPG-ANCHOR-DETACH: POST /v1/unanchor — first-class post-write
+    de-anchoring over the REAL store-backed service. Mirrors
+    POST /v1/anchor's contract: idempotent, 404 on unknown note, 422 on
+    empty anchors."""
+
+    def test_unanchor_round_trip(self, client_real_memory) -> None:
+        r = client_real_memory.post("/v1/remember", json={"content": "how the deploy pipeline works"})
+        nid = r.json()["note_id"]
+        # First attach so the path is actually on the note.
+        client_real_memory.post("/v1/anchor", json={"note_id": nid, "anchors": ["Dockerfile"]})
+        resp = client_real_memory.post("/v1/unanchor", json={
+            "note_id": nid, "anchors": ["Dockerfile"],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["removed"] == ["Dockerfile"]
+        assert data["not_present"] == []
+        assert f"#{nid}" in data["message"]
+
+    def test_unanchor_path_not_on_note_is_a_noop_not_an_error(self, client_real_memory) -> None:
+        """Idempotency: a path the note was never anchored to lands in
+        `not_present`, not a 404 or 422. Mirrors attach's
+        already-present-noop behaviour."""
+        r = client_real_memory.post("/v1/remember", json={"content": "unanchored note"})
+        nid = r.json()["note_id"]
+        resp = client_real_memory.post("/v1/unanchor", json={
+            "note_id": nid, "anchors": ["Dockerfile"],
+        })
+        assert resp.status_code == 200
+        assert resp.json()["removed"] == []
+        assert resp.json()["not_present"] == ["Dockerfile"]
+
+    def test_unanchor_unknown_note_is_404_not_a_silent_ok(self, client_real_memory) -> None:
+        """Lookup semantics on a write surface too: an unknown id says so
+        explicitly (mirrors /v1/anchor's 404 shape)."""
+        resp = client_real_memory.post("/v1/unanchor", json={"note_id": 999999, "anchors": ["x.py"]})
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error"] == "note_not_found"
+
+    def test_unanchor_empty_anchors_is_422(self, client_real_memory) -> None:
+        resp = client_real_memory.post("/v1/unanchor", json={"note_id": 1, "anchors": []})
+        assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------

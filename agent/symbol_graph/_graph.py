@@ -1346,6 +1346,7 @@ class SymbolGraph:
         name: str,
         limit: int = 10,
         caller_file: str | None = None,
+        with_near_miss: bool = False,
     ) -> LocateResult:
         """
         Multi-strategy L2 call resolution. Falls back through 5 strategies
@@ -1367,6 +1368,15 @@ class SymbolGraph:
         the returned symbol's ``name`` field whenever the symbol lives inside
         a class (parity with the searcher's qualified display).  Bare-leaf
         queries (no ``.``) are unchanged.
+
+        UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: with ``with_near_miss=True``
+        (the primary locate surface opts in; internal callers like the
+        search-hint paths keep the default False so every total miss does not
+        pay for suggestions it never renders), a "none" resolution also
+        computes the deterministic near-miss candidates — the exact machinery
+        of `nearest_symbol_names`, via `_near_miss_candidates` — and stores
+        them on the result's `near_miss` field, leaving `symbols` empty so a
+        miss can never masquerade as a match.
         """
         # UPG-11.10-b: detect "Class.method" qualifier in the query (shared
         # split convention with `trace` — see `_split_class_qualifier`).
@@ -1537,7 +1547,20 @@ class SymbolGraph:
                     query=name,
                 )
 
-        return LocateResult(symbols=[], resolution_strategy="none", query=name)
+        # UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: a total miss carries its
+        # deterministic near-miss candidates on the result (opt-in — see the
+        # docstring) so every consumer of the result object, not just the LLM
+        # formatter, can surface them. `symbols` stays empty: these are
+        # suggestions, never a resolution.
+        return LocateResult(
+            symbols=[],
+            resolution_strategy="none",
+            query=name,
+            near_miss=(
+                self._near_miss_candidates(workspace, name, limit)
+                if with_near_miss else []
+            ),
+        )
 
     def nearest_symbol_names(self, workspace: str, token: str, limit: int) -> list[Symbol]:
         """Cheap, deterministic near-miss lookup for a token that already
@@ -1589,24 +1612,57 @@ class SymbolGraph:
         key. A doubly-typo'd qualified token then still surfaces its correct
         symbol as a labeled-inexact suggestion instead of a zero-suggestion
         miss.
+
+        UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: the fallback stages documented
+        above now live in `_near_miss_candidates`, and `locate_l2`'s "none"
+        branch computes them itself (opt-in via `with_near_miss`) so the
+        primary locate surface gets the same suggestions onto its RESULT
+        object. This method delegates to that computation instead of
+        duplicating it — one source of truth for what "nearest" means.
         """
         if limit <= 0:
             return []
-        result = self.locate_l2(workspace, token, limit=limit)
+        result = self.locate_l2(workspace, token, limit=limit, with_near_miss=True)
         if result.resolution_strategy not in ("exact", "none"):
             return result.symbols[:limit]
+        if result.resolution_strategy == "none":
+            # The "none" branch above already computed exactly this fallback
+            # (qualifier widening + prefix containment) — reuse it rather than
+            # re-running the same queries here.
+            return result.near_miss[:limit]
+        # Exact resolution: `token` resolved cleanly, so by this method's own
+        # contract ("a token that already failed EXACT resolution") there is
+        # no near-miss to offer — never widen a correct answer into
+        # suggestions (UPG-NEARMISS-WIDEN-EXACT-GUARD's principle, applied to
+        # the bare-name case). No production caller reaches this with an
+        # exact-resolved token anyway: identifier_hint_nearmiss guards exact
+        # tokens out before calling, and trace() calls only for an unresolved
+        # qualifier whose probe can therefore never land "exact".
+        return []
 
+    def _near_miss_candidates(self, workspace: str, token: str, limit: int) -> list[Symbol]:
+        """The near-miss fallback stages for a token that FAILED resolution —
+        qualifier widening first (dotted tokens), then bare-name prefix
+        containment. Called only from `locate_l2`'s "none" branch (so every
+        candidate here is inexact by construction); `nearest_symbol_names`
+        reaches the same stages by delegating to that branch's result.
+
+        Returns candidates ranked best-first, capped at `limit`, snippets
+        populated. Empty when nothing resembles the token."""
         class_qualifier, leaf = _split_class_qualifier(token)
-        # UPG-NEARMISS-WIDEN-EXACT-GUARD: an exact-strategy result already
-        # resolved `token` cleanly — widening a resolved qualified token out
-        # to every OTHER same-leaf class would turn a correct answer into a
-        # pile of unrelated near-miss suggestions. Only "none" (the qualifier
-        # matched no real enclosing class) is a genuine miss to widen from.
-        if class_qualifier and result.resolution_strategy != "exact":
+        # UPG-NEARMISS-WIDEN-EXACT-GUARD: only a genuine miss reaches this
+        # method (the caller is the "none" branch), so widening out to OTHER
+        # same-leaf classes is safe here — an exact-strategy result would have
+        # resolved `token` cleanly and never been passed down.
+        if class_qualifier:
             pool = self._exact_definitions(
                 workspace, leaf, limit=SYMBOL_GRAPH_QUALIFIED_NEARMISS_CANDIDATE_CAP,
             )
             if not pool:
+                # UPG-QUALIFIED-TYPO-NEARMISS leaf-only retry. NOTE: this
+                # nested locate_l2 call must keep the default
+                # `with_near_miss=False` — passing True would let the nested
+                # "none" branch call back into _near_miss_candidates.
                 leaf_result = self.locate_l2(
                     workspace, leaf, limit=SYMBOL_GRAPH_QUALIFIED_NEARMISS_CANDIDATE_CAP,
                 )
@@ -1681,14 +1737,23 @@ class SymbolGraph:
         rank_repo_defined: bool,
         include_builtins: bool = True,
         exclude_uses: bool = False,
-    ) -> tuple[list[CallEdge], int]:
+    ) -> tuple[list[CallEdge], int, int, bool]:
         """Fetch edges by exact `column` match; fall back to partial (LIKE) only
         when no exact-named edge exists. Exact-first kills the substring
         conflation that merged unrelated symbols — `trace compare` no longer
         pulls in `compare_stacks` / `_Py_atomic_compare_exchange_*` (UPG-4.1).
         Results are deduped and ranked by relevance, then truncated (UPG-4.2).
-        Returns `(edges, hidden_builtins)` — the count of builtin/stdlib callees
-        suppressed before truncation when `include_builtins` is False (UPG-4.3).
+        Returns `(edges, hidden_builtins, truncated, raw_capped)` — the count
+        of builtin/stdlib callees suppressed before truncation when
+        `include_builtins` is False (UPG-4.3), the count of aggregated
+        entries dropped by the `limit` cut itself
+        (UPG-TRACE-CALLER-LIMIT-TRANSPARENCY), and whether the SQL fetch
+        itself hit `_EDGE_FETCH_CAP` so the per-direction `truncated` count
+        is a LOWER BOUND and the formatter must label it as such
+        (UPG-TRACE-EDGE-FETCH-CAP-UNCOUNTED). Without this flag, a heavily
+        called name (more than 1000 raw edge rows) would render a "(+N
+        more ...)" line that looks exact while undercounting the real
+        remainder by an unbounded amount.
         `exclude_uses` drops type-usage edges (UPG-4.4) — set on the callees
         direction so "Calls:" stays function calls, not the types a function
         mentions; left off for callers so `trace <Type>` finds its usage sites.
@@ -1705,7 +1770,16 @@ class SymbolGraph:
                     (workspace, f"%{name}%", self._EDGE_FETCH_CAP),
                 ).fetchall()
         edges = [self._row_to_edge(r) for r in rows]
-        return self._aggregate_edges(workspace, edges, group, limit, rank_repo_defined, include_builtins)
+        shown, hidden, truncated = self._aggregate_edges(
+            workspace, edges, group, limit, rank_repo_defined, include_builtins,
+        )
+        # UPG-TRACE-EDGE-FETCH-CAP-UNCOUNTED: a SQL fetch that returned
+        # exactly `_EDGE_FETCH_CAP` rows MAY have left more on the table.
+        # We don't pay a second query to know for sure — the formatter's
+        # reworded note ("at least N more ...") is true under either case
+        # and strictly more honest than the prior exact-looking version.
+        raw_capped = len(rows) >= self._EDGE_FETCH_CAP
+        return shown, hidden, truncated, raw_capped
 
     @staticmethod
     def _is_builtin_call(name: str, from_file: str, repo: set[str]) -> bool:
@@ -1726,17 +1800,27 @@ class SymbolGraph:
         limit: int,
         rank_repo_defined: bool,
         include_builtins: bool = True,
-    ) -> tuple[list[CallEdge], int]:
+    ) -> tuple[list[CallEdge], int, int]:
         """Collapse edges that share the same caller/callee name into one entry
         carrying a `call_count` of distinct call sites, then rank by relevance
         — repo-defined first (callees only), then call frequency, then name —
         and truncate to `limit`. Replaces the alphabetical-then-truncate path so
         important, repeatedly-called targets survive the cut (UPG-4.2).
+        Returns `(edges, hidden_builtins, truncated)`.
 
         When `not include_builtins` (callee path only), language-builtin/stdlib
         callees are dropped *before* truncation so they can't push repo-internal
         calls out of the window; returns the count hidden (UPG-4.3). Callers are
         never filtered — a caller is by definition a repo-defined function.
+
+        UPG-TRACE-CALLER-LIMIT-TRANSPARENCY: also returns how many aggregated,
+        post-suppression entries were dropped by the `limit` cut — the number
+        of real callers/callees the rendered list is silently missing. THIS is
+        the authoritative layer for that count: it is the only place the
+        user-facing `limit` is applied (the SQL fetch caps upstream bound raw
+        rows, not aggregated entries, and every later layer sees only the
+        already-truncated list), so a count computed anywhere downstream would
+        itself be wrong.
 
         UPG-CALLER-TIEBREAK-ALPHA: on the callers path (`rank_repo_defined=
         False`) call frequency was the only relevance signal above — a tied
@@ -1818,7 +1902,12 @@ class SymbolGraph:
                     e,
                 ))
         ranked.sort(key=lambda t: t[:-1])
-        return [t[-1] for t in ranked[:limit]], hidden
+        shown = [t[-1] for t in ranked[:limit]]
+        # UPG-TRACE-CALLER-LIMIT-TRANSPARENCY: entries beyond the cut are real
+        # callers/callees the rendered list will not show — counted HERE, at
+        # the only layer that applies the user-facing limit.
+        truncated = max(0, len(ranked) - limit)
+        return shown, hidden, truncated
 
     @staticmethod
     def _tied_call_count_names(groups: dict) -> set[str]:
@@ -1888,8 +1977,8 @@ class SymbolGraph:
 
     def callers(self, workspace: str, symbol_name: str, limit: int = 20) -> list[CallEdge]:
         """Who calls this symbol? Exact name match preferred (partial fallback).
-        Deduped by calling function, ranked by call frequency (UPG-4.2)."""
-        edges, _ = self._edges(workspace, "to_symbol", symbol_name, "from_symbol", limit, rank_repo_defined=False)
+        Deduped per (caller name, file), ranked by call frequency (UPG-4.2)."""
+        edges, _, _, _ = self._edges(workspace, "to_symbol", symbol_name, "from_symbol", limit, rank_repo_defined=False)
         return edges
 
     def callees(
@@ -1898,12 +1987,76 @@ class SymbolGraph:
         """What does this symbol call? Exact name match preferred (partial fallback).
         Deduped by callee, repo-internal calls ranked ahead of builtins (UPG-4.2);
         builtin/stdlib callees suppressed unless `include_builtins` (UPG-4.3)."""
-        edges, _ = self._edges(
+        edges, _, _, _ = self._edges(
             workspace, "from_symbol", symbol_name, "to_symbol", limit,
             rank_repo_defined=True, include_builtins=include_builtins,
             exclude_uses=True,
         )
         return edges
+
+    # ------------------------------------------------------------------
+    # UPG-BASE-METHOD-OVERRIDE-FLOOD: read API for same-file override edges
+    # written by `_extract_overrides` at index time. The data these return
+    # is the input a later ranking change would consume to lift a base
+    # method above its overrides in a same-leaf top-k tie (the F1/F23/
+    # F56 family). This lane ships the read API; the ranking change is
+    # out of scope and must be evidence-gated on real measurement.
+    # ------------------------------------------------------------------
+
+    def overrides_of(
+        self,
+        workspace: str,
+        from_file: str,
+        from_symbol: str,
+        from_line: int,
+    ) -> list[CallEdge]:
+        """Same-file base methods that *from_symbol* at *from_file:from_line*
+        overrides (UPG-BASE-METHOD-OVERRIDE-FLOOD).
+
+        The source is identified by (file, symbol name, line) — the same
+        triple the existing `edges` table uses for source identity. Returns
+        one CallEdge per base the method overrides; a method that overrides
+        multiple bases (e.g. a TS `class X extends A, B, C` where A, B, and
+        C are in the same file) returns one edge per base. A method that
+        extends a base defined in a different file is not present in the
+        result — see LANE-REPORT for the same-file scope rationale.
+
+        The returned `to_symbol` is the qualified `BaseClass.method` form
+        so the caller can `locate()` it without ambiguity. The base
+        file is implicit (same as `from_file` by construction).
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT from_file, from_symbol, from_line, to_symbol, edge_type "
+                "FROM edges WHERE workspace = ? AND edge_type = 'overrides' "
+                "AND from_file = ? AND from_symbol = ? AND from_line = ?",
+                (workspace, from_file, from_symbol, from_line),
+            ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
+    def overridden_by(
+        self,
+        workspace: str,
+        to_file: str,
+        to_symbol: str,
+    ) -> list[CallEdge]:
+        """Same-file subclass methods that override *to_symbol* in *to_file*
+        (UPG-BASE-METHOD-OVERRIDE-FLOOD). The inverse of `overrides_of`.
+
+        `to_symbol` is the qualified `BaseClass.method` form (as written
+        by `_extract_overrides`). Returns one CallEdge per subclass method
+        that overrides this base; the source `(from_file, from_symbol,
+        from_line)` triple on the returned edge identifies each override.
+        `from_file` equals `to_file` by the same-file scope of this lane.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT from_file, from_symbol, from_line, to_symbol, edge_type "
+                "FROM edges WHERE workspace = ? AND edge_type = 'overrides' "
+                "AND from_file = ? AND to_symbol = ?",
+                (workspace, to_file, to_symbol),
+            ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
 
     def _exact_definitions(self, workspace: str, name: str, limit: int = 20) -> list[Symbol]:
         """Definition sites whose name matches `name` exactly. Each (file_path,
@@ -2022,6 +2175,12 @@ class SymbolGraph:
         lookup_name = leaf if class_qualifier else symbol_name
 
         result: dict = {}
+        # UPG-TRACE-DIRECTION-UNQUERIED-RENDER: a direction the caller did NOT
+        # ask for is recorded as `None`, not `[]`, so the formatter can
+        # distinguish "we looked and found nothing" from "we never looked".
+        # `direction="both"` legitimately renders both blocks when both are
+        # genuinely empty — the `None`/`[]` split is what keeps that honest
+        # without conflating it with a single-direction trace.
         if direction in ("callers", "both"):
             # Callers can't be attributed to one class-qualified definition —
             # a call site never records the receiver's type — so a resolved
@@ -2030,17 +2189,51 @@ class SymbolGraph:
             # NOT resolve at all (below), the formatter is told so it can
             # label this same list honestly instead of presenting it as the
             # named class's callers.
-            result["callers"] = self.callers(workspace, lookup_name, limit)
+            #
+            # UPG-TRACE-CALLER-LIMIT-TRANSPARENCY: called via `_edges` rather
+            # than `self.callers()` only to capture how many aggregated caller
+            # entries the `limit` cut dropped — the formatter reports it.
+            # UPG-TRACE-EDGE-FETCH-CAP-UNCOUNTED: also captures whether the
+            # SQL fetch itself hit the upstream cap so the formatter can
+            # label the rendered "more not shown" count as a lower bound.
+            callers, _, callers_truncated, callers_raw_capped = self._edges(
+                workspace, "to_symbol", lookup_name, "from_symbol", limit,
+                rank_repo_defined=False,
+            )
+            result["callers"] = callers
+            result["callers_truncated"] = callers_truncated
+            result["callers_raw_capped"] = callers_raw_capped
+        else:
+            result["callers"] = None  # UPG-TRACE-DIRECTION-UNQUERIED-RENDER
         if direction in ("callees", "both"):
-            callees, hidden = self._edges(
+            callees, hidden, callees_truncated, callees_raw_capped = self._edges(
                 workspace, "from_symbol", lookup_name, "to_symbol", limit,
                 rank_repo_defined=True, include_builtins=include_builtins,
                 exclude_uses=True,
             )
             result["callees"] = callees
             result["hidden_builtins"] = hidden
+            result["callees_truncated"] = callees_truncated
+            result["callees_raw_capped"] = callees_raw_capped
+        else:
+            result["callees"] = None  # UPG-TRACE-DIRECTION-UNQUERIED-RENDER
 
         defs = self._exact_definitions(workspace, lookup_name, limit=limit)
+        # UPG-TRACE-CALLER-LIMIT-TRANSPARENCY: the definitions fetch is capped
+        # at `limit` too, and each definition renders as its own by-definition
+        # section — when the cap bit, whole definitions (with their calls) are
+        # silently missing. One conditional COUNT query resolves whether the
+        # fetch actually cut anything (len == limit could also mean exactly
+        # limit exist); zero cost on every non-boundary trace.
+        definitions_truncated = 0
+        if len(defs) == limit:
+            with self._conn() as conn:
+                total_defs = conn.execute(
+                    "SELECT COUNT(*) AS c FROM symbols WHERE workspace = ? AND name = ?",
+                    (workspace, lookup_name),
+                ).fetchone()["c"]
+            definitions_truncated = max(0, total_defs - len(defs))
+        result["definitions_truncated"] = definitions_truncated
         resolved_qualifier = False
         if class_qualifier:
             # UPG-RUST-IMPL-QUALIFIED-LOCATE: owner may be a class OR an
@@ -2079,7 +2272,7 @@ class SymbolGraph:
                     ).fetchall()
                     edges = [self._row_to_edge(r) for r in rows]
                     # dedup + relevance-rank + builtin-suppress this def's callees
-                    cs, hidden = self._aggregate_edges(
+                    cs, hidden, def_truncated = self._aggregate_edges(
                         workspace, edges, "to_symbol", limit,
                         rank_repo_defined=True, include_builtins=include_builtins,
                     )
@@ -2088,6 +2281,13 @@ class SymbolGraph:
                         "module": self._module_label(d.file_path, workspace),
                         "callees": cs,
                         "hidden_builtins": hidden,
+                        "truncated_callees": def_truncated,  # UPG-TRACE-CALLER-LIMIT-TRANSPARENCY
+                        # UPG-TRACE-EDGE-FETCH-CAP-UNCOUNTED: same per-entry
+                        # raw-cap signal as the flat direction — when this
+                        # definition alone has more raw edges than the SQL
+                        # cap, the per-entry "(+N more ...)" line is a
+                        # lower bound, not a count.
+                        "truncated_callees_raw_capped": len(rows) >= self._EDGE_FETCH_CAP,
                     })
             result["by_definition"] = by_def
         return result
@@ -2189,6 +2389,29 @@ class SymbolGraph:
 
     def format_locate_l2_for_llm(self, result: LocateResult) -> str:
         if not result.symbols:
+            # UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: a total miss that carries
+            # near-miss candidates renders them explicitly labeled inexact,
+            # following the labeling convention the other two surfaces already
+            # established — trace()'s qualifier-near-miss banner ("nearest ...
+            # by name resolution (inexact — verify before use)") and the
+            # search-hint section ("No exact match for '...'; nearest symbol
+            # names") — with the same listing shape as the fuzzy block below.
+            # Never a silent substitution: the miss stays a miss.
+            if result.near_miss:
+                names = ", ".join(s.name for s in result.near_miss)
+                n = len(result.near_miss)
+                lines = [
+                    f"No exact match for '{result.query}'. "
+                    f"Nearest symbol name{'s' if n != 1 else ''} by name resolution "
+                    f"(inexact — verify before use): {names}\n"
+                ]
+                for s in result.near_miss:
+                    lines.append(f"  [{s.kind}] {s.name}  {s.file_path}:{s.start_line}")
+                    if s.snippet:
+                        for ln in s.snippet.splitlines()[:SNIPPET_LINES]:
+                            lines.append(f"    {ln}")
+                        lines.append("")
+                return "\n".join(lines)
             return self._no_match_text(result.query)
         _labels = {
             "exact":        "exact name match",
@@ -2264,6 +2487,31 @@ class SymbolGraph:
             return ""
         return (f"    (+{n} builtin/stdlib call{'s' if n != 1 else ''} hidden — "
                 f"pass include_builtins=true to show)")
+
+    @staticmethod
+    def _truncation_note(n: int, what: str, raw_capped: bool = False) -> str:
+        """Footer telling the LLM how many entries a `limit` cut removed from
+        the list just rendered — without it, a caller/callee list reads as
+        complete when it is only a prefix of the real one, and the caller has
+        no signal to act on (UPG-TRACE-CALLER-LIMIT-TRANSPARENCY). Same shape
+        as the hidden-builtins footer above.
+
+        UPG-TRACE-EDGE-FETCH-CAP-UNCOUNTED: when `raw_capped` is True the
+        SQL fetch upstream of aggregation also hit `_EDGE_FETCH_CAP`, so
+        this `n` is a LOWER BOUND on the real remainder (more raw rows
+        may have been dropped before aggregation even ran). The note
+        rewords to "at least N more" and stops suggesting that raising
+        the user-facing `limit` is a sufficient fix — the cap that has
+        to be lifted for an exact count is the SQL `_EDGE_FETCH_CAP`
+        (static; not user-tunable today)."""
+        if n <= 0:
+            return ""
+        if raw_capped:
+            return (
+                f"    (+at least {n} more {what} not shown — raw edge row cap "
+                f"may hide more; count is a lower bound, not exact)"
+            )
+        return f"    (+{n} more {what} not shown — pass a higher limit to show)"
 
     @staticmethod
     def _empty_trace_hint(symbol_name: str) -> str:
@@ -2492,6 +2740,20 @@ class SymbolGraph:
                     f"calls are shown per definition. (Callers below match the name only "
                     f"and can't be attributed to one definition by static analysis.)\n"
                 )
+            # UPG-TRACE-CALLER-LIMIT-TRANSPARENCY: the definitions fetch is
+            # capped at the same `limit` as every list here, and each rendered
+            # definition is a slot against it — when the cap bit, whole
+            # definitions (with their calls) are missing. Suppressed for a
+            # RESOLVED qualified query: there the fetch ran over ALL classes'
+            # definitions and the beyond-cap ones are other-class sites the
+            # answer excluded by design, not silently-lost content.
+            defs_truncated = int(trace_result.get("definitions_truncated") or 0)
+            if defs_truncated > 0 and not qualified_class:
+                lines.append(
+                    f"(+{defs_truncated} more definition"
+                    f"{'s' if defs_truncated != 1 else ''} of '{leaf_name}' beyond "
+                    f"the limit not shown — pass a higher limit to show)\n"
+                )
             any_callees_found = False
             for entry in by_def:
                 d = entry["definition"]
@@ -2509,6 +2771,12 @@ class SymbolGraph:
                 note = self._hidden_builtins_note(entry.get("hidden_builtins", 0))
                 if note:
                     lines.append(note)
+                tnote = self._truncation_note(
+                    entry.get("truncated_callees", 0), "callees",
+                    raw_capped=entry.get("truncated_callees_raw_capped", False),
+                )
+                if tnote:
+                    lines.append(tnote)
                 lines.append("")
             callers = by_def_callers
             callers_empty = callers is not None and not callers
@@ -2517,15 +2785,39 @@ class SymbolGraph:
                     lines.append(f"{self._caller_verb(callers)} — any '{leaf_name}' ({len(callers)}):")
                     for e in callers:
                         lines.append(self._render_caller_line(e, spans, workspace))
+                    tnote = self._truncation_note(
+                        trace_result.get("callers_truncated", 0), "callers",
+                        raw_capped=bool(trace_result.get("callers_raw_capped")),
+                    )
+                    if tnote:
+                        lines.append(tnote)
                 else:
                     lines.append(f"Called by — any '{leaf_name}': (none found in index)")
             if callers_empty and not any_callees_found:
                 lines.append(self._empty_trace_hint(symbol_name))
             return "\n".join(lines)
 
-        callers = trace_result.get("callers", [])
-        callees = trace_result.get("callees", [])
-        spans, callee_loc = self._trace_call_site_ids(workspace, callers, [callees], chunk_span_lookup)
+        # UPG-TRACE-DIRECTION-UNQUERIED-RENDER: `callers`/`callees` are
+        # `None` (not `[]`) when the caller did not query that direction —
+        # `.get(key)` with no default is what lets the `is None` gate below
+        # mean "skip this block entirely" rather than "render a (none found
+        # in index) line about a lookup that never happened". `[]` is
+        # reserved for "queried and genuinely empty", which still renders
+        # its honest miss line.
+        callers = trace_result.get("callers")
+        callees = trace_result.get("callees")
+        if callers is None and callees is None:
+            # Neither direction queried — formatter is being called on a
+            # result that ran no SQL. Skip the body entirely; the only
+            # output is the header above.
+            return "\n".join(lines)
+        # `_trace_call_site_ids` treats `None` callers as `[]` and an empty
+        # `callee_lists` as nothing-to-resolve — passing it the un-queried
+        # direction as a literal empty input is safe and keeps the batch
+        # span resolver's contract intact.
+        spans, callee_loc = self._trace_call_site_ids(
+            workspace, callers or [], [callees or []], chunk_span_lookup,
+        )
         callers_empty = callers is not None and not callers
         if callers is not None:
             if callers:
@@ -2542,6 +2834,12 @@ class SymbolGraph:
                     lines.append(f"{self._caller_verb(callers)} ({len(callers)}):")
                 for e in callers:
                     lines.append(self._render_caller_line(e, spans, workspace))
+                tnote = self._truncation_note(
+                    trace_result.get("callers_truncated", 0), "callers",
+                    raw_capped=bool(trace_result.get("callers_raw_capped")),
+                )
+                if tnote:
+                    lines.append(tnote)
             elif qualifier_unresolved:
                 lines.append(f"Called by — any '{leaf_name}': (none found in index)")
             else:
@@ -2559,6 +2857,12 @@ class SymbolGraph:
                     lines.append(f"\nCalls ({len(callees)}):")
                 for e in callees:
                     lines.append(self._render_callee_line(e, "  ", callee_loc, spans, workspace))
+                tnote = self._truncation_note(
+                    trace_result.get("callees_truncated", 0), "callees",
+                    raw_capped=bool(trace_result.get("callees_raw_capped")),
+                )
+                if tnote:
+                    lines.append(tnote)
             else:
                 if qualifier_unresolved:
                     lines.append(f"\nCalls — any '{leaf_name}': (none found in index)")

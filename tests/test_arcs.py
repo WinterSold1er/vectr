@@ -406,6 +406,163 @@ class TestEditMediatedVsFlaky:
 
 
 # ---------------------------------------------------------------------------
+# Effective-cwd bucketing: relative composition + refusal
+# (UPG-ARC-CWD-VS-EFFECTIVE-DIR refinement of commit 7cbd847)
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveCwdBucketing:
+    """7cbd847 already bucketed on the RAW leading-cd target text; this
+    refinement composes RELATIVE targets with the episode's cwd field,
+    keys tilde/$HOME forms symbolically, and REFUSES TO PAIR entirely on
+    targets no static string can resolve (`cd -`, `$var`, declined shapes).
+    Refusal bias: an arc that is not offered costs a missed lesson; an arc
+    offered under a guessed directory can persist a false lesson into
+    memory permanently."""
+
+    def test_relative_cd_composes_with_cwd_field_across_repos(self) -> None:
+        # HEADLINE: both episodes share NO directory but their textual cd
+        # target agrees — with the shipped textual key both landed in
+        # bucket ("mvn", "sub") and the /work/A failure paired with the
+        # /work/B success (a lesson about a repo pairing that never
+        # happened). Composed keys /work/A/sub and /work/B/sub differ.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/work/A", cmd_raw="cd sub && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/work/B", cmd_raw="cd sub && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert arcs == []
+        state = d._sessions["s1"]
+        assert len(state.pending[("mvn", "/work/A/sub")]) == 1
+
+    def test_relative_cd_same_base_still_pairs(self) -> None:
+        # Composition must not kill the genuine same-repo case.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/work/A", cmd_raw="cd sub && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/work/A", cmd_raw="cd sub && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert len(arcs) == 1
+        assert arcs[0].mutation_diff == {"flag": (("-Dtest=Foo",), ("-Dtest=Bar",))}
+
+    def test_absolute_cd_replaces_harness_cwd(self) -> None:
+        # When the command cds to an absolute path the harness cwd fields
+        # are irrelevant — both episodes really ran in /shared/repo, so
+        # they pair even though every other cwd signal disagrees.
+        d = ArcDetector()
+        d.observe(
+            make_episode(
+                ts=0, cwd="/harness/first", cmd_raw="cd /shared/repo && mvn test -Dtest=Foo", outcome="failure"
+            )
+        )
+        arcs = d.observe(
+            make_episode(
+                ts=1, cwd="/harness/second", cmd_raw="cd /shared/repo && mvn test -Dtest=Bar", outcome="success"
+            )
+        )
+        assert len(arcs) == 1
+
+    def test_bare_cd_keys_symbolic_home_not_cwd_field(self) -> None:
+        # `cd && mvn ...` runs in $HOME; plain `mvn ...` runs in the
+        # harness cwd. Same cwd FIELD, different effective directories ->
+        # never pair. With the shipped fallback (bare cd -> cwd field)
+        # both keyed identically and WOULD have paired.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/w/A", cmd_raw="cd && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/w/A", cmd_raw="mvn test -Dtest=Bar", outcome="success")
+        )
+        assert arcs == []
+        state = d._sessions["s1"]
+        assert len(state.pending[("mvn", "~")]) == 1
+
+    def test_two_bare_cd_commands_pair_as_same_home(self) -> None:
+        # Both episodes genuinely ran in $HOME regardless of their harness
+        # cwd fields, so the symbolic key groups them truthfully.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/w/A", cmd_raw="cd && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/w/B", cmd_raw="cd && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert len(arcs) == 1
+
+    def test_tilde_target_pairs_across_different_cwd_fields(self) -> None:
+        # `~/repo` resolves to the SAME $HOME-derived directory on this
+        # machine for both episodes; the tilde-form is the truthful key.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/w/A", cmd_raw="cd ~/repo && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/w/B", cmd_raw="cd ~/repo && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert len(arcs) == 1
+
+    def test_oldpwd_dash_refuses_pairing_entirely(self) -> None:
+        # `cd -` means $OLDPWD — unknowable from a static string and
+        # different at every call site. Neither episode may enter pending
+        # nor resolve one; with any shared-key guess these two would pair.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/w/A", cmd_raw="cd - && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/w/A", cmd_raw="cd - && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert arcs == []
+        assert d._sessions["s1"].pending == {}
+
+    def test_env_var_target_refuses_pairing_entirely(self) -> None:
+        # $REPO's VALUE can change between call sites even though the NAME
+        # recurs — a textual key would falsely group two different repos,
+        # so refusal is the only truthful verdict.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/w/A", cmd_raw="cd $REPO && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/w/A", cmd_raw="cd $REPO && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert arcs == []
+        assert d._sessions["s1"].pending == {}
+
+    def test_flagged_cd_declined_shape_refuses_pairing(self) -> None:
+        # BEHAVIOR CHANGE vs 7cbd847, which fell back to the cwd field for
+        # shapes it declined parsing (flagged `cd -- <path>`): such a
+        # command PROVABLY did not run in the harness cwd, so trusting that
+        # field is knowingly wrong. Refusal is the honest verdict.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/w/A", cmd_raw="cd -- /repo-a && mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/w/A", cmd_raw="cd -- /repo-a && mvn test -Dtest=Bar", outcome="success")
+        )
+        assert arcs == []
+        assert d._sessions["s1"].pending == {}
+
+    def test_glued_separator_cd_composes_too(self) -> None:
+        # Items (1)+(2) interplay: the glued-separator tokenizer fix feeds
+        # the classifier, so even `cd sub;mvn ...` composes per-harness-cwd.
+        d = ArcDetector()
+        d.observe(
+            make_episode(ts=0, cwd="/work/A", cmd_raw="cd sub;mvn test -Dtest=Foo", outcome="failure")
+        )
+        arcs = d.observe(
+            make_episode(ts=1, cwd="/work/B", cmd_raw="cd sub;mvn test -Dtest=Bar", outcome="success")
+        )
+        assert arcs == []
+
+
+# ---------------------------------------------------------------------------
 # False-positive traps (§3.5)
 # ---------------------------------------------------------------------------
 

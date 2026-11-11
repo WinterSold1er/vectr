@@ -57,6 +57,12 @@ def _make_service():
         # UPG-HOOK-INJECT-OBSERVABILITY: hook injection counters are always
         # present in the real service.status() output — mock the real shape.
         "hook_injection_counts": {"SessionStart": 3, "PreToolUse": 2},
+        # UPG-PURPOSE-RESUME-HOLE: ARCH-4 dual-vector purpose-chunk count and
+        # per-run backfill-gap count are always present in the real
+        # service.status() output — mock the real shape.
+        "total_purpose_chunks": 480,
+        "purpose_backfill_pending_files": 0,
+        "purpose_vectors_pending": False,
     }
     svc.get_map.return_value = "# Codebase Passport\nFastAPI service."
     # UPG-6.2: save_map returns a shaped result — real shape.
@@ -522,6 +528,34 @@ def test_status(client) -> None:
     # UPG-HOOK-INJECT-OBSERVABILITY: hook injection counters surface in
     # /v1/status so `vectr status`/vectr_status can render them.
     assert data["hook_injection_counts"] == {"SessionStart": 3, "PreToolUse": 2}
+    # UPG-PURPOSE-RESUME-HOLE: ARCH-4 purpose-chunk count and per-run
+    # backfill-gap count surface in /v1/status so a body/purpose divergence
+    # cannot hide behind a green status.
+    assert data["total_purpose_chunks"] == 480
+    assert data["purpose_backfill_pending_files"] == 0
+
+
+def test_status_purpose_backfill_gap_surfaces(client) -> None:
+    """UPG-PURPOSE-RESUME-HOLE: when the indexer's most recent run found
+    files with current body content but incomplete purpose vectors,
+    /v1/status must report the exact count via
+    purpose_backfill_pending_files rather than requiring the caller to
+    infer a gap by dividing total_chunks by total_purpose_chunks (a ratio
+    that is always < 1 even on a fully healthy index, since only
+    symbol-bearing chunks get a purpose vector at all)."""
+    svc = client.app.state.service
+    svc.status.return_value = {
+        **svc.status.return_value,
+        "total_chunks": 500,
+        "total_purpose_chunks": 40,
+        "purpose_backfill_pending_files": 7,
+    }
+    resp = client.get("/v1/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_chunks"] == 500
+    assert data["total_purpose_chunks"] == 40
+    assert data["purpose_backfill_pending_files"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +742,7 @@ class TestClientAttributionHeader:
         from app.service import RememberOutcome
         app.state.service.search_only = False
         app.state.service.remember_with_extras.return_value = RememberOutcome(
-            note_id=7, related=[], proxy_anchor_suggestions=[],
+            note_id=7, related=[], revoked_related=[], proxy_anchor_suggestions=[],
         )
         return client.post(
             "/mcp",

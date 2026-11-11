@@ -187,6 +187,134 @@ class TestReadContentFileMultiRoot:
             read_content_file(str(primary), "note.txt", extra_roots=[str(extra_root)])
 
 
+class TestReadContentFileAdditionalReadableRoots:
+    """UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL: the operator can opt in to a
+    configured set of additional absolute roots content_file is allowed to
+    read from, BEYOND the primary workspace root and any extra_roots — for
+    a directory the workspace does not own but agents are instructed to
+    write to (a harness scratchpad dir, a per-session temp dir, etc.). The
+    trust decision is operator-only (config or per-call argument passed
+    down from a service built by the operator), never a flag the caller
+    can simply always pass to widen containment."""
+
+    def test_default_config_has_no_additional_readable_roots(self) -> None:
+        """Off by default — the boundary is unchanged until the operator
+        explicitly lists at least one root in
+        `memory_write.content_file.additional_readable_roots`."""
+        from agent.config import MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS
+        assert MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS == ()
+
+    def test_absolute_path_under_additional_root_is_accepted(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        note_file = scratch / "note.txt"
+        note_file.write_text("body from the harness scratchpad", encoding="utf-8")
+        assert read_content_file(
+            str(primary), str(note_file), additional_readable_roots=[str(scratch)],
+        ) == "body from the harness scratchpad"
+
+    def test_path_outside_every_accepted_root_is_still_rejected(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        outside = tmp_path_factory.mktemp("cf-outside") / "secret.txt"
+        outside.write_text("nope", encoding="utf-8")
+        with pytest.raises(ValueError, match="outside every workspace root"):
+            read_content_file(
+                str(primary), str(outside), additional_readable_roots=[str(scratch)],
+            )
+
+    def test_dotdot_escape_from_additional_root_is_still_rejected(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        outside_root = tmp_path_factory.mktemp("cf-outside")
+        (outside_root / "secret.txt").write_text("nope", encoding="utf-8")
+        # Same shape as the extra_root test above, now from an additional
+        # readable root: a `..` from inside the additional root that
+        # reaches a sibling of the additional root must still be rejected.
+        escaping = str(scratch / ".." / outside_root.name / "secret.txt")
+        with pytest.raises(ValueError, match="outside every workspace root"):
+            read_content_file(
+                str(primary), escaping, additional_readable_roots=[str(scratch)],
+            )
+
+    def test_symlink_inside_additional_root_pointing_outside_all_roots_is_rejected(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        outside = tmp_path_factory.mktemp("cf-outside") / "secret.txt"
+        outside.write_text("nope", encoding="utf-8")
+        link = scratch / "link.txt"
+        link.symlink_to(outside)
+        with pytest.raises(ValueError, match="outside every workspace root"):
+            read_content_file(
+                str(primary), str(link), additional_readable_roots=[str(scratch)],
+            )
+
+    def test_relative_path_is_never_resolved_against_additional_roots(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        """Documented rule (same as extra_roots): a relative raw_path
+        resolves against the PRIMARY root only — it is never trial-resolved
+        against additional_readable_roots, so a file that exists ONLY
+        under an additional root is not found by a relative path even
+        though it would be found by the absolute equivalent."""
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        (scratch / "note.txt").write_text("only in scratch", encoding="utf-8")
+        with pytest.raises(ValueError, match="does not exist"):
+            read_content_file(
+                str(primary), "note.txt", additional_readable_roots=[str(scratch)],
+            )
+
+    def test_empty_additional_readable_roots_explicit_disables_default(
+        self, tmp_path, tmp_path_factory, monkeypatch,
+    ) -> None:
+        """An explicit `additional_readable_roots=[]` is a "no additional
+        roots this call" — distinct from the default None that falls back
+        to the config singleton. Even with the config singleton populated
+        (here monkeypatched to include a real root), an explicit empty
+        list on a single call must NOT widen containment for that call."""
+        from agent.working_context_store import _content_file as _cf
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        note_file = scratch / "note.txt"
+        note_file.write_text("body", encoding="utf-8")
+        monkeypatch.setattr(
+            _cf, "MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS", (str(scratch),),
+        )
+        with pytest.raises(ValueError, match="outside every workspace root"):
+            read_content_file(
+                str(primary), str(note_file), additional_readable_roots=[],
+            )
+
+    def test_configured_default_additional_root_is_honored(
+        self, tmp_path, tmp_path_factory, monkeypatch,
+    ) -> None:
+        """`additional_readable_roots=None` (the default) reads from the
+        config singleton — a calling agent that did NOT opt in to anything
+        still gets the operator-configured set. The MCP and REST dispatch
+        layers both pass None, so the config is the only thing that
+        matters in production."""
+        from agent.working_context_store import _content_file as _cf
+        primary = tmp_path
+        scratch = tmp_path_factory.mktemp("scratch")
+        note_file = scratch / "note.txt"
+        note_file.write_text("body from config-default root", encoding="utf-8")
+        monkeypatch.setattr(
+            _cf, "MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS", (str(scratch),),
+        )
+        # No `additional_readable_roots` kwarg — falls back to the
+        # config-default (here monkeypatched to include the scratch dir).
+        assert read_content_file(str(primary), str(note_file)) == "body from config-default root"
+
+
 class TestResolveRememberContent:
     def test_content_only_is_returned_unmodified(self, tmp_path) -> None:
         assert resolve_remember_content(str(tmp_path), "hello", None) == "hello"
@@ -207,6 +335,28 @@ class TestResolveRememberContent:
     def test_whitespace_only_content_is_treated_as_absent(self, tmp_path) -> None:
         with pytest.raises(ValueError, match="content or content_file is required"):
             resolve_remember_content(str(tmp_path), "   ", None)
+
+    def test_content_file_under_additional_root_resolves(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        scratch = tmp_path_factory.mktemp("scratch")
+        (scratch / "n.txt").write_text("from scratch", encoding="utf-8")
+        assert resolve_remember_content(
+            str(tmp_path), None, str(scratch / "n.txt"),
+            additional_readable_roots=[str(scratch)],
+        ) == "from scratch"
+
+    def test_content_file_outside_every_accepted_root_is_rejected(
+        self, tmp_path, tmp_path_factory,
+    ) -> None:
+        scratch = tmp_path_factory.mktemp("scratch")
+        outside = tmp_path_factory.mktemp("cf-outside") / "n.txt"
+        outside.write_text("nope", encoding="utf-8")
+        with pytest.raises(ValueError, match="outside every workspace root"):
+            resolve_remember_content(
+                str(tmp_path), None, str(outside),
+                additional_readable_roots=[str(scratch)],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +509,54 @@ class TestMcpRememberContentFileMultiRoot:
         assert "outside every workspace root" in result["content"][0]["text"]
 
 
+class TestMcpRememberContentFileAdditionalReadableRoots:
+    """UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL: end-to-end proof through the
+    real MCP `vectr_remember` tool that the operator-configured additional
+    readable roots are honored — and that the dispatcher does NOT pass any
+    per-call widening argument, so the boundary is config-only, not
+    caller-controlled."""
+
+    def test_file_under_additional_root_is_accepted_via_mcp(
+        self, tmp_path, tmp_path_factory, monkeypatch,
+    ) -> None:
+        from agent.working_context_store import _content_file as _cf
+        svc = _make_service(tmp_path, monkeypatch, memory_only=True)
+        scratch = tmp_path_factory.mktemp("scratch")
+        # The MCP dispatcher does NOT take a per-call additional_readable_roots
+        # argument — the only way for the path to be accepted is via the
+        # config singleton. This pins the contract that an operator opts in
+        # by setting `memory_write.content_file.additional_readable_roots`
+        # in config.yaml, and both surfaces pick it up.
+        monkeypatch.setattr(
+            _cf, "MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS",
+            (str(scratch),),
+        )
+        note_file = scratch / "note.txt"
+        note_file.write_text("scratch body", encoding="utf-8")
+
+        result = handle_tools_call("vectr_remember", {"content_file": str(note_file)}, svc)
+        assert result["isError"] is False
+        note_id = _note_id_from_confirmation(result["content"][0]["text"])
+        stored = svc._context_store.get_note(svc._workspace_root, note_id)
+        assert stored.content == "scratch body"
+
+    def test_file_outside_every_accepted_root_is_still_an_mcp_error(
+        self, tmp_path, tmp_path_factory, monkeypatch,
+    ) -> None:
+        from agent.working_context_store import _content_file as _cf
+        svc = _make_service(tmp_path, monkeypatch, memory_only=True)
+        scratch = tmp_path_factory.mktemp("scratch")
+        monkeypatch.setattr(
+            _cf, "MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS",
+            (str(scratch),),
+        )
+        outside = tmp_path_factory.mktemp("cf-outside") / "secret.txt"
+        outside.write_text("nope", encoding="utf-8")
+        result = handle_tools_call("vectr_remember", {"content_file": str(outside)}, svc)
+        assert result["isError"] is True
+        assert "outside every workspace root" in result["content"][0]["text"]
+
+
 # ---------------------------------------------------------------------------
 # REST POST /v1/remember — its own coverage, not inferred from the MCP pass
 # ---------------------------------------------------------------------------
@@ -484,6 +682,50 @@ class TestRestRememberContentFileMultiRoot:
     ) -> None:
         extra_root = tmp_path_factory.mktemp("extra-root")
         client_real_memory.app.state.service._extra_roots = [str(extra_root)]
+        outside = tmp_path_factory.mktemp("cf-outside") / "secret.txt"
+        outside.write_text("nope", encoding="utf-8")
+
+        resp = client_real_memory.post("/v1/remember", json={"content_file": str(outside)})
+        assert resp.status_code == 422
+        assert "outside every workspace root" in resp.json()["detail"]["detail"]
+
+
+class TestRestRememberContentFileAdditionalReadableRoots:
+    """UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL: REST-side mirror of
+    TestMcpRememberContentFileAdditionalReadableRoots. Both surfaces
+    resolve through the same `resolve_remember_content` and read the
+    config singleton for `additional_readable_roots` — same configuration
+    knob, identical behaviour, no per-call widening."""
+
+    def test_file_under_additional_root_is_accepted_via_rest(
+        self, client_real_memory, tmp_path_factory, monkeypatch,
+    ) -> None:
+        from agent.working_context_store import _content_file as _cf
+        scratch = tmp_path_factory.mktemp("scratch")
+        monkeypatch.setattr(
+            _cf, "MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS",
+            (str(scratch),),
+        )
+        note_file = scratch / "note.txt"
+        note_file.write_text("scratch body via REST", encoding="utf-8")
+
+        resp = client_real_memory.post("/v1/remember", json={"content_file": str(note_file)})
+        assert resp.status_code == 200
+        note_id = resp.json()["note_id"]
+        full = client_real_memory.post(
+            "/v1/recall", json={"note_id": note_id, "detail": "full"},
+        ).json()["notes"]
+        assert "scratch body via REST" in full
+
+    def test_file_outside_every_accepted_root_still_returns_422(
+        self, client_real_memory, tmp_path_factory, monkeypatch,
+    ) -> None:
+        from agent.working_context_store import _content_file as _cf
+        scratch = tmp_path_factory.mktemp("scratch")
+        monkeypatch.setattr(
+            _cf, "MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS",
+            (str(scratch),),
+        )
         outside = tmp_path_factory.mktemp("cf-outside") / "secret.txt"
         outside.write_text("nope", encoding="utf-8")
 

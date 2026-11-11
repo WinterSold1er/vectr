@@ -75,6 +75,11 @@ def vectr_service(tmp_path_factory):
     Uses the same _DummyEmbedProvider pattern as the integration fixtures so no
     model download is required. BM25 lexical search is sufficient for substring-
     based deterministic recall; semantic ranking uses deterministic dummy vectors.
+
+    Yields (service, index_stats) — index_stats is the (files_indexed,
+    total_chunks, elapsed_ms) tuple svc.index() returned, kept alongside so
+    recall failures can tell an EMPTY corpus (fixture/ignore-rule breakage)
+    apart from a ranking collapse.
     """
     from unittest.mock import patch
     from tests.conftest import _DummyEmbedProvider, _RealVectrService
@@ -82,12 +87,23 @@ def vectr_service(tmp_path_factory):
     workspace = str(Path(__file__).parent.parent)
     db_dir = str(tmp_path_factory.mktemp("ragas_eval_db"))
 
+    # The mtime patch below targets the method index_workspace() actually
+    # calls (_load_mtime_cache_with_reason); the old patch here targeted the
+    # two-name wrapper (_load_mtime_cache) and was therefore INEFFECTIVE — it
+    # looked like it forced a full rescan but never ran.
     with patch("agent.indexer.get_embed_provider", return_value=_DummyEmbedProvider()), \
-         patch("agent.indexer.CodeIndexer._load_mtime_cache", return_value={}), \
+         patch("agent.indexer.CodeIndexer._load_mtime_cache_with_reason", return_value=({}, False)), \
          patch.dict("os.environ", {"VECTR_DB_DIR": db_dir, "VECTR_EMBED_MODEL": "dummy"}):
-        svc = _RealVectrService(workspace_root=workspace)
-        svc.index(workspace)
-        yield svc
+        # configure_ide=False: this fixture points a real VectrService at the
+        # real source tree on purpose (retrieval quality needs real code to
+        # search), but indexing the tree must not also REWRITE it. Left at its
+        # default True, phase-2 startup writes .cursor/mcp.json,
+        # .vscode/mcp.json and .claude/settings.json into the developer's
+        # working checkout, pointing their editor at whatever port this
+        # in-process service reports. There is no HTTP bind here to advertise.
+        svc = _RealVectrService(workspace_root=workspace, configure_ide=False)
+        index_stats = svc.index(workspace)
+        yield svc, index_stats
 
 
 def _retrieve_contexts(service, question: str, n: int = 5) -> list[str]:
@@ -110,7 +126,24 @@ class TestDeterministicPrecisionRecall:
 
     @pytest.fixture(autouse=True)
     def _svc(self, vectr_service):
-        self.svc = vectr_service
+        self.svc, self.index_stats = vectr_service
+
+    def _corpus_diagnostics(self) -> str:
+        """One-line discriminator for recall failures: an empty corpus means
+        the FIXTURE broke (ignore rules/path resolution swallowed the tree —
+        e.g. UPG-RAGAS-WORKTREE-GUARD's ancestor-exclusion class); a healthy
+        corpus with zero recall means ranking collapsed. PYTHONHASHSEED is
+        included because the dummy embedder derives vectors from hash() —
+        cross-process nondeterminism is a known suspect for flaky recall."""
+        files, chunks, elapsed_ms = (list(self.index_stats) + [None, None, None])[:3]
+        seed = os.environ.get("PYTHONHASHSEED", "<unset: randomized per process>")
+        hint = ""
+        if not files:
+            hint = " — CORPUS IS EMPTY: the fixture indexed nothing; suspect ignore rules or workspace resolution, NOT ranking"
+        return (
+            f"indexed_files={files} total_chunks={chunks} index_ms={elapsed_ms} "
+            f"PYTHONHASHSEED={seed}{hint}"
+        )
 
     def _evaluate(self, sample: EvalSample, n: int = 5) -> tuple[float, int]:
         contexts = _retrieve_contexts(self.svc, sample.question, n=n)
@@ -123,7 +156,10 @@ class TestDeterministicPrecisionRecall:
         """At least one sample must have non-zero deterministic precision."""
         assert any(
             self._evaluate(s)[0] > 0 for s in _make_eval_samples()
-        ), "vectr_search returned 0 relevant chunks for ALL eval samples"
+        ), (
+            "vectr_search returned 0 relevant chunks for ALL eval samples — "
+            f"{self._corpus_diagnostics()}"
+        )
 
     def test_mean_recall_above_threshold(self):
         """Mean recall across all samples must be ≥ 0.4."""
@@ -132,7 +168,7 @@ class TestDeterministicPrecisionRecall:
         mean_recall = sum(recalls) / len(recalls)
         assert mean_recall >= 0.4, (
             f"Mean deterministic recall {mean_recall:.2f} < 0.40 — "
-            f"per-sample recalls: {recalls}"
+            f"per-sample recalls: {recalls}. {self._corpus_diagnostics()}"
         )
 
     def test_per_sample_results_logged(self):
@@ -164,7 +200,7 @@ class TestRagasContextMetrics:
 
     @pytest.fixture(autouse=True)
     def _svc(self, vectr_service):
-        self.svc = vectr_service
+        self.svc, self.index_stats = vectr_service
 
     def _build_ragas_dataset(self, samples: list[EvalSample], n: int = 5):
         datasets = pytest.importorskip("datasets")

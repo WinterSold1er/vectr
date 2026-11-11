@@ -1,8 +1,6 @@
 """vectr bundled-config loader.
 
-Reads ``agent/config.yaml`` at import time and caches the results, layering the
-user's ``embedding:`` settings from ``~/.vectr/config.yaml`` and the workspace
-``.vectr/config.yaml`` over the bundled block (workspace wins).  All paths
+Reads ``agent/config.yaml`` at import time and caches the results.  All paths
 are resolved via ``importlib.resources`` so this works both when running from
 the repository root *and* when vectr is installed as the global binary
 (``/opt/homebrew/bin/vectr`` or similar pip install), where a ``cwd``-relative
@@ -70,8 +68,27 @@ RERANK_PRE_FILTER_FETCH_K : int
     via is_trivial_chunk(), then trims to top_k_unfiltered before the cross-encoder
     runs. Ensures the rerank pool is filled with real code on fixture-heavy corpora.
 
+RERANK_MAX_LENGTH : int
+    Cross-encoder max sequence length in tokens (UPG-RERANK-LATENCY-BUDGET).
+    Was hardcoded in agent/searcher.py; now a config sibling of model/top_k.
+
+RERANK_BATCH_SIZE_BY_DEVICE : dict[str, int]
+    predict() batch_size for the reranker cross-encoder, keyed by the
+    resolved torch device type (CrossEncoder.device.type — the same
+    attribute sentence_transformers itself populates when no device is
+    given). See agent/config.yaml's ranking.rerank.batch_size comment for
+    the measured per-device evidence (UPG-RERANK-LATENCY-BUDGET); batch_size
+    only changes wall-clock latency, never rank order. The "default" key is
+    the fallback for any device this hasn't been measured on.
+
 INDEXING_MAX_CHUNK_LINES : int
     Hard cap on lines per chunk — prevents single huge chunks diluting embeddings (UPG-12.1).
+
+INDEXING_MAX_CHUNK_CHARS : int
+    Hard cap on characters per chunk (UPG-WINDOW-CHUNK-BYTE-CAP). A single long
+    source line defeats every line-based cap; oversized chunks are sub-split
+    into bounded pieces so the tail stays retrievable instead of being embedded
+    (paid for in memory/latency) and then truncated at the embedder's token cap.
 
 INDEXING_CLASS_HEADER_LINES : int
     Lines kept for class-level chunk (sig + docstring + attrs) (UPG-12.1).
@@ -97,6 +114,10 @@ EVICTION_HINT_MAX_IDS : int
 EVICTION_MAX_TRACKED_SESSIONS : int
     Maximum concurrent per-session EvictionAdvisor instances tracked by a
     daemon before the oldest is dropped (LRU) (UPG-EVICT-SESSION-SCOPE).
+    Also reused, same cap and same LRU shape, by WorkingContextStore's
+    per-session anchor-observation ledger (UPG-ANCHOR-UNOBSERVED-BINDING)
+    — one more per-session in-memory dict with the identical unbounded-
+    session-growth risk, not a reason for a second tunable.
 
 EVICTION_REMEMBER_ESCALATION_CHUNKS : int
     Chunks retrieved since the caller's last vectr_remember before
@@ -146,6 +167,11 @@ MEMORY_HYGIENE_STALE_TASK_WARN_COUNT : int
 MEMORY_HYGIENE_STALE_TASK_WARN_AGE_DAYS : int
     Age in days after which a kind="task" note counts toward the stale count
     above (UPG-TASK-SUPERSEDES-HYGIENE).
+
+MEMORY_EXPORT_DEBOUNCE_SECONDS : float
+    Seconds of write-quiet, per workspace, before a scheduled `vectr memory
+    export` re-render actually runs (UPG-MEMORY-LEGIBLE-FILE-PROJECTION part
+    (a)). Coalesces a same-turn burst of writes into a single re-render.
 
 LOCATE_LARGE_SPAN_THRESHOLD : int
     Line-span (end_line - start_line) at or above which a located symbol is
@@ -216,6 +242,24 @@ DOCSTRING_DEDUP_MAX_REPS_COMPARED : int
     chunks share one boilerplate leading doc but are genuinely different.
     Fails in the safe direction only — a candidate past this bound is never
     falsely collapsed, only left as an extra separate result.
+
+NEAR_DUP_BODY_ENABLED : bool
+NEAR_DUP_BODY_SIMILARITY_MIN : float
+    Minimum difflib.SequenceMatcher ratio between two chunks' full normalized
+    bodies required to collapse a candidate into an already-kept
+    representative under the LANE-NEARDUP-DEDUP content-only key. Higher than
+    DOCSTRING_DEDUP_BODY_SIMILARITY_MIN (0.75) — this lane is for the
+    truly-near-identical-content case (verbatim or nearly-verbatim
+    restatement), not the boilerplate-header case DEF-C catches. Two
+    genuinely different functions discussing the same subject sit well below
+    this threshold; only near-verbatim copy-pasted bodies clear it.
+
+NEAR_DUP_BODY_MAX_REPS_COMPARED : int
+    Max already-kept representatives compared per new candidate under the
+    LANE-NEARDUP-DEDUP content-only key before the candidate stops being
+    compared and becomes its own representative. Same shape and
+    safe-failure direction as DOCSTRING_DEDUP_MAX_REPS_COMPARED above;
+    separate knob so the two mechanisms can be tuned independently.
 
 INDEXING_FLOW_SCAN_HEAD_BYTES : int
     Bytes scanned from the start of a `.js` file when detecting Flow type syntax
@@ -340,7 +384,7 @@ HOOKS_LOG_CHARS_PER_TOKEN : int
 
 HOOKS_MIN_SIMILARITY : float
     Per-turn UserPromptSubmit recall relevance floor (UPG-9.5). Raised from
-    0.35 to 0.72 (adversarial-review measurement, 2026-07-15): at 0.35 the
+    0.35 to 0.72 (measured 2026-07-15): at 0.35 the
     hook injected 3 irrelevant notes on 8/8 deliberately off-topic prompts;
     the M trigger primitive's own per-kind thetas (0.72-0.80) had 0/8 false
     fires on the identical prompts.
@@ -493,27 +537,44 @@ NOTFOUND_FLOOR_BANNER_CLI : str
     above because that text names `vectr_locate`, meaningless at a shell
     prompt — no `vectr locate` subcommand exists.
 
+RELATIVE_CLIFF_ENABLED : bool
+    UPG-BANNER-CALIBRATION Phase 3: master switch for the rank-1-to-rank-2
+    ce_relevance cliff sub-signal (ranking.relative_cliff.enabled in
+    config.yaml). False is an exact no-op: the cliff sub-signal never
+    enters the low_confidence OR, restoring pre-this-feature behaviour.
+    The Phase 1 measurement could not validate either a recalibrated
+    absolute floor or a rank-1-vs-rank-2 cliff on the two corpora it
+    reached (django + tigerbeetle); the default stays OFF until Phase 3
+    measurement on the missing three corpora (react, cpython, uv)
+    shows a separation. A change to the default is a product decision
+    (Rail 7) and not made in this lane.
+
+RELATIVE_CLIFF_MIN_TOP : float
+    UPG-BANNER-CALIBRATION Phase 3: absolute ce_relevance floor below
+    which a rank-1 cannot credibly lead a set, in the same scale and
+    gate (ce_relevance-only, never the dense-cosine fallback) as
+    NOTFOUND_FLOOR_MIN_TOP_RELEVANCE above. The cliff sub-signal only
+    fires when rank-1 is at least this high; a weak top result with a
+    wide-looking drop to rank-2 is not a confident result regardless
+    of the drop. No-op whenever RELATIVE_CLIFF_ENABLED is False.
+
+RELATIVE_CLIFF_MIN_DROP : float
+    UPG-BANNER-CALIBRATION Phase 3: the required rank-1-to-rank-2 gap
+    expressed as a share of remaining headroom above rank-1, i.e.
+        (score[0] - score[1]) >= min_drop * (1 - score[0])
+    not a fixed score difference — see the score_order_explain entry
+    for why a fixed margin on bounded scores is unsatisfiable on a
+    confident query. The exact value is the Phase 3 question the
+    distribution study answers; the shipped default 0.50 is a
+    placeholder the enabled=false default never exercises. No-op
+    whenever RELATIVE_CLIFF_ENABLED is False.
+
 EMBEDDING_DEFAULT_MODEL : str
-    Default embedding model for the L3 content index (UPG-EMBEDDER-SWAP-GRANITE).
-    Resolved through the layering of UPG-EMBED-CONFIG-LAYERING — workspace
-    ``.vectr/config.yaml`` ``embedding.model`` > global ``~/.vectr/config.yaml``
-    > bundled ``agent/config.yaml`` — and ``VECTR_EMBED_MODEL`` outranks all
-    three (``embed_model_spec()``). The spec selects the provider: a bare name
-    is local (sentence-transformers), ``voyage*``/``openai/<m>``/``google/<m>``
-    are API providers. A workspace's ChromaDB collection is stamped with
-    whichever model built it (CodeIndexer's embed-model stamp); changing this
-    value forces a full vector index rebuild on next index rather than mixing
-    vectors from two models in one collection.
-
-EMBEDDING_OUTPUT_DIMENSIONALITY : int | None
-    ``embedding.output_dimensionality`` — the output size asked of providers
-    that support truncation (Google ``batchEmbedContents``
-    ``outputDimensionality``). null keeps the provider's own default.
-
-EMBEDDING_API_KEY_ENV : str
-    ``embedding.api_key_env`` — name of the environment variable holding a
-    remote provider's API key (default GEMINI_API_KEY). The value is never
-    logged or quoted in an error message.
+    Default local (sentence-transformers) embedding model for the L3 content
+    index (UPG-EMBEDDER-SWAP-GRANITE). A workspace's ChromaDB collection is
+    stamped with whichever model built it (CodeIndexer's embed-model stamp);
+    changing this value forces a full vector index rebuild on next index
+    rather than mixing vectors from two models in one collection.
 
 EMBEDDING_THREAD_CAP : int
     Resolved CPU thread cap applied to the local (torch-backed) embedding
@@ -654,7 +715,6 @@ vectr_cache_root() -> Path
 from __future__ import annotations
 
 import importlib.resources as _ilr
-import logging as _logging
 import os as _os
 import re as _re
 from pathlib import Path
@@ -712,60 +772,10 @@ _StrictBoolLoader.add_implicit_resolver(
 )
 
 
-_config_log = _logging.getLogger("vectr.config")
-
-
-def embedding_overlay_paths() -> list[Path]:
-    """User ``config.yaml`` overlays, LOWEST precedence first: the global
-    ``~/.vectr/config.yaml``, then the workspace ``.vectr/config.yaml`` (the
-    workspace file wins). The workspace is ``VECTR_WORKSPACE`` when a daemon set
-    it, else the current directory — the same workspace the daemon indexes."""
-    workspace = _os.environ.get("VECTR_WORKSPACE") or _os.getcwd()
-    return [
-        Path.home() / ".vectr" / "config.yaml",
-        Path(workspace) / ".vectr" / "config.yaml",
-    ]
-
-
-def merge_embedding_overlays(cfg: dict[str, Any], overlays: list[Path]) -> None:
-    """Layer the user's ``embedding:`` settings over the bundled block, applying
-    ``overlays`` in lowest-precedence-first order so a later file wins.
-
-    Only the user-facing embedding settings are layerable
-    (``model``, ``output_dimensionality``, ``api_key_env``); every other config
-    block stays bundled-only. An overlay that cannot be read or parsed is
-    reported on the vectr logger and skipped — a half-applied or silently
-    ignored user config is worse than an announced one.
-    """
-    embedding = cfg.setdefault("embedding", {})
-    for path in overlays:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            _config_log.warning("vectr: ignoring unreadable %s: %s", path, exc)
-            continue
-        try:
-            data = _yaml.load(raw, Loader=_StrictBoolLoader)
-        except _yaml.YAMLError as exc:
-            _config_log.warning("vectr: ignoring invalid YAML in %s: %s", path, exc)
-            continue
-        if not isinstance(data, dict) or not isinstance(data.get("embedding"), dict):
-            continue
-        user = data["embedding"]
-        if user.get("model") is not None:
-            embedding["default_model"] = str(user["model"])
-        for key in ("output_dimensionality", "api_key_env"):
-            if user.get(key) is not None:
-                embedding[key] = user[key]
-
-
 def _load_config() -> dict[str, Any]:
-    """Load agent/config.yaml and layer the user embedding overlays on it."""
-    cfg = _yaml.load(_read_bundled_text("config.yaml"), Loader=_StrictBoolLoader)
-    merge_embedding_overlays(cfg, embedding_overlay_paths())
-    return cfg  # type: ignore[no-any-return]
+    """Load and return the parsed agent/config.yaml as a dict."""
+    raw = _read_bundled_text("config.yaml")
+    return _yaml.load(raw, Loader=_StrictBoolLoader)  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +857,28 @@ DOCSTRING_DEDUP_BODY_SIMILARITY_MIN: float = float(_ddd_cfg["body_similarity_min
 DOCSTRING_DEDUP_MAX_REPS_COMPARED: int = int(_ddd_cfg["max_reps_compared"])
 
 # ---------------------------------------------------------------------------
+# Content-based near-duplicate dedup (LANE-NEARDUP-DEDUP)
+# ---------------------------------------------------------------------------
+
+_ndb_cfg: dict[str, Any] = _cfg["ranking"]["near_dup_body"]
+
+# Minimum difflib.SequenceMatcher ratio between two chunks' full normalized
+# bodies required to collapse a candidate into an already-kept representative
+# under the near-dup-body key. Much higher than DOCSTRING_DEDUP_BODY_SIMILARITY_MIN
+# (0.75) — this lane is for the truly-near-identical-content case, not the
+# boilerplate-header case. Read via
+# config.NEAR_DUP_BODY_SIMILARITY_MIN.
+NEAR_DUP_BODY_ENABLED: bool = bool(_ndb_cfg.get("enabled", False))
+NEAR_DUP_BODY_SIMILARITY_MIN: float = float(_ndb_cfg["body_similarity_min_ratio"])
+# Max already-kept representatives compared per new candidate before the
+# candidate stops being compared and becomes its own representative — same
+# latency bound as DOCSTRING_DEDUP_MAX_REPS_COMPARED, separate config knob so
+# the two mechanisms can be tuned independently. Fails in the safe direction
+# only (a candidate past the cap is never falsely collapsed, only left as an
+# extra separate result). Read via config.NEAR_DUP_BODY_MAX_REPS_COMPARED.
+NEAR_DUP_BODY_MAX_REPS_COMPARED: int = int(_ndb_cfg["max_reps_compared"])
+
+# ---------------------------------------------------------------------------
 # Rerank pool sizes (UPG-12.1) + reranker model
 # ---------------------------------------------------------------------------
 
@@ -859,6 +891,16 @@ RERANK_MODEL: str = str(_rr_cfg["model"])
 RERANK_TOP_K: int = int(_rr_cfg["top_k"])
 RERANK_TOP_K_UNFILTERED: int = int(_rr_cfg["top_k_unfiltered"])
 RERANK_PRE_FILTER_FETCH_K: int = int(_rr_cfg["pre_filter_fetch_k"])
+RERANK_MAX_LENGTH: int = int(_rr_cfg["max_length"])
+# Per-device predict() batch_size (UPG-RERANK-LATENCY-BUDGET). Every entry is
+# read directly (no .get() default) so a missing device key fails loudly at
+# import time; the "default" key itself is the intentional runtime fallback
+# for a resolved torch device the config doesn't name (see agent/searcher.py).
+RERANK_BATCH_SIZE_BY_DEVICE: dict[str, int] = {
+    str(_device): int(_bs) for _device, _bs in _rr_cfg["batch_size"].items()
+}
+if "default" not in RERANK_BATCH_SIZE_BY_DEVICE:
+    raise KeyError("ranking.rerank.batch_size must define a 'default' entry")
 
 # ---------------------------------------------------------------------------
 # Indexing tunables (UPG-12.1)
@@ -867,6 +909,7 @@ RERANK_PRE_FILTER_FETCH_K: int = int(_rr_cfg["pre_filter_fetch_k"])
 _idx_cfg: dict[str, Any] = _cfg["indexing"]
 
 INDEXING_MAX_CHUNK_LINES: int = int(_idx_cfg["max_chunk_lines"])
+INDEXING_MAX_CHUNK_CHARS: int = int(_idx_cfg["max_chunk_chars"])
 INDEXING_CLASS_HEADER_LINES: int = int(_idx_cfg["class_header_lines"])
 INDEXING_BUILD_ARTIFACT_DIR_SUFFIXES: tuple[str, ...] = tuple(
     str(s).lower() for s in _idx_cfg["build_artifact_dir_suffixes"]
@@ -1116,9 +1159,13 @@ NOTFOUND_FLOOR_BANNER_CLI: str = str(_nff_cfg["banner_cli"])
 
 # UPG-SCORE-ORDER-EXPLAIN: annotate a large displayed-relevance-vs-order
 # divergence with the demoting prior's reason (render-only, additive).
+# UPG-GATE-V4-MINORS: the margin is a share of the score headroom above
+# rank-1 — gap >= MIN_HEADROOM_RATIO * (1 - top_score) — replacing the fixed
+# ratio r >= MARGIN_RATIO * top_score, which scores bounded in [0, 1] made
+# unsatisfiable on any confident query (top_score >= 2/3).
 _soe_cfg: dict[str, Any] = _cfg["ranking"]["score_order_explain"]
 SCORE_ORDER_EXPLAIN_ENABLED: bool = bool(_soe_cfg["enabled"])
-SCORE_ORDER_EXPLAIN_MARGIN_RATIO: float = float(_soe_cfg["margin_ratio"])
+SCORE_ORDER_EXPLAIN_MIN_HEADROOM_RATIO: float = float(_soe_cfg["min_headroom_ratio"])
 
 # UPG-RESULT-FLOOR: drop sub-floor cross-encoder-relevance results instead of
 # returning a full n_results block of ~0.000 ANN neighbours (keeps >=1).
@@ -1130,11 +1177,30 @@ RESULT_FLOOR_MIN_RELEVANCE: float = float(_rf_cfg["min_relevance"])
 # pointer mode — a result whose own ce_relevance clears this floor keeps a
 # bounded excerpt of its body instead of a bare pointer, even while the
 # surrounding result set is still flagged low confidence.
+# UPG-BANNER-CALIBRATION: min_relevance is now an independently-calibrated
+# constant, deliberately lower than notfound_floor.min_top_relevance (see
+# config.yaml comment) — retain_rank1_always/RANK1_LABEL add a second,
+# rank-based (not score-based) exemption for the set's top result alone.
 _pmr_cfg: dict[str, Any] = _cfg["ranking"]["pointer_mode_retain"]
 POINTER_MODE_RETAIN_ENABLED: bool = bool(_pmr_cfg["enabled"])
 POINTER_MODE_RETAIN_MIN_RELEVANCE: float = float(_pmr_cfg["min_relevance"])
 POINTER_MODE_RETAIN_EXCERPT_LINES: int = int(_pmr_cfg["excerpt_lines"])
 POINTER_MODE_RETAIN_LABEL: str = str(_pmr_cfg["label"])
+POINTER_MODE_RETAIN_RANK1_ALWAYS: bool = bool(_pmr_cfg["retain_rank1_always"])
+POINTER_MODE_RETAIN_RANK1_LABEL: str = str(_pmr_cfg["rank1_label"])
+
+# UPG-BANNER-CALIBRATION Phase 3: an alternative low-confidence sub-signal
+# (ranking.relative_cliff in config.yaml) — a rank-1-to-rank-2 ce_relevance
+# drop test, an alternative to the absolute min_top_relevance floor. SHIPPED
+# DEFAULT OFF; the Phase 3 distribution study on the three unmeasured corpora
+# is what would justify turning it on, and the value of min_drop. See the
+# config.yaml comment for the headroom-relative gap formula; the cliff
+# function itself is a pure-Python comparison of two already-computed scores
+# in agent.ranking_cliff.relative_cliff_fires, with no query-side logic.
+_rc_cfg: dict[str, Any] = _cfg["ranking"]["relative_cliff"]
+RELATIVE_CLIFF_ENABLED: bool = bool(_rc_cfg["enabled"])
+RELATIVE_CLIFF_MIN_TOP: float = float(_rc_cfg["min_top"])
+RELATIVE_CLIFF_MIN_DROP: float = float(_rc_cfg["min_drop"])
 
 # ---------------------------------------------------------------------------
 # Search — additive identifier-shape symbol-graph hint (UPG-QUERYTYPE-REROUTE)
@@ -1162,51 +1228,11 @@ DEFAULT_PORT: int = 8765
 DEFAULT_HOST: str = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
-# Embedding — default model, layerable (UPG-EMBEDDER-SWAP-GRANITE,
-# UPG-EMBED-CONFIG-LAYERING): workspace .vectr/config.yaml >
-# ~/.vectr/config.yaml > bundled agent/config.yaml, and VECTR_EMBED_MODEL above
-# all three. `embedding.model` in an overlay is the user-facing name for the
-# bundled `default_model`. Provider choice comes from the spec itself: a bare
-# name is local (sentence-transformers), `voyage*` / `openai/<m>` /
-# `google/<m>` select API providers — see agent/indexer/_types.py.
+# Embedding — default local model (UPG-EMBEDDER-SWAP-GRANITE)
 # ---------------------------------------------------------------------------
 
-EMBEDDING_MODEL_ENV: str = "VECTR_EMBED_MODEL"
 EMBEDDING_DEFAULT_MODEL: str = str(_cfg["embedding"]["default_model"])
 EMBEDDING_MAX_SEQ_LENGTH: int = int(_cfg["embedding"]["max_seq_length"])
-
-
-def _resolve_output_dimensionality(raw: Any) -> int | None:
-    """``embedding.output_dimensionality``: null keeps the provider's own
-    default output size; a value must be a positive integer. A malformed value
-    fails loudly at startup rather than sending a broken request later."""
-    if raw is None:
-        return None
-    try:
-        dim = int(str(raw))
-    except ValueError:
-        dim = -1
-    if dim <= 0:
-        raise ValueError(
-            f"embedding.output_dimensionality must be a positive integer or null, got {raw!r}"
-        )
-    return dim
-
-
-EMBEDDING_OUTPUT_DIMENSIONALITY: int | None = _resolve_output_dimensionality(
-    _cfg["embedding"].get("output_dimensionality")
-)
-
-# Name of the environment variable holding a remote provider's API key. The
-# value is never logged or quoted in an error message — only the channel is.
-EMBEDDING_API_KEY_ENV: str = str(_cfg["embedding"].get("api_key_env") or "GEMINI_API_KEY")
-
-
-def embed_model_spec() -> str:
-    """The embedding model spec to run with: ``VECTR_EMBED_MODEL`` first, then
-    the layered ``embedding.model``. Call sites use this instead of reading the
-    env var themselves so the precedence rule lives in exactly one place."""
-    return _os.environ.get(EMBEDDING_MODEL_ENV) or EMBEDDING_DEFAULT_MODEL
 
 # UPG-EMBED-THREAD-CONTENTION: 0 means "auto" — derive from
 # thread_cap_auto_fraction * os.cpu_count(), minimum 1 thread. A positive
@@ -1307,6 +1333,10 @@ PROACTIVE_ENVELOPE_OPEN_HUMAN: str = str(_pro_envelope_cfg["open_human"])
 PROACTIVE_ENVELOPE_CLOSE: str = str(_pro_envelope_cfg["close"])
 
 PROACTIVE_COOLDOWN_ITEMS: int = int(_pro_cfg["cooldown_items"])
+# UPG-PROXY-COOLDOWN-NO-TIME-DECAY: wall-clock suppression window (seconds) on
+# top of the count ring. 0 disables the decay (pure count ring, the historical
+# behaviour); agent/proactive/settings.py normalises non-positive to None.
+PROACTIVE_COOLDOWN_TTL_SECONDS: float = float(_pro_cfg["cooldown_ttl_seconds"])
 
 # UPG-PROXY-INJECT-PRECISION: structural (path-anchored) channel relevance
 # gate. Every value below is a STATIC config threshold or a note.kind
@@ -1336,7 +1366,9 @@ PROACTIVE_MATCHER_SEMANTIC_NOTE: bool = bool(_pro_matchers_cfg["semantic_note"])
 PROACTIVE_MATCHER_CODE_SEARCH: bool = bool(_pro_matchers_cfg["code_search"])
 
 _proxy_cfg: dict[str, Any] = _pro_cfg["proxy"]
-PROACTIVE_PROXY_ENABLED: bool = bool(_proxy_cfg["enabled"])
+# (UPG-PROACTIVE-DEAD-GATES: the old `proxy.enabled` constant is gone — the
+# proxy listener's injection behaviour is governed by `proxy.inject`, and the
+# localhost boundary by settings.py's unconditional `proactive_bind_is_loopback`.)
 PROACTIVE_PROXY_HOST: str = str(_proxy_cfg["host"])
 PROACTIVE_PROXY_PORT: int = int(_proxy_cfg["port"])
 PROACTIVE_PROXY_UPSTREAM_BASE_URL: str = str(_proxy_cfg["upstream_base_url"])
@@ -1364,8 +1396,8 @@ PROACTIVE_RESPONSE_CACHE_TTL_SECONDS: float = float(_resp_cache_cfg["ttl_seconds
 PROACTIVE_RESPONSE_CACHE_MAX_ENTRIES: int = int(_resp_cache_cfg["max_entries"])
 
 # ---------------------------------------------------------------------------
-# Trigger engine wave 1 (TRIGGER-ENGINE, bm2-design-skeleton.md §2/§3) —
-# total order + injection budgets. See agent/trigger_engine.py.
+# Trigger engine (TRIGGER-ENGINE) — total order + injection budgets.
+# See agent/trigger_engine.py.
 # ---------------------------------------------------------------------------
 
 _trig_cfg: dict[str, Any] = _cfg["memory_triggers"]
@@ -1405,8 +1437,7 @@ MEMORY_TRIGGER_BODY_TRUNCATION_MIN_BOUNDARY_FRACTION: float = float(
     _trig_inject_cfg["body_truncation_min_boundary_fraction"]
 )
 
-# Trigger engine wave 2b (TRIGGER-ENGINE, bm2-design-skeleton.md §8) — the M
-# (semantic) primitive's fixed per-kind cosine thresholds. Built by direct
+# The M (semantic) primitive's fixed per-kind cosine thresholds. Built by direct
 # subscript against every kind already enumerated in kind_priority above, so
 # a config.yaml missing an entry for any kind raises KeyError here at import
 # rather than silently defaulting a kind to "never matches" or "always
@@ -1416,7 +1447,7 @@ _trig_theta_cfg: dict[str, Any] = _trig_semantic_cfg["theta_by_kind"]
 MEMORY_TRIGGER_SEMANTIC_THETA_BY_KIND: dict[str, float] = {
     kind: float(_trig_theta_cfg[kind]) for kind in MEMORY_TRIGGER_KIND_PRIORITY
 }
-# Serving-policy hardening (§5.5) — see the cooldown_turns key's own
+# Serving-policy hardening (UPG-MEMORY-STATE-MACHINE §5.5) — see the cooldown_turns key's own
 # config.yaml comment for the turns-vs-wall-clock-seconds distinction.
 MEMORY_TRIGGER_SEMANTIC_COOLDOWN_TURNS: int = int(_trig_semantic_cfg["cooldown_turns"])
 
@@ -1432,9 +1463,19 @@ _related_notes_cfg: dict[str, Any] = _mem_write_cfg["related_notes"]
 MEMORY_WRITE_RELATED_ENABLED: bool = bool(_related_notes_cfg["enabled"])
 MEMORY_WRITE_RELATED_LIMIT: int = int(_related_notes_cfg["limit"])
 MEMORY_WRITE_RELATED_MIN_SIMILARITY: float = float(_related_notes_cfg["min_similarity"])
+MEMORY_WRITE_RELATED_REVOKED_ENABLED: bool = bool(_related_notes_cfg["revoked_enabled"])
+MEMORY_WRITE_RELATED_REVOKED_LIMIT: int = int(_related_notes_cfg["revoked_limit"])
+MEMORY_WRITE_RELATED_REVOKED_QUERY_FLOOR: int = int(_related_notes_cfg["revoked_query_floor"])
 
 _user_quote_cfg: dict[str, Any] = _mem_write_cfg["user_quote"]
 MEMORY_WRITE_USER_QUOTE_MIN_CHARS: int = int(_user_quote_cfg["min_chars"])
+MEMORY_WRITE_USER_QUOTE_AUTO_BIND_MAX_AGE_SECONDS: float = float(
+    _user_quote_cfg["auto_bind_max_age_seconds"]
+)
+MEMORY_WRITE_USER_QUOTE_SPAN_BIND_MIN_CHARS: int = int(_user_quote_cfg["span_bind_min_chars"])
+MEMORY_WRITE_USER_QUOTE_SPAN_BIND_MAX_PRODUCT_CHARS: int = int(
+    _user_quote_cfg["span_bind_max_product_chars"]
+)
 
 _proxy_suggest_cfg: dict[str, Any] = _mem_write_cfg["proxy_anchor_suggestions"]
 MEMORY_WRITE_PROXY_SUGGEST_ENABLED: bool = bool(_proxy_suggest_cfg["enabled"])
@@ -1442,6 +1483,15 @@ MEMORY_WRITE_PROXY_SUGGEST_LIMIT: int = int(_proxy_suggest_cfg["limit"])
 
 _content_file_cfg: dict[str, Any] = _mem_write_cfg["content_file"]
 MEMORY_WRITE_CONTENT_FILE_MAX_BYTES: int = int(_content_file_cfg["max_bytes"])
+# UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL: operator-configured additional
+# absolute roots content_file reads are allowed to resolve under, beyond the
+# primary workspace root and the multi-root `extra_roots` already accepted by
+# the resolver. Operator-only — the trust decision is made at daemon startup
+# (config), not per call, so a calling agent cannot widen containment.
+# Empty tuple by default: the boundary is unchanged until an operator opts in.
+MEMORY_WRITE_CONTENT_FILE_ADDITIONAL_READABLE_ROOTS: tuple[str, ...] = tuple(
+    str(r) for r in _content_file_cfg["additional_readable_roots"]
+)
 
 # ---------------------------------------------------------------------------
 # UPG-TASK-SUPERSEDES-HYGIENE: vectr_status stale-task nudge thresholds.
@@ -1451,6 +1501,20 @@ MEMORY_WRITE_CONTENT_FILE_MAX_BYTES: int = int(_content_file_cfg["max_bytes"])
 _hygiene_cfg: dict[str, Any] = _cfg["memory_hygiene"]
 MEMORY_HYGIENE_STALE_TASK_WARN_COUNT: int = int(_hygiene_cfg["stale_task_warn_count"])
 MEMORY_HYGIENE_STALE_TASK_WARN_AGE_DAYS: int = int(_hygiene_cfg["stale_task_warn_age_days"])
+
+_memory_export_cfg: dict[str, Any] = _cfg["memory_export"]
+MEMORY_EXPORT_DEBOUNCE_SECONDS: float = float(_memory_export_cfg["debounce_seconds"])
+
+# UPG-MEMORY-IMPORT: closed list of workspace-relative paths the import
+# command's default-discovery path walks when --path is not given. Closed
+# (same reasoning as VALID_KINDS / SCOPE_VALUES / etc. — a fixed protocol
+# vocabulary rather than a tunable threshold), lives here as a plain
+# constant rather than in config.yaml's operator-tunable section. Mirrors
+# `memory_import.candidate_files` in config.yaml, but reading the
+# constant form from the same dict makes the value the importer sees
+# match the documented default if a test does not override it.
+_memory_import_cfg: dict[str, Any] = _cfg["memory_import"]
+MEMORY_IMPORT_CANDIDATE_FILES: tuple[str, ...] = tuple(_memory_import_cfg["candidate_files"])
 
 # ---------------------------------------------------------------------------
 # UPG-MEMORY-DECAY-KIND-SCOPED: per-kind decay half-life (decay_old_notes(),
@@ -1498,6 +1562,26 @@ MEMORY_DECAY_TTL_DAYS_BY_KIND: dict[str, float | None] = {
 _recall_for_path_cfg: dict[str, Any] = _cfg["memory_recall_for_path"]
 MEMORY_RECALL_FOR_PATH_OVERFETCH_MULTIPLIER: int = int(_recall_for_path_cfg["overfetch_multiplier"])
 MEMORY_RECALL_FOR_PATH_OVERFETCH_CEILING: int = int(_recall_for_path_cfg["overfetch_ceiling"])
+
+# ---------------------------------------------------------------------------
+# UPG-RECALL-MISS-FLOOR parts (b)/(c): Tier 0 (directive + pinned) unconditional
+# injection and the deterministic tag/anchor/symbol/title channels composed
+# with the ranked (semantic/SQL) result in WorkingContextStore.recall().
+# See the recall_floor config.yaml comment for the full rationale.
+# ---------------------------------------------------------------------------
+
+_recall_floor_cfg: dict[str, Any] = _cfg["recall_floor"]
+RECALL_FLOOR_TIER0_MAX_NOTES: int = int(_recall_floor_cfg["tier0_max_notes"])
+RECALL_FLOOR_DETERMINISTIC_MAX_NOTES: int = int(_recall_floor_cfg["deterministic_max_notes"])
+RECALL_FLOOR_METADATA_SCAN_CEILING: int = int(_recall_floor_cfg["metadata_scan_ceiling"])
+RECALL_FLOOR_TITLE_MIN_TOKEN_LEN: int = int(_recall_floor_cfg["title_min_token_len"])
+RECALL_FLOOR_TITLE_MIN_OVERLAP_TOKENS: int = int(_recall_floor_cfg["title_min_overlap_tokens"])
+RECALL_FLOOR_TIER0_MIN_NOTES: int = int(_recall_floor_cfg["tier0_min_notes"])
+RECALL_FLOOR_TIER0_MAX_SHARE_OF_LIMIT: float = float(_recall_floor_cfg["tier0_max_share_of_limit"])
+RECALL_FLOOR_DETERMINISTIC_MAX_SHARE_OF_REMAINING: float = float(
+    _recall_floor_cfg["deterministic_max_share_of_remaining"]
+)
+RECALL_FLOOR_DETERMINISTIC_ENABLED: bool = bool(_recall_floor_cfg["deterministic_enabled"])
 
 # ---------------------------------------------------------------------------
 # UPG-TEST-CACHE-ISOLATION: single override point for vectr's on-disk cache

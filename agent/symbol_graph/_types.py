@@ -23,6 +23,13 @@ class LocateResult:
     symbols: list[Symbol]
     resolution_strategy: str  # exact|suffix|same_module|import_chain|substring|fuzzy|none
     query: str
+    # UPG-LOCATE-NEARMISS-WIRE-PRIMARY-TOOL: populated only on a "none"
+    # resolution (and only when the caller opted in via locate_l2's
+    # `with_near_miss`) — deterministic near-miss candidates from
+    # SymbolGraph.nearest_symbol_names' machinery. NEVER merged into
+    # `symbols`: every entry here is inexact by construction, and a
+    # consumer must label it as a suggestion, never as a match.
+    near_miss: list[Symbol] = field(default_factory=list)
 
 
 @dataclass

@@ -9,7 +9,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 import pytest
-import yaml
 
 from agent.instance_registry import InstanceRegistry, workspace_hash
 import main as m
@@ -314,9 +313,15 @@ class TestDoStartBindHostEnv:
             proc.pid = 99999
             return proc
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
         with patch("subprocess.Popen", side_effect=_mock_popen), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh, **kwargs)
@@ -3647,6 +3652,100 @@ class TestInstructionVetV3ToolLoadingSplice:
 
 
 # ---------------------------------------------------------------------------
+# Aliased guidance files: CLAUDE.md <-> AGENTS.md symlink / hardlink
+# (UPG-INIT-SYMLINK-WRITE-ORDER)
+# ---------------------------------------------------------------------------
+
+class TestAliasedGuidanceFilesWrittenOnce:
+    """Workspaces commonly alias CLAUDE.md and AGENTS.md to one another so a
+    single body serves several AI code editors. Every guidance write follows
+    such an alias, so writing each PATH in turn used to rewrite the same
+    underlying file repeatedly — each write strips the previous vectr block
+    before appending its own — and the LAST intended variant silently won.
+    `_write_workspace_config` now groups paths that resolve to the same
+    underlying file (symlink, hardlink, or dangling symlink) and writes each
+    distinct file exactly once with merged options."""
+
+    @staticmethod
+    def _block_count(text: str) -> int:
+        return text.count("<!-- vectr-start -->")
+
+    def test_claude_md_symlink_to_agents_md_keeps_tool_loading_guidance(self, tmp_path):
+        """The reported defect: CLAUDE.md -> AGENTS.md symlink. The CLAUDE.md
+        variant (with the deferred-tool loading blockquote) was written
+        first, then AGENTS.md's pass rewrote the same bytes without it. The
+        single merged write must keep both."""
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text("# My agents\n")
+        (tmp_path / "CLAUDE.md").symlink_to("AGENTS.md")
+        m._write_workspace_config(str(tmp_path), 8765)
+
+        content = agents.read_text()
+        assert self._block_count(content) == 1
+        assert "# My agents" in content   # pre-existing user content preserved
+        assert "ToolSearch" in content    # CLAUDE.md-only tool_loading=True merged in
+
+    def test_agents_md_symlink_to_claude_md_all_hooks_installed_is_hook_aware(self, tmp_path):
+        """Reverse direction (AGENTS.md -> not-yet-existing CLAUDE.md) with
+        BOTH hook surfaces installed: the shared file gets the hook-aware
+        session-start variant plus the tool-loading block, written once."""
+        m._write_claude_hooks(str(tmp_path))
+        m._write_codex_hooks(str(tmp_path))
+        (tmp_path / "AGENTS.md").symlink_to("CLAUDE.md")
+        m._write_workspace_config(str(tmp_path), 8765)
+
+        content = (tmp_path / "CLAUDE.md").read_text()  # real file behind the alias
+        assert self._block_count(content) == 1
+        assert "your working-memory notes are auto-injected automatically" in content
+        assert 'call `vectr_recall(query="<your task>")`' not in content
+        assert "ToolSearch" in content
+        # The alias resolves to exactly those bytes.
+        assert (tmp_path / "AGENTS.md").resolve().read_text() == content
+
+    def test_partial_hooks_keep_default_variant_on_aliased_file(self, tmp_path):
+        """Only one hook surface installed: the aliased file also serves a
+        reader WITHOUT automatic injection, so the conservative intersection
+        keeps the default self-recall variant — dropping it would starve
+        that reader of recall entirely (hook-aware copy tells the model not
+        to self-recall because injection is automatic)."""
+        m._write_claude_hooks(str(tmp_path))
+        (tmp_path / "AGENTS.md").write_text("x\n")
+        (tmp_path / "CLAUDE.md").symlink_to("AGENTS.md")
+        m._write_workspace_config(str(tmp_path), 8765)
+
+        content = (tmp_path / "AGENTS.md").read_text()
+        assert 'call `vectr_recall(query="<your task>")`' in content
+        assert "your working-memory notes are auto-injected automatically" not in content
+        # tool_loading merges by union even when hooks merge by intersection.
+        assert "ToolSearch" in content
+
+    def test_hardlinked_files_written_once(self, tmp_path):
+        """A hardlink pair shares an inode without being a symlink — identity
+        grouping must catch it via st_dev/st_ino too."""
+        claude = tmp_path / "CLAUDE.md"
+        claude.write_text("seed\n")
+        agents = tmp_path / "AGENTS.md"
+        os.link(claude, agents)
+        m._write_workspace_config(str(tmp_path), 8765)
+
+        assert self._block_count(agents.read_text()) == 1
+        assert agents.read_text() == claude.read_text()
+        assert "ToolSearch" in agents.read_text()
+
+    def test_dangling_symlink_pair_still_written_once(self, tmp_path):
+        """Fresh workspace where CLAUDE.md is a symlink to a not-yet-existing
+        AGENTS.md: neither name stats, but realpath still collapses the pair,
+        so creation happens through ONE merged write instead of the old
+        create-then-strip-then-rewrite through the alias."""
+        (tmp_path / "CLAUDE.md").symlink_to("AGENTS.md")
+        m._write_workspace_config(str(tmp_path), 8765)
+
+        content = (tmp_path / "AGENTS.md").read_text()
+        assert self._block_count(content) == 1
+        assert "ToolSearch" in content
+
+
+# ---------------------------------------------------------------------------
 # TestMergeSafeInit
 # ---------------------------------------------------------------------------
 
@@ -4075,7 +4174,15 @@ class TestWaitForDaemonReady:
 class TestDoStartReadinessBranches:
     """UPG-CLI-START-READY-RACE: `_do_start`'s printed message must reflect
     whether the daemon actually became reachable, not just that Popen()
-    returned."""
+    returned.
+
+    UPG-CLI-START-TEXT-EXIT-CODE: the text surface's exit contract is the
+    same rule the opt-in --json surface already had — exit 1 exactly when
+    status == "failed" (process exited before readiness; nothing is
+    listening), and 0 for both "ready" and "not_ready". The tests here pin
+    each branch's code alongside its message; the ready branch returning
+    normally is pinned implicitly by every pre-existing success-path test,
+    which would error on an unexpected SystemExit."""
 
     def _patched_popen(self):
         def _mock_popen(cmd, env, **kwargs):
@@ -4116,7 +4223,29 @@ class TestDoStartReadinessBranches:
         assert "has not" in err and "responding yet" in err
         assert "Poll readiness with: vectr status" in err
 
+    def test_not_ready_returns_normally_exit_zero(self, tmp_path):
+        """UPG-CLI-START-TEXT-EXIT-CODE: `not_ready` is an uncertain outcome,
+        not a failure — the process is alive and may still be loading — so
+        the text surface exits 0 for it, mirroring the --json surface (which
+        exits 1 only for status == "failed"). A `set -e` script must not
+        abort on a slow-but-succeeding start."""
+        ws = str(tmp_path)
+        wh = workspace_hash(ws)
+        with patch("subprocess.Popen", side_effect=self._patched_popen()), \
+             patch("main.InstanceRegistry") as MockReg, \
+             patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=False), \
+             patch("main._is_pid_alive", return_value=True), \
+             patch("builtins.open", MagicMock()):
+            MockReg.return_value.register = MagicMock()
+            m._do_start(ws, 8765, wh)  # no SystemExit raised
+
     def test_prints_failed_message_when_process_exited(self, tmp_path, capsys):
+        """UPG-CLI-START-TEXT-EXIT-CODE: `failed` now exits 1 on the text
+        surface exactly as the --json surface always did — nothing is
+        listening after this outcome, so any later use of this workspace's
+        port is guaranteed to fail and $? must be able to say so. Message
+        content unchanged."""
         ws = str(tmp_path)
         wh = workspace_hash(ws)
         with patch("subprocess.Popen", side_effect=self._patched_popen()), \
@@ -4126,8 +4255,10 @@ class TestDoStartReadinessBranches:
              patch("main._is_pid_alive", return_value=False), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
-            m._do_start(ws, 8765, wh)
+            with pytest.raises(SystemExit) as exc_info:
+                m._do_start(ws, 8765, wh)
 
+        assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert "failed to start" in err
 
@@ -4149,9 +4280,15 @@ class TestDoStartExplicitEnvConstruction:
         wh = workspace_hash(ws)
         captured_env: dict = {}
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
         with patch("subprocess.Popen", side_effect=self._mock_popen_factory(captured_env)), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh, workspace_explicit=True)
@@ -4163,9 +4300,15 @@ class TestDoStartExplicitEnvConstruction:
         wh = workspace_hash(ws)
         captured_env: dict = {}
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
         with patch("subprocess.Popen", side_effect=self._mock_popen_factory(captured_env)), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh)
@@ -4221,9 +4364,15 @@ class TestDoStartForegroundFastEnvConstruction:
         wh = workspace_hash(ws)
         captured_env: dict = {}
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
         with patch("subprocess.Popen", side_effect=self._mock_popen_factory(captured_env)), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh, foreground_fast=True)
@@ -4235,9 +4384,15 @@ class TestDoStartForegroundFastEnvConstruction:
         wh = workspace_hash(ws)
         captured_env: dict = {}
 
+        # UPG-CLI-START-TEXT-EXIT-CODE: this asserts on the env handed to
+        # Popen, captured before the readiness verdict is reached. Readiness
+        # is pinned so the subject is the spawn env alone, not whether PID
+        # 99999 happens to be alive on the running machine. The exit contract
+        # itself is pinned by TestDoStartReadinessBranches.
         with patch("subprocess.Popen", side_effect=self._mock_popen_factory(captured_env)), \
              patch("main.InstanceRegistry") as MockReg, \
              patch("main._migrate_legacy_files"), \
+             patch("main._wait_for_daemon_ready", return_value=True), \
              patch("builtins.open", MagicMock()):
             MockReg.return_value.register = MagicMock()
             m._do_start(ws, 8765, wh)
@@ -4908,253 +5063,6 @@ class TestCodexMcpConfig:
         assert parsed["mcp_servers"]["vectr"]["url"] == "http://localhost:8765/mcp"
 
 
-class TestDshMcpConfig:
-    """DeepSeek Harness (dsh) support — vectr registers itself as an MCP
-    server in the ACTIVE dsh profile's `cordis.patch.yml` via a merge-safe,
-    comment-delimited `- insert:` row (mirrors the Codex TOML writer). dsh
-    loads MCP servers as `@deepseek-ai/dsh-mcp-client` plugin rows, so vectr
-    manages one `mcp-client.vectr` item over Streamable HTTP."""
-
-    def test_creates_patch_with_vectr_insert_row(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        parsed = yaml.safe_load(cfg.read_text())
-        row = parsed[0]["insert"][0]
-        assert row["id"] == "mcp-client.vectr"
-        assert row["name"] == "@deepseek-ai/dsh-mcp-client"
-        assert row["config"]["serverName"] == "vectr"
-        assert row["config"]["transport"] == "streamable-http"
-        assert row["config"]["url"] == "http://localhost:8765/mcp"
-
-    def test_keyless_daemon_has_no_headers(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        parsed = yaml.safe_load(cfg.read_text())
-        assert "headers" not in parsed[0]["insert"][0]["config"]
-
-    def test_authenticated_daemon_gets_headers(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_mcp_config(cfg, 8765, {"X-Api-Key": "secret123"})
-        parsed = yaml.safe_load(cfg.read_text())
-        # dsh's streamable-http config names the field `headers` (the JSON key).
-        assert parsed[0]["insert"][0]["config"]["headers"]["X-Api-Key"] == "secret123"
-
-    def test_idempotent_single_block(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        assert cfg.read_text().count("# vectr-start") == 1
-
-    def test_port_change_rewrites_in_place(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        m._write_dsh_mcp_config(cfg, 8999, {})
-        text = cfg.read_text()
-        assert "localhost:8999" in text
-        assert "localhost:8765" not in text
-        assert text.count("# vectr-start") == 1
-
-    def test_merge_safe_preserves_user_entries(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(
-            "- insert:\n"
-            "    - id: mcp-client.github\n"
-            "      name: '@deepseek-ai/dsh-mcp-client'\n"
-            "      config:\n"
-            "        serverName: github\n"
-        )
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        parsed = yaml.safe_load(cfg.read_text())
-        ids = [entry["insert"][0]["id"] for entry in parsed]
-        assert ids == ["mcp-client.github", "mcp-client.vectr"]
-
-    def test_replaces_only_vectr_block_on_rerun(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(
-            "- insert:\n"
-            "    - id: mcp-client.other\n"
-            "      name: '@deepseek-ai/dsh-mcp-client'\n"
-            "      config:\n"
-            "        serverName: other\n"
-        )
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        m._write_dsh_mcp_config(cfg, 8766, {})
-        parsed = yaml.safe_load(cfg.read_text())
-        ids = [entry["insert"][0]["id"] for entry in parsed]
-        # the user's other server survives every re-run untouched
-        assert ids == ["mcp-client.other", "mcp-client.vectr"]
-        assert "localhost:8766" in cfg.read_text()
-
-    def test_empty_array_is_replaced(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text("# Your patch layer\n[]\n")
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        text = cfg.read_text()
-        assert "# Your patch layer" in text  # header comment survives
-        parsed = yaml.safe_load(text)
-        assert parsed[0]["insert"][0]["id"] == "mcp-client.vectr"
-
-    def test_invalid_existing_yaml_is_left_untouched(self, tmp_path, capsys):
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        broken = "this is: [not: valid\n  - yaml: :\n"
-        cfg.write_text(broken)
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        # merged output would not parse → skip rather than compound the damage
-        assert cfg.read_text() == broken
-        assert "not valid YAML" in capsys.readouterr().err
-
-    def test_js_tag_expression_is_preserved_not_rejected(self, tmp_path):
-        # dsh's loader evaluates `!!js` tags; the validator must pass them
-        # through (unknown to PyYAML) instead of rejecting the user's patch.
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(
-            "- insert:\n"
-            "    - id: mcp-client.github\n"
-            "      name: '@deepseek-ai/dsh-mcp-client'\n"
-            "      config:\n"
-            "        serverName: github\n"
-            "        env:\n"
-            "          TOKEN: !!js process.env.GITHUB_PERSONAL_ACCESS_TOKEN\n"
-        )
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        text = cfg.read_text()
-        assert "mcp-client.github" in text
-        assert "mcp-client.vectr" in text
-        assert "!!js process.env.GITHUB_PERSONAL_ACCESS_TOKEN" in text
-
-    def test_dsh_home_and_profile_resolution(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("DSH_HOME", str(tmp_path))
-        assert m._dsh_home() == tmp_path
-        monkeypatch.setenv("DSH_PROFILE", "headless")
-        assert m._dsh_profile() == "headless"
-        assert m._dsh_patch_path() == tmp_path / "profiles" / "headless" / "cordis.patch.yml"
-
-    def test_written_by_write_workspace_config_when_dsh_home_exists(self, tmp_path, monkeypatch):
-        # `_write_workspace_config` seeds .vectrignore via the indexer, which
-        # imports chromadb — full test deps are a CI concern, skip without them.
-        pytest.importorskip("chromadb")
-        dsh_home = tmp_path / "dshhome"
-        dsh_home.mkdir()
-        monkeypatch.setenv("DSH_HOME", str(dsh_home))
-        m._write_workspace_config(str(tmp_path), 8765)
-        cfg = dsh_home / "profiles" / "web" / "cordis.patch.yml"
-        assert cfg.exists()
-        parsed = yaml.safe_load(cfg.read_text())
-        row = parsed[0]["insert"][0]
-        assert row["id"] == "mcp-client.vectr"
-        assert row["config"]["url"] == "http://localhost:8765/mcp"
-
-    def test_skipped_when_dsh_home_absent(self, tmp_path, monkeypatch):
-        pytest.importorskip("chromadb")
-        monkeypatch.setenv("DSH_HOME", str(tmp_path / "no-such-dsh-home"))
-        m._write_workspace_config(str(tmp_path), 8765)
-        assert not (tmp_path / "no-such-dsh-home").exists()
-
-
-class TestDshHooksConfig:
-    """DeepSeek Harness hook bridge — `vectr init --hooks` also registers a
-    `hooks-claude-code` row in the dsh profile's cordis.patch.yml, pointing
-    dsh's Claude Code hook bridge at the workspace's .claude/settings.json.
-    Managed as its own comment-delimited block (`# vectr-hooks-start`…`#
-    vectr-hooks-end`), independent of the MCP block above."""
-
-    def test_creates_hooks_bridge_row(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_hooks_config(cfg, "/ws/.claude/settings.json")
-        parsed = yaml.safe_load(cfg.read_text())
-        row = parsed[0]["insert"][0]
-        assert row["id"] == "hooks-claude-code"
-        assert row["name"] == "@deepseek-ai/dsh-hooks-claude-code"
-        assert row["config"]["configPath"] == "/ws/.claude/settings.json"
-
-    def test_config_path_is_quoted_absolute(self, tmp_path):
-        # json.dumps quoting keeps a path with spaces/colons valid YAML.
-        cfg = tmp_path / "cordis.patch.yml"
-        path = "/home/user/My Workspace/.claude/settings.json"
-        m._write_dsh_hooks_config(cfg, path)
-        text = cfg.read_text()
-        assert '"' + path + '"' in text
-        parsed = yaml.safe_load(text)
-        assert parsed[0]["insert"][0]["config"]["configPath"] == path
-
-    def test_idempotent_single_block(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
-        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
-        assert cfg.read_text().count("# vectr-hooks-start") == 1
-
-    def test_path_change_rewrites_in_place(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_hooks_config(cfg, "/a/.claude/settings.json")
-        m._write_dsh_hooks_config(cfg, "/b/.claude/settings.json")
-        text = cfg.read_text()
-        assert '"/b/.claude/settings.json"' in text
-        assert '"/a/.claude/settings.json"' not in text
-        assert text.count("# vectr-hooks-start") == 1
-
-    def test_merge_safe_preserves_user_entries(self, tmp_path):
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text("- insert:\n    - id: mcp-client.github\n      name: x\n")
-        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
-        parsed = yaml.safe_load(cfg.read_text())
-        ids = [entry["insert"][0]["id"] for entry in parsed]
-        assert ids == ["mcp-client.github", "hooks-claude-code"]
-
-    def test_mcp_and_hooks_blocks_coexist_in_place(self, tmp_path):
-        # Both dsh rows live in one patch file as independent blocks; a re-run
-        # of either writer replaces its own block in place without duplicating
-        # or reordering the other.
-        cfg = tmp_path / "cordis.patch.yml"
-        m._write_dsh_mcp_config(cfg, 8765, {})
-        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
-        parsed = yaml.safe_load(cfg.read_text())
-        ids = [entry["insert"][0]["id"] for entry in parsed]
-        assert ids == ["mcp-client.vectr", "hooks-claude-code"]
-        # re-run both with new values: order stable, both updated, no dupes
-        m._write_dsh_mcp_config(cfg, 8999, {})
-        m._write_dsh_hooks_config(cfg, "/y/.claude/settings.json")
-        text = cfg.read_text()
-        assert text.count("# vectr-start") == 1
-        assert text.count("# vectr-hooks-start") == 1
-        assert "localhost:8999" in text
-        assert '"/y/.claude/settings.json"' in text
-        parsed2 = yaml.safe_load(text)
-        ids2 = [entry["insert"][0]["id"] for entry in parsed2]
-        assert ids2 == ["mcp-client.vectr", "hooks-claude-code"]
-
-    def test_invalid_existing_yaml_is_left_untouched(self, tmp_path, capsys):
-        cfg = tmp_path / "cordis.patch.yml"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        broken = "this is: [not: valid\n  - yaml: :\n"
-        cfg.write_text(broken)
-        m._write_dsh_hooks_config(cfg, "/x/.claude/settings.json")
-        assert cfg.read_text() == broken
-        assert "not valid YAML" in capsys.readouterr().err
-
-    def test_written_by_cmd_init_hooks(self, tmp_path, monkeypatch):
-        pytest.importorskip("chromadb")
-        dsh_home = tmp_path / "dshhome"
-        dsh_home.mkdir()
-        monkeypatch.setenv("DSH_HOME", str(dsh_home))
-        ws = tmp_path / "ws"
-        ws.mkdir()
-        m._write_claude_hooks(str(ws))
-        m._write_dsh_hooks_config(
-            m._dsh_patch_path(), str((ws / ".claude" / "settings.json").resolve()),
-        )
-        cfg = dsh_home / "profiles" / "web" / "cordis.patch.yml"
-        parsed = yaml.safe_load(cfg.read_text())
-        row = parsed[0]["insert"][0]
-        assert row["id"] == "hooks-claude-code"
-        assert row["config"]["configPath"] == str((ws / ".claude" / "settings.json").resolve())
-
-
 class TestCodexHooks:
     """Part C — `.codex/hooks.json` writer reuses the `vectr hook <event>`
     commands unchanged; Codex's hook schema/events/envelope match Claude
@@ -5346,3 +5254,174 @@ class TestCodexInitIntegration:
     def test_disclosure_lists_codex_config(self):
         assert ".codex/config.toml" in m._IDE_CONFIG_WRITES_DISCLOSURE
         assert "8 files" in m._IDE_CONFIG_WRITES_DISCLOSURE
+
+
+# ---------------------------------------------------------------------------
+# cmd_anchor / cmd_unanchor (UPG-ANCHOR-ATTACH / UPG-ANCHOR-DETACH)
+# ---------------------------------------------------------------------------
+
+class TestCmdAnchor:
+    """UPG-ANCHOR-ATTACH: cmd_anchor is the shell path to POST /v1/anchor.
+    The dispatch table registers the cmd; the parser requires --id and
+    one-or-more PATHs; the call posts the payload as JSON to the daemon."""
+
+    def test_anchor_posts_to_v1_anchor_with_note_id_and_paths(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        import argparse
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "note_id": 42,
+            "attached": ["src/auth.py"],
+            "already_present": [],
+            "message": "Attached 1 anchor(s) to note #42.",
+            "processing_ms": 3,
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("main.InstanceRegistry") as MockReg, \
+             patch("httpx.post", return_value=mock_resp) as mock_post:
+            MockReg.return_value.get.return_value = None
+            args = argparse.Namespace(
+                note_id=42, paths=["src/auth.py", "src/server.py"],
+                path=str(tmp_path), port=8765,
+            )
+            m.cmd_anchor(args)
+
+        mock_post.assert_called_once()
+        call_url = mock_post.call_args[0][0]
+        assert "/v1/anchor" in call_url
+        payload = mock_post.call_args[1]["json"]
+        assert payload == {"note_id": 42, "anchors": ["src/auth.py", "src/server.py"]}
+
+    def test_anchor_parser_requires_note_id_and_one_or_more_paths(self):
+        """Argparse parity with REST (min_length=1) and MCP (non-empty
+        anchors list): nargs='+' on the positional PATH and required=True
+        on --id are the load-bearing pieces."""
+        from unittest.mock import patch
+        with patch("main.cmd_anchor") as mock_cmd:
+            with patch("sys.argv", ["vectr", "anchor", "src/auth.py", "--id", "42"]):
+                m.main()
+        # Both present: cmd_anchor was dispatched with both args.
+        assert mock_cmd.call_count == 1
+        ns = mock_cmd.call_args[0][0]
+        assert ns.paths == ["src/auth.py"]
+        assert ns.note_id == 42
+        # Missing --id: argparse exits with SystemExit (status 2). The
+        # command is never dispatched.
+        with patch("main.cmd_anchor") as mock_cmd, \
+             patch("sys.argv", ["vectr", "anchor", "src/auth.py"]):
+            with pytest.raises(SystemExit):
+                m.main()
+        assert mock_cmd.call_count == 0
+        # Zero paths: also a SystemExit (nargs='+') — same contract.
+        with patch("main.cmd_anchor") as mock_cmd, \
+             patch("sys.argv", ["vectr", "anchor", "--id", "42"]):
+            with pytest.raises(SystemExit):
+                m.main()
+        assert mock_cmd.call_count == 0
+
+
+class TestCmdUnanchor:
+    """UPG-ANCHOR-DETACH: cmd_unanchor is the shell path to POST /v1/unanchor.
+    The inverse of cmd_anchor — same shape, different verb."""
+
+    def test_unanchor_posts_to_v1_unanchor_with_note_id_and_paths(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        import argparse
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "note_id": 42,
+            "removed": ["src/auth.py"],
+            "not_present": [],
+            "message": "Removed 1 anchor(s) from note #42.",
+            "processing_ms": 3,
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("main.InstanceRegistry") as MockReg, \
+             patch("httpx.post", return_value=mock_resp) as mock_post:
+            MockReg.return_value.get.return_value = None
+            args = argparse.Namespace(
+                note_id=42, paths=["src/auth.py", "src/server.py"],
+                path=str(tmp_path), port=8765,
+            )
+            m.cmd_unanchor(args)
+
+        mock_post.assert_called_once()
+        call_url = mock_post.call_args[0][0]
+        assert "/v1/unanchor" in call_url
+        payload = mock_post.call_args[1]["json"]
+        assert payload == {"note_id": 42, "anchors": ["src/auth.py", "src/server.py"]}
+
+    def test_unanchor_prints_not_present_paths_to_stderr(self, tmp_path, capsys):
+        from unittest.mock import patch, MagicMock
+        import argparse
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "note_id": 42,
+            "removed": [],
+            "not_present": ["src/missing.py"],
+            "message": "Removed 0 anchor(s) from note #42.",
+            "processing_ms": 2,
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("main.InstanceRegistry") as MockReg, \
+             patch("httpx.post", return_value=mock_resp):
+            MockReg.return_value.get.return_value = None
+            args = argparse.Namespace(
+                note_id=42, paths=["src/missing.py"],
+                path=str(tmp_path), port=8765,
+            )
+            m.cmd_unanchor(args)
+
+        out, err = capsys.readouterr()
+        assert "Removed 0" in out
+        assert "not_present" in err or "no-op" in err
+        assert "src/missing.py" in err
+
+    def test_unanchor_is_dispatched_in_main(self, tmp_path):
+        """The main() dispatch table routes 'unanchor' to cmd_unanchor."""
+        from unittest.mock import patch, MagicMock
+        import argparse
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "note_id": 1, "removed": ["x.py"], "not_present": [],
+            "message": "Removed 1 anchor(s) from note #1.", "processing_ms": 1,
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("main.InstanceRegistry") as MockReg, \
+             patch("httpx.post", return_value=mock_resp), \
+             patch("main.cmd_unanchor") as mock_cmd:
+            MockReg.return_value.get.return_value = None
+            with patch("sys.argv", ["vectr", "unanchor", "x.py", "--id", "1"]):
+                m.main()
+        mock_cmd.assert_called_once()
+
+    def test_unanchor_parser_requires_note_id_and_one_or_more_paths(self):
+        """Same nargs='+' / required=True contract as 'anchor' — REST and
+        MCP enforce the same non-empty-anchors floor and the CLI must
+        match, or the surface splits on this single user input."""
+        from unittest.mock import patch
+        with patch("main.cmd_unanchor") as mock_cmd:
+            with patch("sys.argv", ["vectr", "unanchor", "src/auth.py", "--id", "42"]):
+                m.main()
+        assert mock_cmd.call_count == 1
+        ns = mock_cmd.call_args[0][0]
+        assert ns.paths == ["src/auth.py"]
+        assert ns.note_id == 42
+        with patch("main.cmd_unanchor") as mock_cmd, \
+             patch("sys.argv", ["vectr", "unanchor", "src/auth.py"]):
+            with pytest.raises(SystemExit):
+                m.main()
+        assert mock_cmd.call_count == 0
+        with patch("main.cmd_unanchor") as mock_cmd, \
+             patch("sys.argv", ["vectr", "unanchor", "--id", "42"]):
+            with pytest.raises(SystemExit):
+                m.main()
+        assert mock_cmd.call_count == 0

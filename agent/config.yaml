@@ -347,6 +347,61 @@ ranking:
     # via config.DOCSTRING_DEDUP_MAX_REPS_COMPARED.
     max_reps_compared: 3
 
+  near_dup_body:
+    # DISABLED BY DEFAULT pending measurement (sentinel + user, 2026-08-31).
+    # The 0.95 threshold's safety margin was calibrated against ONE witness
+    # pair (trait/impl bodies at ~0.857 similarity), and that argument does
+    # not survive contact with templated code. Bodies that differ only in an
+    # index -- `handler_0`/`compute_0`/`x=0` against `handler_1` and so on --
+    # are extremely common in generated clients, dispatch tables and test
+    # suites, and they cross 0.95 on character similarity while being
+    # genuinely distinct symbols. A lane test that meant to build five
+    # NON-duplicates built exactly that shape, and this key collapsed 5
+    # results to 1, and 50 to 28, in another.
+    #
+    # Collapsing a real answer out of a result set is silent: the caller
+    # cannot tell a deduped set from a set that never had the answer. That
+    # is strictly worse than the wasted-slot defect this key fixes, so it
+    # stays off until the collapse rate is measured across the warm corpora.
+    # Flip to true only with that evidence.
+    enabled: false
+    # LANE-NEARDUP-DEDUP: a third, independent dedup key (alongside
+    # `seen_content` byte-identical UPG-2.2 and `seen_docstring` DEF-C) that
+    # catches near-duplicate FULL CONTENT (chunk body, not just leading
+    # docstring) for the case DEF-C cannot reach: chunks whose leading
+    # docstrings differ but whose bodies are still near-verbatim restatements
+    # of each other (a function pair that copy-pasted one boilerplate prose
+    # header each, but landed on essentially the same implementation; two
+    # thin wrapper modules whose one-liner headers don't share a token yet
+    # whose bodies are byte-near-identical). DEF-C keys on a shared leading
+    # docstring, so it can never match those — they need a key that looks at
+    # the content directly.
+    #
+    # The threshold here is much higher than DEF-C's 0.75: DEF-C catches
+    # "boilerplate header over genuinely different bodies" (the
+    # near-duplicate-docstring case), so its 0.75 has to leave headroom for
+    # the trait/impl + overload false-collapse guard. This lane is for the
+    # OPPOSITE failure mode (truly-near-identical content), so the threshold
+    # sits well above the trait/impl body similarity measured for DEF-C
+    # (~0.857): 0.95 keeps a wide margin above any plausible "two genuinely
+    # different functions discussing the same subject" case. 0.95 catches
+    # verbatim or nearly-verbatim text (one or two rephrased tokens, the rest
+    # identical) and skips everything below it.
+    #
+    # Fails in the SAFE direction: a chunk whose body is at similarity
+    # 0.94 with an already-kept representative is left as its own result, the
+    # wasted slot is the pre-existing defect this lane exists to reduce
+    # (never a false collapse).
+    body_similarity_min_ratio: 0.95
+    # Latency bound: a chunk's content is compared against at most this many
+    # already-kept representatives (the earliest/best-ranked ones) instead of
+    # the full, unboundedly-growing list. O(n*k) instead of O(n^2) in the
+    # pathological case (many chunks that are pairwise-similar to within
+    # 0.94 of each other but never genuinely collapse). Same shape and
+    # same safe-failure direction as DEF-C's max_reps_compared above. Read
+    # via config.NEAR_DUP_BODY_MAX_REPS_COMPARED.
+    max_reps_compared: 3
+
   locate_ranking:
     # UPG-15.10: scope-depth + line-span signals for locate ranking.
     # These penalise class/function definitions that are buried inside function
@@ -369,7 +424,19 @@ ranking:
     # env var overrides this key (test fixtures rely on that); an empty value
     # disables reranking entirely. Swapping this model needs no reindex —
     # the reranker scores (query, chunk) pairs at query time only.
-    model: "BAAI/bge-reranker-base"
+    #
+    # UPG-RERANKER-SWAP-SPIKE (2026-08-19): swapped from BAAI/bge-reranker-base
+    # after a full-pipeline A/B on the django acceptance corpus. bge is an NL
+    # passage ranker that inverts relevance on code — it scored QuerySet.get at
+    # 0.0275 on "get object by primary key" while scoring SingleObjectMixin.
+    # get_object 0.9258, and BaseCache 0.0019 on "caching framework
+    # implementation". Truncation was ruled out (all chunks under the 512 cap),
+    # so this was model miscalibration on the code domain, not a context-length
+    # artifact. At the shipped pool depth below, gte scores 43/57 auto-verdict
+    # cases and 5 of the must-pass six against bge's 35/57 and 3/6.
+    # Costs ~1957ms median rerank vs bge's ~1634ms on M1 MPS at batch_size 4.
+    # 574MB on disk (bge: 1.1GB), ~4.6s warm load, no trust_remote_code needed.
+    model: "Alibaba-NLP/gte-reranker-modernbert-base"
 
     # rerank this many hybrid candidates before trimming to n_results
     top_k: 40
@@ -377,7 +444,71 @@ ranking:
     # When no language filter is set, doc prose dominates the shallow hybrid pool and
     # real implementation chunks fall outside it (audit: extractor.py / chunk_file never
     # fetched). Fetch a deeper pool in that case so the quality prior has code to surface.
-    top_k_unfiltered: 60
+    #
+    # THIS, not top_k above, is the knob that governs almost every real query:
+    # top_k applies only to the language/path-filtered branch, and 0 of 65 django
+    # acceptance cases set a language filter (UPG-RERANK-LATENCY-BUDGET, 2026-08-19).
+    # Cross-encoder cost is linear in pairs, and the effective pool runs ~1.2x this
+    # cap because it is a union of the vector-order and BM25-order arms.
+    #
+    # Lowered 60 -> 40 alongside the reranker swap. Measured frontier for the
+    # shipped model across {10,20,30,40,60}: 599/1074/1580/1957/2681 ms median
+    # against 40/41/41/43/44 cases passing and 4/5/4/5/5 of the must-pass six.
+    # 40 rather than 20 deliberately: must-pass-six is NON-MONOTONIC because F22
+    # flips across the sweep (verified deterministic by a byte-identical rerun on
+    # a fresh daemon), so 20's 5/6 is an isolated peak between two 4/6 dips while
+    # 40 and 60 form a contiguous 5/6 plateau. Robustness over the better headline.
+    # All of this is django-only evidence; pool depth interacts with corpus chunk
+    # density in a way model choice does not, so cross-corpus validation is open.
+    top_k_unfiltered: 40
+
+    # Cross-encoder max sequence length in tokens. A (query, chunk) pair
+    # longer than this is truncated before scoring. Sibling of model/top_k
+    # above — was hardcoded in agent/searcher.py before UPG-RERANK-LATENCY-BUDGET.
+    max_length: 512
+
+    # predict() batch_size for the reranker cross-encoder, keyed by the
+    # resolved torch device (agent/searcher.py reads CrossEncoder.device.type
+    # after load -- the SAME attribute sentence_transformers itself populates
+    # when device is left unset; this is not a second device-detection path).
+    # UPG-RERANK-LATENCY-BUDGET measured a 40-query sweep with realistic
+    # 59-92-pair candidate pools (benchmarks/reranker_spike/, branch
+    # upg/reranker-swap-spike) against both shipped reranker models
+    # (BAAI/bge-reranker-base, Alibaba-NLP/gte-reranker-modernbert-base).
+    # Rank order (top-1 and top-5 set) was verified IDENTICAL to batch_size 32
+    # at every tested value on mps -- batch_size only changes wall-clock time,
+    # never which chunks come back or in what order.
+    #   mps (Apple M1, measured): batch_size 32 (the previous unconfigured
+    #     sentence_transformers default) is the WORST value in the sweep --
+    #     smaller batches parallelize better under Metal for this pool-size
+    #     range. batch_size 4 is 1.97x faster than 32 for bge-reranker-base
+    #     (2471ms -> 1252ms median per call) and 1.53x faster for
+    #     gte-reranker-modernbert-base (4067ms -> 2656ms).
+    #   cpu (Apple M1 / ARM, measured, 5-thread cap matching
+    #     embedding.thread_cap -- the same torch.set_num_threads applied
+    #     process-wide by LocalEmbedProvider construction, so this mirrors
+    #     production CPU-path threading): same direction as mps -- batch_size
+    #     32 is again the WORST value, batch_size 4 the best -- but a smaller
+    #     magnitude effect. batch_size 4 is 1.70x faster than 32 for
+    #     bge-reranker-base (4450ms -> 2610ms mean-of-medians) and 1.49x
+    #     faster for gte-reranker-modernbert-base (6297ms -> 4219ms).
+    #     Measured on Apple Silicon (ARM) only -- not verified on x86/Intel/
+    #     AMD CPU hardware, so the magnitude (not necessarily the direction)
+    #     could differ there.
+    #   cuda: UNMEASURED -- no CUDA hardware was available to verify this.
+    #     Larger batches are normally faster on CUDA, the opposite direction
+    #     from the mps/cpu result above, so guessing a small value here would
+    #     risk silently regressing CUDA throughput with no local way to catch
+    #     it. Keeps sentence_transformers' own unconfigured default (32)
+    #     until someone measures it on real CUDA hardware.
+    #   default: fallback for any other/unrecognized resolved device string
+    #     (npu, xpu, hpu, or a future torch backend) -- same reasoning as
+    #     cuda above, preserve the library default rather than guess.
+    batch_size:
+      mps: 4
+      cpu: 4
+      cuda: 32
+      default: 32
 
     # Over-fetch depth for the pool-entry trivial filter (UPG-15.7).
     # Before trimming to top_k_unfiltered, the hybrid retrieval fetches this many raw
@@ -524,6 +655,53 @@ ranking:
     # terminal reader instead of the editor's LLM.
     banner_cli: "No strong match for this query — the results below scored low on absolute relevance and may be unrelated. Try an exact symbol name, rephrase the query, or fall back to grep/reading the file directly."
 
+  relative_cliff:
+    # UPG-BANNER-CALIBRATION Phase 3: an ALTERNATIVE low-confidence sub-
+    # signal — the rank-1-to-rank-2 cross-encoder relevance cliff. Tests
+    # whether the top result decisively leads the next, or whether the
+    # two are essentially tied on a shared weak base. The Phase 1
+    # distribution study (django + tigerbeetle, 65 queries, current
+    # default reranker) showed that the absolute `min_top_relevance`
+    # floor above never fires under gte-reranker-modernbert-base (its
+    # compressed range lifts every class into 0.5-0.97), and a
+    # preliminary rank-1-vs-rank-2 cliff check on django showed no clean
+    # separation either. A relative-cliff test is the third alternative
+    # the measurement on the missing three corpora (react, cpython, uv)
+    # is meant to evaluate. This entry ships the MECHANISM behind a
+    # config switch so the reviewer can measure it; it does NOT change
+    # the default. enabled: false keeps low_confidence byte-identical
+    # to the pre-this-feature behaviour — an exact no-op. A future
+    # default change requires Phase 3 measurement evidence on all five
+    # warm corpora and a separate product decision (Rail 7).
+    enabled: false
+    # Absolute floor (UPG-SCORE-DISPLAY-FLAT scale) below which a
+    # rank-1 cannot credibly lead a set. A rank-1 well under this bar
+    # is not a confident result regardless of how wide the drop to
+    # rank-2 looks; the cliff only matters on a top result that has
+    # any business being a top result. Same scale as
+    # min_top_relevance above — a calibrated cross-encoder relevance
+    # in [0, 1], never the raw dense-cosine fallback (UPG-NOTFOUND-
+    # FLOOR-2: a bi-encoder cosine cannot separate absent-topic from
+    # on-topic, so reusing it here would re-introduce that defect).
+    min_top: 0.30
+    # Required gap between rank-1 and rank-2 expressed as a SHARE OF
+    # REMAINING HEADROOM above rank-1:
+    #     (score[0] - score[1]) >= min_drop * (1 - score[0])
+    # rather than a fixed score difference. Displayed scores are
+    # bounded in [0, 1] so a constant margin is structurally
+    # unsatisfiable on any confident query (the score_order_explain
+    # rationale above, restated for this signal): once score[0]
+    # reaches 2/3, no gap however large can clear a fixed 0.10
+    # margin. The headroom formulation degrades gracefully with
+    # rank-1 confidence. 0.50 means "rank-2 must score at least half
+    # the range still available below rank-1 lower than rank-1",
+    # which is the same shape the score_order_explain entry already
+    # uses (UPG-GATE-V4-MINORS). The exact value is the Phase 3
+    # question the distribution study answers; 0.50 is a placeholder
+    # that the enabled=false default never exercises. Set enabled:
+    # true and tune this against the distribution output.
+    min_drop: 0.50
+
   score_order_explain:
     # UPG-SCORE-ORDER-EXPLAIN: displayed absolute relevance may disagree with
     # display order (the composite quality/importance priors decide order, not
@@ -533,10 +711,21 @@ ranking:
     # silently misleading. Additive, deterministic, chunk-property-based — never
     # reorders anything (no query-side logic).
     enabled: true
-    # Only annotate a large divergence: a below-rank-1 result whose displayed
-    # relevance is at least this multiple of rank 1's. Mild inversions (a
-    # near-tie) are left unlabeled to avoid noise.
-    margin_ratio: 1.5
+    # Only annotate a large divergence. UPG-GATE-V4-MINORS: the divergence
+    # measure is now a SHARE OF REMAINING HEADROOM, not a fixed multiple of
+    # rank-1's score. Displayed scores are bounded in [0, 1], so the old
+    # ratio rule ("lower result scored >= margin_ratio * rank-1") was
+    # structurally unsatisfiable on confident queries: once rank-1 reached
+    # 2/3, NO inversion however large could ever be annotated (measured gate
+    # witness: rank-1 0.864 vs a rank-5 0.969 went unannotated). The required
+    # absolute gap instead shrinks as rank-1 approaches the ceiling —
+    # annotate iff (score - top_score) >= min_headroom_ratio * (1 -
+    # top_score), i.e. the inversion consumes at least this share of the
+    # score range still available above rank-1. Calibrated between two
+    # pinned cases: 0.80 -> 0.90 consumes 50% of the remaining range
+    # (near-tie, left unlabeled); 0.864 -> 0.969 consumes ~77% (annotated).
+    # Mild inversions are still left unlabeled to avoid noise.
+    min_headroom_ratio: 0.65
 
   result_floor:
     # UPG-RESULT-FLOOR: an absent-topic query still draws n_results nearest
@@ -565,25 +754,63 @@ ranking:
     # low confidence overall. Gated on ce_relevance ONLY, never the raw
     # dense-cosine fallback — a bi-encoder cosine cannot separate
     # absent-topic from on-topic queries (UPG-NOTFOUND-FLOOR-2), so it
-    # cannot anchor a per-result floor either; when reranking did not run,
-    # every result's ce_relevance is None and every result still renders as
-    # a plain pointer, identical to pre-fix behaviour. Deterministic,
+    # cannot anchor a per-result floor either. Deterministic,
     # score-property-based; no query-content logic.
     enabled: true
-    # Reuses the same absolute bar the SET-LEVEL low-confidence gate itself
-    # uses (ranking.notfound_floor.min_top_relevance) — "individually strong"
-    # means clearing the identical floor a set-leading result would need to
-    # avoid the low-confidence flag in the first place. Independently
-    # tunable from that key.
+    # UPG-BANNER-CALIBRATION: previously this reused the exact same scalar as
+    # ranking.notfound_floor.min_top_relevance (0.30) — which is a structural
+    # deadlock, not a coincidence, for the one sub-signal that most needs the
+    # escape hatch. When low_confidence fires via that sub-signal, it is
+    # BECAUSE the top (rank-1) result's own ce_relevance is < min_top_relevance
+    # — so a retain floor set >= min_top_relevance can mathematically never
+    # pass for the exact result that triggered the flag, on any reranker or
+    # corpus (F47 measured: rank-1 correct, ce_relevance 0.024, banner fired,
+    # zero code delivered, forcing a second vectr_fetch round trip — the
+    # inverse of vectr's core promise). Lowering this constant on its own
+    # widens the escape hatch for OTHER ranks whose score falls between the
+    # two floors, but cannot rescue rank-1 by construction. This value is now
+    # genuinely independent of notfound_floor.min_top_relevance rather than
+    # deliberately tied to it, and governs ranks 2+ only; rank-1 is exempted
+    # below via retain_rank1_always regardless of this number.
+    # UPG-BANNER-CALIBRATION Phase 1 measurement (django + tigerbeetle, 65
+    # queries, current default reranker gte-reranker-modernbert-base): no
+    # single absolute value in [0, 1] cleanly separates known-good from
+    # known-miss or known-absent CE scores under either the current reranker
+    # (all three classes overlap in a narrow 0.5-0.97 band) or the prior
+    # bge-reranker-base default (all three classes overlap in a 0.02-0.99
+    # band per the pre-existing config comment on ce_override_min_relevance).
+    # That measurement is precisely why this constant is LEFT AT 0.30. The
+    # deadlock above is fixed structurally, by rank, via retain_rank1_always
+    # below; it needs no new number, and this lane's own distribution study
+    # supports no particular value for ranks 2+. Moving it without separation
+    # evidence would replace one uncalibrated constant with another and call
+    # it a fix. Recalibrating this bar is UPG-BANNER-CALIBRATION Phase 3, and
+    # depends on whichever cross-encoder is the default at calibration time.
     min_relevance: 0.30
+    # UPG-BANNER-CALIBRATION: the composite-top (rank-1) result of a
+    # low-confidence set always keeps its excerpt, regardless of
+    # min_relevance above. Mirrors the existing result_floor precedent
+    # ("the single strongest result is always kept so the low-confidence
+    # banner always leads a best guess") but extends it from "stays in the
+    # list" to "keeps its body" — a rank-based, CE-scale-agnostic exemption
+    # that needs no calibrated absolute number, so it survives untouched
+    # across any future reranker swap or recalibration of min_relevance
+    # above. Deterministic, rank-property-based; no query-content logic.
+    retain_rank1_always: true
     # Bounded excerpt length (lines) for a retained result — deliberately
     # smaller than the normal 80-line display cap (UPG-11.4-b) so a
     # low-confidence set with several individually-strong results still
     # stays token-bounded; vectr_fetch(ids=[...]) restores the rest.
     excerpt_lines: 20
-    # Phrase attached to a retained result's pointer line, so the caller LLM
-    # knows why this one entry differs from its low-confidence neighbours.
+    # Phrase attached to a retained result's pointer line when it clears
+    # min_relevance above, so the caller LLM knows why this entry differs
+    # from its low-confidence neighbours.
     label: "individually strong — clears the confidence floor despite the low-confidence set"
+    # UPG-BANNER-CALIBRATION: separate phrase for the retain_rank1_always
+    # case, which is not a "clears the floor" claim (the result may score
+    # under min_relevance, or have no ce_relevance at all when reranking
+    # didn't run) — it is retained purely because it is the set's best guess.
+    rank1_label: "top-ranked result — always shown as a best guess despite the low-confidence set"
 
 strategy:
   # Fallback hybrid-search weights used before the first index-time codebase
@@ -710,6 +937,18 @@ search:
 indexing:
   # hard cap — prevents single huge chunks diluting embeddings
   max_chunk_lines: 150
+
+  # Character cap per chunk (UPG-WINDOW-CHUNK-BYTE-CAP). Every LINE-based cap
+  # (this section's max_chunk_lines, the window walker's 200-line windows) is
+  # defeated by a single long line: a minified JS bundle, a generated SQL dump,
+  # or one giant data-fixture line produces an unbounded chunk that costs
+  # memory in its embed batch and is truncated away at the embedder's token
+  # cap anyway. Any chunk exceeding this many characters is sub-split into
+  # bounded pieces (tail stays retrievable — nothing is truncated away).
+  # Default headroom: a full 200-line window of dense source averages well
+  # under half of this, so ordinary files never hit the cap; it only bites
+  # genuinely oversized content.
+  max_chunk_chars: 32000
 
   # lines kept for class-level chunk (sig + docstring + attrs)
   class_header_lines: 40
@@ -1005,6 +1244,46 @@ memory_hygiene:
   # note from last month's finished work gets surfaced.
   stale_task_warn_age_days: 7
 
+memory_export:
+  # UPG-MEMORY-LEGIBLE-FILE-PROJECTION part (a): `vectr memory export` renders
+  # the live working-memory notes to a read-only markdown mirror (default
+  # MEMORY.md) so a human — or an agent without MCP tool access — can open,
+  # grep, and `git diff` memory the way they already do for a hand-written
+  # notes file. Nothing ever reads the rendered file back; the database stays
+  # the sole source of truth. The mirror is re-rendered from a debounced
+  # post-write hook (`_bump_notes_epoch()` in app/service.py) so it never
+  # falls far behind, but a write must never be slowed or failed by export
+  # work — hence the debounce rather than a synchronous render on every call.
+
+  # Seconds of write-quiet before a scheduled export actually runs, per
+  # workspace. A burst of several remember()/revoke()/etc calls in quick
+  # succession (e.g. an agent recording multiple findings back-to-back)
+  # collapses into a single re-render instead of one per write. 3 seconds is
+  # short enough that the file is current well within one human glance at a
+  # terminal, long enough to coalesce a realistic same-turn burst.
+  debounce_seconds: 3.0
+
+memory_import:
+  # UPG-MEMORY-IMPORT: `vectr memory import` walks this list of workspace-
+  # relative paths in order when no --path is given, then imports every
+  # existing one through the structural section split (heading boundaries)
+  # or the export-grammar recovery path (when the file carries the export
+  # header comment). The defaults cover the common on-disk memory files a
+  # user already has before adopting vectr. Editors that store their rules
+  # in a subdirectory (e.g. `.cursor/rules/*.mdc`) are reachable through
+  # repeated --path arguments — the closed list here is the WORKSPACE-ROOT
+  # discovery set only, and adding a new filename to it is a config-only
+  # change. Filenames are data, not product copy: matching
+  # `.github/copilot-instructions.md` is the discovery surface, and saying
+  # so is honest, the same way the init command names files it writes.
+
+  candidate_files:
+    - MEMORY.md
+    - CLAUDE.md
+    - AGENTS.md
+    - .cursorrules
+    - .github/copilot-instructions.md
+
 memory_recall_for_path:
   # UPG-PROXY-SUBSTRING-ANCHOR: recall_for_path() answers "which notes are
   # relevant to this file path" for the PreToolUse hook and the proactive
@@ -1027,6 +1306,183 @@ memory_recall_for_path:
   # unbounded table scan. 200 is generously above any realistic per-path
   # note count while keeping the query cheap.
   overfetch_ceiling: 200
+
+recall_floor:
+  # UPG-RECALL-MISS-FLOOR parts (b)/(c), revised round 4: a floor that
+  # does not depend on matching at all. MEMORY.md-style unconditional
+  # injection is not BETTER retrieval, it is NO retrieval — it only works
+  # because the file is ~40 lines. At hundreds of notes that stops
+  # scaling, so instead of tuning semantic matching further,
+  # `WorkingContextStore.recall()` composes two guarantees ahead of the
+  # ranked (semantic/SQL) result:
+  #   Tier 0 — every explicitly PINNED note, injected unconditionally,
+  #     never scored against the query. Round-4 change: directive notes
+  #     were DROPPED from Tier 0's candidate predicate (it used to be
+  #     `kind == 'directive' or pinned`, now just `pinned`). Reason:
+  #     boot_recall() already returns ALL directive notes unconditionally
+  #     every session (capped by behavior.boot.max_directive_notes,
+  #     default 100) — including them here a second time only charged
+  #     query budget for a guarantee that already exists on a stronger,
+  #     dedicated channel. The pin is the only note kind with NO other
+  #     guaranteed-delivery path, so it is the only kind Tier 0 still
+  #     carries; the pin-priority sort this used to need (to pick between
+  #     a pinned note and a directive) is gone along with the directive
+  #     branch — there is only one candidate kind left to order.
+  #   Deterministic channels — OFF BY DEFAULT as of round 4 (see
+  #     deterministic_enabled below); when enabled, a note whose OWN
+  #     declared tag, anchor basename, trigger symbol, or title token set
+  #     is found in the query's text (containment checked against that
+  #     note's stored metadata, never a classification of the query) is
+  #     guaranteed a slot ahead of pure semantic fill. When more notes
+  #     match than fit the channel's cap, the matched set is ranked by
+  #     its OWN match specificity (how many distinct declared-metadata
+  #     fields matched, then how long/specific the matched text was)
+  #     before truncating — never by recency alone (UPG-RECALL-MISS-FLOOR
+  #     F2 fix; see _declared_metadata_match_specificity() in
+  #     agent/working_context_store/_store.py). See deterministic_enabled
+  #     below for why this channel is gated off pending a tighter
+  #     predicate.
+  # Both tiers are bounded by count so neither can crowd out the ranked
+  # result entirely, and the combined result is always truncated to the
+  # caller's `limit` (see benchmarks/recall_miss/harness.py's STEP 0
+  # guard: a composition may never return more than `limit` notes). With
+  # zero pinned notes and deterministic_enabled: false (the shipped
+  # default in a workspace that has never pinned anything), `recall()`
+  # with apply_floor=True is required to produce byte-identical output to
+  # apply_floor=False — nothing may consume budget unconditionally unless
+  # a user actually opted into it via a pin.
+
+  # Max notes Tier 0 (pinned notes only, as of round 4) contributes per
+  # recall() call, regardless of how many pinned notes exist in the
+  # workspace. The candidate pool is ordered by recency (created_at DESC,
+  # note_id DESC — see _floor_candidate_pool()); when a workspace holds
+  # more pinned notes than this bound, Tier 0 is, in practice, "the
+  # tier0_max_notes MOST RECENTLY pinned notes" — an older one can never
+  # enter Tier 0 no matter how long it has stood. This is a DELIBERATE,
+  # stated bound of the design (recency is a reasonable, deterministic
+  # tie-break for an otherwise-unconditional guarantee), not an accident
+  # of pool order — see tier0_min_notes below for the separate guarantee
+  # this cap must never fall below.
+  tier0_max_notes: 5
+
+  # Max notes the deterministic tag/anchor/symbol/title channels
+  # contribute per recall() call, on top of (and excluding) whatever
+  # Tier 0 already filled.
+  deterministic_max_notes: 5
+
+  # UPG-RECALL-MISS-FLOOR F1 fix, revised after review, and again round 4
+  # (Tier 0 became pinned-only, this key's shape is unchanged): Tier 0's
+  # guaranteed slot count is `max(1, min(this, floor(limit *
+  # tier0_max_share_of_limit)))` — never 0 for any `limit >= 1`, but
+  # scaled by the SAME share as the ceiling below rather than flat-taxing
+  # a tight budget at this full count. 2 gives room for more than one
+  # pinned note to survive at once (rather than only ever guaranteeing
+  # the single most recent pin); it reaches exactly 2 at recall()'s own
+  # production default (limit=10), below that (e.g. limit=5) it degrades
+  # to a single guaranteed slot. Before this key existed (first version
+  # of this mechanism), a caller passing limit=10 got tier0_cap =
+  # int(10 * 0.1) = 1 and limit=5 got 0 (measured live against the real
+  # 38-query labeled corpus with a deliberately off-topic query) — both
+  # silent failures of the "never 0" requirement, not merely a smaller
+  # guarantee than intended.
+  tier0_min_notes: 2
+
+  # Upper bound on how many of the workspace's own notes are scanned as
+  # Tier 0 / deterministic-channel candidates per call (ordered by
+  # created_at DESC, most recent first) — the deterministic channels must
+  # check every eligible note's OWN metadata against the query, which has
+  # no relevance-ranked shortcut, so this ceiling keeps a single recall()
+  # call bounded on a workspace with a very large note count.
+  metadata_scan_ceiling: 2000
+
+  # Title channel: a note's title is tokenized the same uniform way as
+  # the query (lowercased, split on non-alphanumeric runs); a token
+  # shorter than this is dropped from both sides before comparing, so
+  # short connector words never count toward the overlap below.
+  title_min_token_len: 4
+
+  # Title channel: minimum number of surviving title tokens that must
+  # also appear in the query's own token set for the title channel to
+  # count as a deterministic hit for that note.
+  title_min_overlap_tokens: 2
+
+  # UPG-RECALL-MISS-FLOOR F1/F3 fix: an earlier version of this section
+  # picked tier0_max_fraction_of_limit=0.1 / deterministic_max_fraction_
+  # of_limit=0.3 by scanning several (tier0, deterministic) combinations
+  # against the labeled recall-miss corpus and keeping the pair that
+  # scored best — that made the corpus's own measured recall a SELECTED
+  # number, not a measured one, and review correctly rejected it (see
+  # UPG-RECALL-MISS-FLOOR working notes). Also, at recall()'s own default
+  # (limit=10), 0.1 alone gave Tier 0 exactly ONE slot — not enough room
+  # for the tier's own acceptance bar ("a directive AND a pinned note are
+  # injected at 100%"). The two constants below are instead each a direct
+  # restatement of a stated STRUCTURAL principle, independent of any
+  # particular query set; see `tier0_min_notes` above for the guaranteed
+  # minimum that now always takes precedence over the ceiling below it.
+
+  # Tier 0's upper bound, as a share of the caller's own `limit`, used
+  # BOTH to scale tier0_min_notes' guaranteed floor down at a tight
+  # `limit` (see tier0_min_notes above) AND as the ceiling
+  # tier0_min_notes cannot itself exceed once `limit` grows
+  # (_recall_floor_notes: tier0_guaranteed = max(1, min(tier0_min_notes,
+  # floor(limit * this))); tier0_cap = min(tier0_max_notes,
+  # max(tier0_guaranteed, floor(limit * this)))). Chosen so this share
+  # reaches tier0_min_notes exactly at the crossover point tier0_min_notes
+  # / this = 2 / 0.2 = 10 — recall()'s own production default. A caller
+  # asking for exactly the default result count gets the full guaranteed
+  # minimum (2, room for more than one pinned note); a caller asking
+  # for meaningfully more lets Tier 0 grow, still capped by
+  # tier0_max_notes, toward its full absolute allowance; a caller asking
+  # for meaningfully less degrades toward a single guaranteed slot
+  # (pin-priority) rather than spending tier0_min_notes' full count
+  # unconditionally on a channel that already has a stronger backstop in
+  # boot_recall().
+  tier0_max_share_of_limit: 0.2
+
+  # The deterministic channel's upper bound, as a share of whatever
+  # budget Tier 0 did NOT actually use (limit minus the ACTUAL number of
+  # Tier 0 notes returned — which can be below tier0_min_notes/tier0_cap
+  # in a workspace with few or no directive/pinned notes), never a share
+  # of `limit` directly. 0.5 is the direct arithmetic statement of "the
+  # deterministic channel never takes more than the ranked group": at
+  # most an equal split of what Tier 0 left behind, so ranked fill is
+  # guaranteed at least as many slots as the deterministic channel
+  # claims, at any `limit`.
+  #
+  # NOTED PROPERTY (UPG-RECALL-MISS-FLOOR, measured against the live
+  # labeled corpus after the tier0_max_share_of_limit fix above): because
+  # this cap is a share of REMAINING, shrinking Tier 0's actual count
+  # grows this channel's own cap by roughly the same amount, so the
+  # combined tier0+deterministic budget can stay unchanged even when
+  # tier0_min_notes/tier0_max_share_of_limit shrink Tier 0 itself — the
+  # freed capacity is not guaranteed to reach the ranked group unless a
+  # matching deterministic note actually exists to claim it. This is an
+  # observed structural consequence of the two formulas composing, not a
+  # bug; do not retune either share to chase a specific corpus's numbers
+  # (see the F3 note above this section on why that was rejected once).
+  deterministic_max_share_of_remaining: 0.5
+
+  # UPG-RECALL-MISS-FLOOR round-4 evidence gate: the deterministic channel
+  # ships OFF by default. Measured against the live 38-query labeled
+  # corpus, its membership predicate (containment of a note's own tag,
+  # anchor basename, trigger symbol, or title-token-overlap against the
+  # query text) is too loose to act as a guarantee — mean 50.2 candidate
+  # notes matched per query (min 6, max 111) against a mean of ~1 labeled-
+  # relevant note; per-channel precision was tag 1.6%, title 4.6%, anchor
+  # 0%, symbol 0 matches across the run. A cap-sweep (total floor cap 0..6
+  # slots, endpoints reproduced the harness exactly) showed the channel's
+  # effect on recall is NOT monotonic in budget (k=5: cap1 +0, cap2 -1,
+  # cap3 -2, cap4 -2, cap5 -2, cap6 -2; k=10: cap1 +0, cap2 +0, cap3 +1,
+  # cap4 +0, cap5 +0, cap6 +2) — a channel carrying real signal should be
+  # roughly monotonic; a jagged walk means the +2 measured at k=10 in an
+  # earlier round was noise from a loose predicate consuming budget, not
+  # an effect. This is evidence-gating, not deletion: the code, its ranked
+  # match-specificity ordering, and its test coverage are all still
+  # present and correct (tests flip this flag true to exercise the
+  # channel) — a future task can revisit the predicate itself (e.g.
+  # requiring 2+ matched channels to enter the pool at all, not just to
+  # win a tie) and flip this back on with fresh evidence.
+  deterministic_enabled: false
 
 symbol_graph:
   # UPG-JSFLOW-SYMBOLS: language keywords that must never be minted as a
@@ -1641,18 +2097,6 @@ embedding:
   # default's behavior; raise deliberately, with indexing throughput in mind.
   max_seq_length: 512
 
-  # Output size asked of providers that support truncated output (Google
-  # batchEmbedContents outputDimensionality). null keeps the provider's own
-  # default — Google's full 3072-dim output, which is the only Google output
-  # returned already L2-normalized; any smaller value is renormalized by
-  # GoogleEmbedProvider so cosine scoring stays comparable.
-  output_dimensionality: null
-
-  # Environment variable holding a remote provider's API key (Google). Falls
-  # back to "gemini_api_key" in ~/.vectr/secrets.json (keep that file mode 600).
-  # The key value itself is never logged or quoted in an error message.
-  api_key_env: GEMINI_API_KEY
-
   # Hard cap on the number of CPU threads the local (torch-backed) embedding
   # model may use — applied via torch.set_num_threads/set_num_interop_threads
   # at LocalEmbedProvider construction, so it also governs the cross-encoder
@@ -1815,6 +2259,61 @@ memory_write:
     # CLOSENESS (is this candidate worth the caller's attention at all),
     # never for correctness (that judgment always stays caller-side).
     min_similarity: 0.75
+    # UPG-RELATED-REVOKED-DETERRENT: separately from the ACTIVE candidates
+    # above, additionally surface the nearest REVOKED near-duplicate (if any
+    # clears min_similarity above) as a deterrent line naming its id, title,
+    # similarity, revocation date and reason — a pointer to look at, not the
+    # note's raw content (the existing _ANTI_MEMORY_TEMPLATE in
+    # agent/working_context_store/_store.py is for a DIFFERENT delivery
+    # path: injecting a revoked note's own content inline with a warning;
+    # this is a nearest-neighbour pointer alongside a fresh write, same
+    # shape as the active-candidate rendering above, so it reuses THAT
+    # rendering's shape instead). This is the single highest-value case the
+    # whole related-notes feature can surface: it catches an agent about to
+    # re-assert a belief the user already marked wrong, at the moment of
+    # writing rather than only when the new note happens to be recalled
+    # later. A separate flag from `enabled` above because it renders
+    # materially different content (a deterrent, not a similarity nudge)
+    # and an operator may want the ordinary near-duplicate nudge without
+    # the revoked-note callout.
+    revoked_enabled: true
+    # Capped at 1 by design, not a ranked list like the active candidates
+    # above: this is a deterrent flag ("you already revoked something like
+    # this"), not a browsing surface — one match is enough to make the
+    # point without turning a routine write into a multi-item warning
+    # digest.
+    revoked_limit: 1
+    # UPG-RELATED-REVOKED-OVERFETCH-DEPTH: how many nearest-neighbour
+    # candidates the revoked-path vector query pulls BEFORE the folded-
+    # lifecycle-state filter runs, independent of `revoked_limit` above.
+    # `revoked_limit` bounds what gets RENDERED; this bounds what gets
+    # SEARCHED — the two must not share one number. On a measured live
+    # 565-note corpus, notes in the `revoked` state were 0.35% of the
+    # corpus (2 of 565) while active notes were ~99% — so a revoked
+    # near-duplicate is exactly the rare case that several closer ACTIVE
+    # notes on the same (now-corrected) topic can crowd out of a shallow
+    # candidate pool entirely, even though it is the single highest-value
+    # thing this offer can surface. Deriving the pool size from
+    # `revoked_limit * 3` (the active path's formula, appropriate there
+    # because its target class is ~99% of the corpus) gives a pool of only
+    # 3 for the shipped `revoked_limit: 1` — three closer active near-
+    # duplicates are then enough to hide a real revoked one every time.
+    # This floor is a flat number, not a multiple of the collection size:
+    # the crowding-out risk comes from how many active notes cluster
+    # around ONE topic a user revisited, which is bounded by realistic
+    # human note-taking volume on a single subject, not by how large the
+    # whole corpus has grown — so the same floor is sane whether the
+    # collection holds 5 notes (this floor collapses to `col_count` via
+    # the `min()` below, i.e. "search everything", trivially cheap) or
+    # 50,000 (this floor keeps the query bounded and cheap regardless of
+    # corpus growth). 100 is a generous multiple of any measured or
+    # plausible single-topic active-note cluster size, while measured
+    # latency cost stays negligible for a query that already runs inline
+    # on every remember() call: on a synthetic 50,000-vector collection,
+    # ChromaDB .query() at n_results=100 costs ~0.94ms mean versus ~0.59ms
+    # at n_results=3 — under 0.4ms of added latency for roughly 33x the
+    # search depth.
+    revoked_query_floor: 100
 
   user_quote:
     # UPG-MEM-PROVENANCE-USER-STATED: a note may carry a verbatim excerpt of
@@ -1828,8 +2327,67 @@ memory_write:
     # nothing while still upgrading the note's trust class — the floor is what
     # keeps "bound" evidential rather than automatic. Raise it to demand more
     # of the user's actual wording; there is no value at which an excerpt is
-    # accepted without being contained.
+    # accepted without being contained. Also the evidence floor for the
+    # auto-bind path just below (a note's whole content must reach this many
+    # normalized characters to be worth comparing at all).
     min_chars: 12
+
+    # UPG-PROVENANCE-NEVER-RISES: `remember()` only reaches `user-stated`
+    # provenance above when the WRITING AGENT remembers to pass an explicit
+    # `user_quote=` argument — on a live 719-note production corpus this
+    # voluntary step was never once taken, so the class was unreachable in
+    # practice. This is the harness-driven fallback: when a `remember()` call
+    # carries no `user_quote` of its own, the daemon compares the note's
+    # content against the most recently captured `UserPromptSubmit` prompt
+    # for this workspace (agent/working_context_store/_user_quote.py's
+    # `bind_user_quote_auto()` — a deterministic whole-content substring
+    # check, never semantic) and binds automatically on a match. This value
+    # bounds how old that captured prompt may be, in seconds, before it is
+    # considered a different turn and the fallback is skipped rather than
+    # correlating a note to a stale, unrelated prompt. 600s (10 minutes) is
+    # generous enough to cover the writing agent's own thinking/tool-call
+    # time between the user's message and the resulting `vectr_remember`
+    # call, without reaching into the previous conversational turn.
+    auto_bind_max_age_seconds: 600
+
+    # UPG-PROVENANCE-AUTOBIND-SPAN: measured reach limit of the whole-content
+    # check above on a live 742-note corpus was "at most 1 of 45" directives,
+    # because a real directive is routinely wrapped in agent-authored framing
+    # the user never typed (e.g. `USER DIRECTIVE 2026-07-12: "<the user's
+    # actual words>"`) — whole-body containment can never match that, only a
+    # SPAN can. bind_user_quote_auto() therefore searches for the longest
+    # contiguous run of the note's content that appears verbatim in the
+    # captured user turn, rather than requiring the entire body to match.
+    # This floor applies to that SPAN's length and is intentionally HIGHER
+    # than min_chars above: a derived span is a weaker signal than a
+    # caller-declared excerpt at the same length, because the caller made no
+    # claim at all — an incidental shared technical phrase between two
+    # unrelated pieces of text can clear a low floor by coincidence (measured
+    # against this exact risk: "the venv interpreter" is 21 characters, "run
+    # the linter" is 15 — both plausible incidental overlaps between a note
+    # and an unrelated user message about the same tool). 30 was chosen
+    # because it clears both of those measured false-bind examples while
+    # still comfortably admitting the real, much longer motivating quote
+    # above (74 characters) — a coincidental overlap this long, that is also
+    # a full clause of a real user turn, is not the same class of event.
+    span_bind_min_chars: 30
+
+    # Longest-common-substring search is worst-case O(len(content) *
+    # len(turn)) (pathological inputs only — e.g. long runs of a repeated
+    # character after whitespace normalization; ordinary text is far cheaper
+    # in practice via difflib's matching-block algorithm, but nothing here
+    # should depend on that holding for every possible input). This search
+    # runs inline on every remember() call whose explicit user_quote (if any)
+    # did not already bind, so a pathological pair of inputs must not be
+    # allowed to stall a write. Bounds the PRODUCT of the two
+    # (whitespace-normalized) lengths, not either length alone, because the
+    # realistic risk is a short note quoting a fragment of a very long pasted
+    # user turn — capping the turn's length alone would refuse exactly that
+    # case even though the product stays small. Above this product the
+    # search is skipped outright (never truncated-and-searched, which could
+    # silently miss the real match and produce a wrong bind) and the note
+    # keeps its ordinary provenance.
+    span_bind_max_product_chars: 4000000
 
   proxy_anchor_suggestions:
     # Surfaces which protocol-level proxy-anchor files (agent/
@@ -1854,6 +2412,23 @@ memory_write:
     # only so content_file cannot be used to load an unrelated large file
     # (a log dump, a full source tree) into a single working-memory note.
     max_bytes: 1048576
+    # UPG-REMEMBER-CONTENT-FILE-PATH-REFUSAL: additional absolute roots the
+    # operator allows content_file reads from, BEYOND the primary workspace
+    # root and the multi-root `extra_roots` already accepted by the
+    # resolver. Empty by default — the boundary is unchanged until an
+    # operator (whoever runs the daemon) explicitly opts in by listing one
+    # or more roots here. Use this to allow content_file reads from a
+    # directory the workspace does not own but agents are instructed to
+    # write to (a harness's scratchpad dir, a per-session temp dir, etc.)
+    # without weakening the per-call refusal to read /etc/passwd or another
+    # project's tree. Operator-only: a calling agent cannot widen
+    # containment per call — the trust decision is made once at startup,
+    # not per request, so the boundary is not a flag the caller can
+    # simply always pass. Symlink resolution still runs BEFORE the
+    # containment check (matching the primary/extra_roots rule), so a
+    # symlink inside an additional root that resolves outside every
+    # accepted root is still rejected.
+    additional_readable_roots: []
 
 proactive:
   # UPG-PRO — "Proactive context" (experimental). Deterministically surface the
@@ -1946,6 +2521,16 @@ proactive:
   # Dedup / cooldown ledger size: the last N injected anchor ids per session are
   # suppressed, so the same note is not re-injected turn after turn.
   cooldown_items: 30
+  # UPG-PROXY-COOLDOWN-NO-TIME-DECAY: wall-clock suppression window (seconds)
+  # on top of that count ring. The proxy channel's session key is process-
+  # scoped, so "last 30" can span the proxy's whole lifetime — without a time
+  # bound a note that becomes genuinely relevant again hours later stays
+  # suppressed until 30 OTHER distinct anchors have cycled through. An entry
+  # stops suppressing once its most recent delivery is older than this TTL;
+  # the count ring still applies on top of it. 0 disables the decay entirely
+  # (pure count ring, the historical behaviour). Suppression refreshes on each
+  # re-delivery: the window runs from the MOST RECENT time you saw the note.
+  cooldown_ttl_seconds: 3600
 
   # Structural (path-anchored) channel relevance gate (UPG-PROXY-INJECT-
   # PRECISION). `recall_for_path()` answers "which notes mention or are
@@ -2048,9 +2633,12 @@ proactive:
   # Phase 3 — localhost Anthropic-shaped API proxy. The literal "vectr in the
   # middle" of the wire: point the agent harness at it with
   # ANTHROPIC_BASE_URL, and it forwards to the real API while appending
-  # deterministic context AFTER the last prompt-cache breakpoint.
+  # deterministic context AFTER the last prompt-cache breakpoint. (The old
+  # `enabled` toggle was removed as dead config — UPG-PROACTIVE-DEAD-GATES:
+  # nothing read it; whether injection happens is governed by `inject`, and
+  # the localhost boundary is enforced unconditionally at runtime, never by a
+  # config key.)
   proxy:
-    enabled: false                 # opt-in listener; off by default
     host: 127.0.0.1                # localhost only; a non-loopback host is refused
     port: 8785                     # proxy listener port (distinct from any daemon port)
     upstream_base_url: https://api.anthropic.com   # the real API the proxy forwards to

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from importlib import metadata as _importlib_metadata
 
+from agent.working_context_store import SORT_BY_VALUES
+
 
 def _package_version() -> str:
     try:
@@ -333,7 +335,12 @@ _MEMORY_WRITE_TOOLS = [
                 },
                 "priority": {
                     "type": "string",
-                    "description": "Note priority: 'high' | 'medium' (default) | 'low'",
+                    "description": (
+                        "Note priority: 'high' | 'medium' (default) | 'low'. "
+                        "Session-start boot injection and the resume surface show only "
+                        "priority='high' kind='task' notes, so a checkpoint you want "
+                        "picked up at resume needs priority='high'."
+                    ),
                     "default": "medium",
                     "enum": ["high", "medium", "low"],
                 },
@@ -342,7 +349,9 @@ _MEMORY_WRITE_TOOLS = [
                     "description": (
                         "Memory kind, controlling how the note is injected (default 'finding'): "
                         "'directive' = a must-never-miss rule, injected unconditionally every session; "
-                        "'task' = current-work context; 'gotcha' = a file/path-anchored caveat; "
+                        "'task' = current-work context (save checkpoints with priority=\"high\" — "
+                        "session-start/resume surfaces show only high-priority task notes); "
+                        "'gotcha' = a file/path-anchored caveat; "
                         "'finding' = a relevance-ranked learning; 'reference' = a pointer (URL/ticket); "
                         "'decision' = an architectural/design decision plus its why — not auto-injected, "
                         "recall the group chronologically with vectr_recall(kind=\"decision\", "
@@ -470,6 +479,16 @@ _MEMORY_WRITE_TOOLS = [
                         "is not itself an integer, are reported back in the confirmation, "
                         "never an error and never silently dropped."
                     ),
+                },
+                "pin": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional: pin this note into Tier 0 at write time — injected on "
+                        "EVERY future vectr_recall(query=...) call regardless of the query, "
+                        "same effect as a separate vectr_pin call right after this write. "
+                        "Bounded, so pin sparingly. Default false."
+                    ),
+                    "default": False,
                 },
             },
             # UPG-REMEMBER-MCP-LONG-PAYLOAD-PARSE-LOSS: content is no longer
@@ -620,7 +639,12 @@ _MEMORY_TOOLS = [
                         "timeline, or with any other kind/tag filter for the same time-ordered view)."
                     ),
                     "default": "relevance",
-                    "enum": ["relevance", "recency", "priority", "chronological"],
+                    # UPG-SORTBY-SHARED-VOCAB: same SORT_BY_VALUES constant the
+                    # REST validator, MCP dispatch guard, and CLI argparse
+                    # choices consume. JSON Schema needs a JSON-native list,
+                    # not a tuple, so we list()-cast at the boundary; the
+                    # vocabulary itself is still the shared constant.
+                    "enum": list(SORT_BY_VALUES),
                 },
                 "max_age_days": {
                     "type": "number",
@@ -834,6 +858,154 @@ _MEMORY_TOOLS = [
             "required": ["note_id"],
         },
     },
+    {
+        "name": "vectr_supersede",
+        "annotations": {
+            "title": "Retire a note as superseded (post-hoc)",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "description": (
+            "Retire an ALREADY-STORED note as superseded, when you discover only AFTER "
+            "writing its replacement that supersedes=<old id> was not passed on that "
+            "write. The retired note stops appearing in default recall/session-start "
+            "and renders with a factual '[superseded ...]' badge — it is NOT marked "
+            "wrong and never shows the revoked deterrent (it was accurate when "
+            "written; the world moved on). Use vectr_revoke instead when the note is "
+            "actually FALSE. Pass superseded_by=<note_id> to link the replacement if "
+            "one exists; omit it to retire with no successor. Reversible with "
+            "vectr_reinstate."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "integer",
+                    "description": "ID of the note to retire (the [#N] id from vectr_recall)",
+                },
+                "superseded_by": {
+                    "type": "integer",
+                    "description": (
+                        "Optional: ID of the replacement note that already exists "
+                        "(the write that should have carried supersedes=<this note>)."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional: why this note is being retired as superseded.",
+                },
+            },
+            "required": ["note_id"],
+        },
+    },
+    {
+        "name": "vectr_pin",
+        "annotations": {
+            "title": "Pin/unpin a note into Tier 0",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "description": (
+            "Pin a note so it is injected on EVERY future vectr_recall(query=...) call, "
+            "regardless of the query — never relevance-scored, never dropped for being "
+            "off-topic. Use for a note that must never be missed by an unlucky query "
+            "(the same standing-rule role kind='directive' already plays, but for a note "
+            "you don't want to reclassify as a directive). Pass pinned=false to unpin. "
+            "Bounded: only a small configured number of directive+pinned notes ever "
+            "occupy this unconditional tier, so pin sparingly. Equivalent to passing "
+            "pin=true directly to vectr_remember at write time."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "integer",
+                    "description": "ID of the note to pin/unpin (the [#N] id from vectr_recall)",
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": "true to pin (default), false to unpin",
+                },
+            },
+            "required": ["note_id"],
+        },
+    },
+    {
+        "name": "vectr_anchor",
+        "annotations": {
+            "title": "Attach anchor paths to a stored note",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "description": (
+            "Attach file paths to an EXISTING note so future changes to those "
+            "files can flag the note as possibly-stale (UPG-ANCHOR-ATTACH). "
+            "The single-call replacement for re-storing with anchors=[...] and "
+            "supersedes=<note_id> when you notice afterwards that a note is "
+            "about a specific process/config file. Anchors are staleness "
+            "probes, never a claim that the note is wrong: on the next "
+            "staleness check, a changed anchor means the process MAY have "
+            "changed. Idempotent — paths already attached are reported back, "
+            "not duplicated."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "integer",
+                    "description": "ID of the note to attach anchors to (the [#N] id from vectr_recall)",
+                },
+                "anchors": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace-relative file paths to anchor this note to (at least one)",
+                },
+            },
+            "required": ["note_id", "anchors"],
+        },
+    },
+    {
+        "name": "vectr_unanchor",
+        "annotations": {
+            "title": "Remove anchor paths from a stored note",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "description": (
+            "Remove file paths from an EXISTING note's anchor set "
+            "(UPG-ANCHOR-DETACH). The inverse of `vectr_anchor`: use it when "
+            "you discover a note was anchored to the wrong file, or when the "
+            "anchored file's relevance has gone away. A removed anchor simply "
+            "stops being a candidate in the next staleness check — never a "
+            "claim that the note is wrong. Idempotent — paths the note was "
+            "never anchored to are reported back, not treated as failures. "
+            "Path comparison is exact-string on the spelling the note was "
+            "anchored with, matching `vectr_anchor`'s contract."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "integer",
+                    "description": "ID of the note to remove anchors from (the [#N] id from vectr_recall)",
+                },
+                "anchors": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace-relative file paths to detach this note from (at least one)",
+                },
+            },
+            "required": ["note_id", "anchors"],
+        },
+    },
 ]  # end _MEMORY_TOOLS
 
 # ingest_traces — not gated by session memory (always available)
@@ -899,6 +1071,10 @@ MEMORY_READY_TOOLS = frozenset(
         "vectr_promote",
         "vectr_revoke",
         "vectr_reinstate",
+        "vectr_supersede",
+        "vectr_pin",
+        "vectr_anchor",
+        "vectr_unanchor",
         "vectr_status",
         "vectr_snapshot",
         "vectr_snapshot_list",

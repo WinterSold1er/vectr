@@ -666,3 +666,83 @@ class TestValidateWorkspaceEnv:
         msg = str(excinfo.value)
         assert "VECTR_WORKSPACE" in msg
         assert bad_path in msg
+
+
+# ---------------------------------------------------------------------------
+# UPG-RAGAS-WORKTREE-GUARD: chunk-quality matchers must judge the file by its
+# workspace-RELATIVE path only — never by ancestors above the workspace root.
+# should_index_file() used to pass the absolute path into
+# is_vectr_config_file/is_generated_file/is_build_artifact_file, whose
+# part-scan then saw every directory between / and the file: a checkout
+# living under an ancestor named like a generated-dir/config-dir/build-suffix
+# component silently lost its ENTIRE tree.
+# ---------------------------------------------------------------------------
+
+class TestChunkQualityMatchersAreWorkspaceRelative:
+    def test_generated_ancestor_does_not_exclude_tree(self, tmp_path) -> None:
+        """RED on main before the fix: `generated` is in
+        agent/chunk_quality._GENERATED_DIR_PARTS, and the absolute path
+        handed to is_generated_file() contained it as a path ANCESTOR —
+        every file under the workspace was excluded no matter its own name."""
+        from integrations.workspace_detect import should_index_file
+
+        ws = tmp_path / "generated" / "myproject"
+        src = ws / "src"
+        src.mkdir(parents=True)
+        f = src / "app.py"
+        f.write_text("def app(): pass\n")
+
+        assert should_index_file(str(f), [], workspace_root=str(ws)) is True
+
+    def test_config_dir_ancestor_does_not_exclude_tree(self, tmp_path) -> None:
+        """`.cursor`/`.vscode` are _VECTR_CONFIG_DIRS; same ancestor bug,
+        different set. A workspace checked out under such a directory (e.g.
+        dotfile-style layouts) must still index."""
+        from integrations.workspace_detect import should_index_file
+
+        ws = tmp_path / ".vscode" / "myproject"
+        src = ws / "lib"
+        src.mkdir(parents=True)
+        f = src / "core.py"
+        f.write_text("def core(): pass\n")
+
+        assert should_index_file(str(f), [], workspace_root=str(ws)) is True
+
+    def test_build_suffix_ancestor_does_not_exclude_tree(self, tmp_path) -> None:
+        """`mypkg.egg-info` ends with a configured build-artifact suffix;
+        as an ANCESTOR it must not exclude the tree (is_build_artifact_file
+        scans every directory component of whatever path it is given)."""
+        from integrations.workspace_detect import should_index_file
+
+        ws = tmp_path / "mypkg.egg-info" / "checkout"
+        src = ws / "pkg"
+        src.mkdir(parents=True)
+        f = src / "mod.py"
+        f.write_text("def mod(): pass\n")
+
+        assert should_index_file(str(f), [], workspace_root=str(ws)) is True
+
+    def test_generated_dir_INSIDE_workspace_still_excluded(self, tmp_path) -> None:
+        """The fix must not blind the matchers to relative components: a
+        `generated/` directory BELOW the workspace root is still excluded
+        exactly as before."""
+        from integrations.workspace_detect import should_index_file
+
+        gen = tmp_path / "generated"
+        gen.mkdir()
+        f = gen / "proto_gen.py"
+        f.write_text("def stub(): pass\n")
+
+        assert should_index_file(str(f), [], workspace_root=str(tmp_path)) is False
+
+    def test_config_file_INSIDE_workspace_still_excluded(self, tmp_path) -> None:
+        """Companion invariant for the config-file matcher: basename matching
+        within the tree keeps working after the relativization change. Uses
+        agents.md deliberately — its extension passes _SUPPORTED_EXTS, so the
+        exclusion comes from the matcher itself, not the extension gate."""
+        from integrations.workspace_detect import should_index_file
+
+        cfg = tmp_path / "agents.md"
+        cfg.write_text("instructions\n")
+
+        assert should_index_file(str(cfg), [], workspace_root=str(tmp_path)) is False

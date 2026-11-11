@@ -111,6 +111,32 @@ USER_STATED_PROVENANCE = "user-stated"
 PROVENANCE_VALUES: tuple[str, ...] = ("human", USER_STATED_PROVENANCE, "agent", "auto")
 DEFAULT_PROVENANCE = "agent"
 
+# SORT_BY_VALUES (UPG-SORTBY-SHARED-VOCAB): the closed recall() sort-mode
+# vocabulary. Lives in agent/working_context_store (the layer that owns
+# recall semantics and the SQL ORDER BY map) and is re-imported by every
+# other surface that declares a sort_by contract — REST (app/models.py),
+# MCP dispatch + tool schema (integrations/mcp_server/_dispatch.py +
+# _schemas.py), and the CLI (main.py). The brief explicitly considered the
+# alternative of keeping it in app/models.py (the REST layer) and rejected
+# that as inverted layering: every other surface would then have to import
+# from app/ to declare its own contract, making the REST layer the source of
+# truth for vocabulary the store actually implements. Putting the constant
+# here flows downhill — REST, MCP, CLI, and the store itself all import
+# from this one place, and adding a fifth sort mode becomes one edit, not
+# five. Public (no leading underscore) because the whole point is
+# cross-module import. The store's internal _SORT_ORDER_SQL map and the
+# branch conditions in recall()/_semantic_recall()/_format_index_line are
+# intentionally NOT rewritten to reference SORT_BY_VALUES: they are
+# IMPLEMENTATION sites (per-mode ORDER BY fragments, per-mode sort keys),
+# and the constant is the VOCABULARY site — replacing each `if sort_by ==
+# "recency":` branch with an enum lookup would buy nothing and obscure the
+# per-mode SQL. Same local-tuple convention as VALID_KINDS/EVENT_VALUES/
+# SCOPE_VALUES/PROVENANCE_VALUES above — closed protocol vocabulary, not an
+# operator-tunable threshold, so it lives here rather than in config.yaml.
+SORT_BY_VALUES: tuple[str, ...] = (
+    "relevance", "recency", "priority", "chronological",
+)
+
 # The ladder `promote()` walks, weakest first — deliberately NOT
 # PROVENANCE_VALUES reversed any more (UPG-MEM-PROVENANCE-USER-STATED):
 # "user-stated" is DERIVED from a bound verbatim excerpt at write time, so it
@@ -158,11 +184,12 @@ class WorkingNote:
     provenance: str = DEFAULT_PROVENANCE  # human | user-stated | agent | auto (bm2-design-skeleton.md §5)
     user_quote: str = ""               # verbatim user-turn excerpt bound to `content` at write time (UPG-MEM-PROVENANCE-USER-STATED); "" unless provenance == USER_STATED_PROVENANCE
     scope: str = DEFAULT_SCOPE            # workspace | repo | path-subtree | branch | session
-    anchors: list[list[str]] = None    # type: ignore[assignment]  # [[path, content_hash_at_write_or_None], ...]
+    anchors: list[list[str]] = None    # type: ignore[assignment]  # [[path, content_hash_at_write_or_None, observed_bool_or_None], ...] — 3rd element (UPG-ANCHOR-UNOBSERVED-BINDING) is True/False only when this session had an observation ledger, else None (unknown); a 2-element row written before this field existed loads with no 3rd element and reads back as None via `len(anchor) >= 3` checks, never inferred as False
     supersedes: int | None = None      # note_id THIS note explicitly tombstones at write time
     superseded_by_note_id: int | None = None  # reciprocal: set on the OLD note by the explicit-supersedes path (distinct from `superseded_by`'s code_hash-conflict/author_id semantics)
     last_fired: float | None = None    # last time the trigger engine actually fired this note (T:cooldown + total-order tie-break)
     branch: str = ""                   # git branch recorded at write time when scope=="branch" (TRIGGER-ENGINE wave 2a); "" for every other scope or when git is unavailable
+    pinned: bool = False               # UPG-RECALL-MISS-FLOOR part (b): explicit user/agent pin — Tier 0 unconditional-injection membership alongside kind='directive', set/cleared via vectr_pin (or vectr_remember(pin=True) at write time), never inferred
 
     def __post_init__(self) -> None:
         if self.triggers is None:
