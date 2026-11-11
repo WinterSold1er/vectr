@@ -287,6 +287,12 @@ def trajectory_report(
             "censored": censored,
             "mistake_committed": metrics.get("mistake_committed"),
             "self_corrected": metrics.get("self_corrected"),
+            # UPG-EVAL-TURNS-UNITS: surfaced alongside `rdc["turns_to_fact"]` for
+            # comparison only -- neither is an RDC component, and `rdc`'s
+            # `turns_to_fact` keeps its original meaning. Absent on older records
+            # (and on censored legs, where the scorer leaves it null), so null.
+            "conversational_turns_to_fact": metrics.get("conversational_turns_to_fact"),
+            "session_turns": (rec.get("cost") or {}).get("session_turns"),
             "rdc": rdc_k,
             "rdc_ratio": rdc_ratio(rdc_k, rdc_1),
             # UPG-EVAL-BTF-DOUBLECOUNT: reported alongside `rdc["billable_tokens_to_fact"]`

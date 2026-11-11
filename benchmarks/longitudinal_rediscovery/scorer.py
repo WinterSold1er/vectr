@@ -431,6 +431,20 @@ def _billable_tokens(usage: Mapping[str, Any]) -> float:
 # be reported, never silently under- or over-counted. Test fixtures
 # (`tests/test_longitudinal_scorer.py`'s `_transcript()`) set a synthetic,
 # per-event unique id for exactly this reason.
+def _conversational_turns_before(events: Sequence[dict], event_index: int) -> int:
+    """The CLI-native turn number of the turn holding `events[event_index]`.
+
+    UPG-EVAL-TURNS-UNITS: every preserved real transcript in this repo satisfies
+    `result.num_turns == count(all "user"-type events) + 1`, so the turn count the
+    CLI itself reports is the number of `user` events before the event plus one.
+    Deliberately NOT derived from `_dedupe_assistant_messages`: the CLI reuses one
+    `message.id` across chains of sequential tool_use/tool_result round-trips (seen
+    in preserved real transcripts), and that collapse -- correct for token
+    billing -- would merge several distinct CLI-native turns into one.
+    """
+    return sum(1 for ev in events[:event_index] if ev.get("type") == "user") + 1
+
+
 def _dedupe_assistant_messages(events: Sequence[dict]) -> list[dict]:
     seen: set[str] = set()
     out: list[dict] = []
@@ -521,6 +535,7 @@ def leg_metrics(
         "censored": a is None,
         "censor_reason": "fact never acquired" if a is None else None,
         "turns_to_fact": None,
+        "conversational_turns_to_fact": None,
         "tool_calls_to_fact": None,
         "output_tokens_to_fact": None,
         "billable_tokens_to_fact": None,
@@ -567,6 +582,11 @@ def leg_metrics(
     result.update(
         {
             "turns_to_fact": len(deduped_prefix_events),
+            # UPG-EVAL-TURNS-UNITS: a second, DIFFERENT unit reported alongside
+            # `turns_to_fact` (distinct deduped API calls) -- the CLI's own
+            # `result.num_turns` unit, counted straight off the raw event stream so
+            # a reused `message.id` cannot deflate it. Never folded into RDC(k).
+            "conversational_turns_to_fact": _conversational_turns_before(events, e_index),
             "tool_calls_to_fact": a + 1,
             "output_tokens_to_fact": output_tokens,
             "billable_tokens_to_fact": billable,

@@ -826,7 +826,7 @@ class VectrService:
         try:
             from agent.strategy_selector import fingerprint, select_strategy
             fp = fingerprint(self._workspace_root, self._indexer.indexed_file_paths)
-            self._strategy = select_strategy(fp)
+            self._strategy = select_strategy(fp, self._workspace_root)
             logger.info(
                 "Retrieval strategy: sem=%.2f bm25=%.2f graph_first=%s — %s",
                 self._strategy.semantic_weight,

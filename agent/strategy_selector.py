@@ -123,9 +123,10 @@ def resolve_embed_model(
 ) -> tuple[str, str]:
     """Three-tier embed-model precedence, returning (model, rationale).
 
-    1. `explicit_override` — the caller's already-resolved
-       `os.environ.get("VECTR_EMBED_MODEL")` (None when unset) — ALWAYS
-       wins; the evidence table is not consulted.
+    1. `explicit_override` — the caller's already-resolved operator choice
+       (`agent.indexer._types.resolve_embed_model`: `VECTR_EMBED_MODEL`, then
+       the workspace/global `embedding.model` config; None when nothing is set)
+       — ALWAYS wins; the evidence table is not consulted.
     2. A matching `EMBED_MODEL_EVIDENCE_TABLE` row for this fingerprint wins
        over the built-in default.
     3. No match falls back to the configured default
@@ -145,8 +146,8 @@ def resolve_embed_model(
     """
     if explicit_override:
         return explicit_override, (
-            "embed model explicitly set via VECTR_EMBED_MODEL — evidence "
-            f"table not consulted, using {explicit_override}"
+            "embed model explicitly set via VECTR_EMBED_MODEL or the embedding "
+            f"config — evidence table not consulted, using {explicit_override}"
         )
     table_model = select_embed_model_from_evidence(fp, table)
     if table_model is not None:
@@ -346,8 +347,15 @@ def fingerprint(workspace_root: str, indexed_files: list[str]) -> CodebaseFinger
     )
 
 
-def select_strategy(fp: CodebaseFingerprint) -> RetrievalStrategy:
-    """Choose retrieval weights and flags from the full codebase fingerprint."""
+def select_strategy(
+    fp: CodebaseFingerprint, workspace_root: str | None = None
+) -> RetrievalStrategy:
+    """Choose retrieval weights and flags from the full codebase fingerprint.
+
+    `workspace_root` only feeds the embed-model resolution below (the workspace
+    `.vectr/config.yaml` overlay); `None` falls back to VECTR_WORKSPACE / cwd,
+    which is how `agent.indexer` resolves the same overlay.
+    """
     reasons: list[str] = []
 
     # Base weights by size
@@ -407,10 +415,24 @@ def select_strategy(fp: CodebaseFingerprint) -> RetrievalStrategy:
     # heuristic, since it keys purely on the corpus fingerprint (dominant
     # language) computed above, the same class of index-side signal as every
     # weight/graph_first rule in this function. `EMBED_MODEL_EVIDENCE_TABLE`
-    # ships empty (see its module-level comment), so `recommended` resolves
-    # to the configured default on every real workspace today.
+    # ships empty (see its module-level comment), so `recommended` resolves to
+    # the operator's own configured model (env or config overlay) or the
+    # built-in default on every real workspace today.
+    #
+    # `recommended_embed_model` must report the model vectr ACTUALLY indexes
+    # with: resolved through the same helper `app/service.py` and the indexer
+    # use (VECTR_EMBED_MODEL > workspace .vectr/config.yaml > ~/.vectr/config.yaml
+    # > bundled default). Reading the env alone made session-status report the
+    # bundled default for every workspace switched by the config overlay. The
+    # empty-string fallback means "nothing configured" at this tier, so tier 2
+    # (the evidence table) is still consulted.
+    from agent.indexer._types import resolve_embed_model as resolve_configured_embed_model
+
     recommended, embed_reason = resolve_embed_model(
-        fp, explicit_override=os.environ.get("VECTR_EMBED_MODEL")
+        fp,
+        explicit_override=resolve_configured_embed_model(
+            os.environ.get("VECTR_EMBED_MODEL"), workspace_root, ""
+        ) or None,
     )
     reasons.append(embed_reason)
 

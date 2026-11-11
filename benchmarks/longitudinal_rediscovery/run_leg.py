@@ -76,6 +76,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -379,6 +380,30 @@ def _stop_daemon(vectr_bin: str, workspace: Path, port: int, env: dict[str, str]
     return _hard_stop_port(port)
 
 
+_SYNTHETIC_GITCONFIG: Path | None = None
+
+
+def _synthetic_gitconfig() -> Path:
+    """Path to a synthetic global git config carrying the synthetic identity.
+
+    `git config user.email` READS resolve through the operator's own
+    `~/.gitconfig` unless GIT_CONFIG_GLOBAL says otherwise, so the harness needs
+    a real file to point at -- one per harness process, in a private temp dir.
+    """
+    global _SYNTHETIC_GITCONFIG
+    if _SYNTHETIC_GITCONFIG is None:
+        directory = Path(tempfile.mkdtemp(prefix="vectr-eval-gitconfig-"))
+        config = directory / "gitconfig"
+        config.write_text(
+            "[user]\n"
+            f"\tname = {scen.SYNTHETIC_GIT_USER_NAME}\n"
+            f"\temail = {scen.SYNTHETIC_GIT_USER_EMAIL}\n",
+            encoding="utf-8",
+        )
+        _SYNTHETIC_GITCONFIG = config
+    return _SYNTHETIC_GITCONFIG
+
+
 def _spawn_env_for_agent(base_url: str) -> dict[str, str]:
     """Env for the spawned eval agent: every CLAUDE*/ANTHROPIC* var is stripped
     first so the child looks like a fresh user invocation rather than a nested
@@ -395,12 +420,19 @@ def _spawn_env_for_agent(base_url: str) -> dict[str, str]:
     """
     env = {k: v for k, v in os.environ.items()
            if not (k.startswith("CLAUDE") or k.startswith("ANTHROPIC")
-                   or k.startswith("GIT_AUTHOR_") or k.startswith("GIT_COMMITTER_"))}
+                   or k.startswith("GIT_AUTHOR_") or k.startswith("GIT_COMMITTER_")
+                   or k == "GIT_CONFIG_GLOBAL")}
     env["ANTHROPIC_BASE_URL"] = base_url
     env["GIT_AUTHOR_NAME"] = scen.SYNTHETIC_GIT_USER_NAME
     env["GIT_AUTHOR_EMAIL"] = scen.SYNTHETIC_GIT_USER_EMAIL
     env["GIT_COMMITTER_NAME"] = scen.SYNTHETIC_GIT_USER_NAME
     env["GIT_COMMITTER_EMAIL"] = scen.SYNTHETIC_GIT_USER_EMAIL
+    # GIT_CONFIG_GLOBAL is stripped (not merely shadowed) and redirected to the
+    # synthetic file: authorship env vars do not affect a `git config` READ, so a
+    # workspace with no `.git` at all still resolved the operator's real
+    # `~/.gitconfig`. NOSYSTEM=1 closes the same leak at the system level.
+    env["GIT_CONFIG_GLOBAL"] = str(_synthetic_gitconfig())
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     return env
 
 

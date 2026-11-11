@@ -332,6 +332,69 @@ class TestSelectStrategyEmbedModelIntegration:
         assert s.recommended_embed_model == EMBEDDING_DEFAULT_MODEL
 
 
+class TestSelectStrategyEmbedModelConfigOverlay:
+    """`recommended_embed_model` must be the model vectr actually indexes with.
+    Reading `VECTR_EMBED_MODEL` alone reported the bundled default for every
+    workspace switched by its `.vectr/config.yaml` overlay, so session-status
+    contradicted itself (`embed_model` from the overlay, `recommended_embed_model`
+    from the env-only path). Same resolver as `app/service.py`, same tiers."""
+
+    @staticmethod
+    def _workspace(tmp_path: Path, overlay_model: str | None) -> str:
+        if overlay_model is not None:
+            cfg = tmp_path / ".vectr"
+            cfg.mkdir(parents=True, exist_ok=True)
+            (cfg / "config.yaml").write_text(f"embedding:\n  model: {overlay_model}\n")
+        return str(tmp_path)
+
+    def test_workspace_overlay_without_env_is_reported(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("VECTR_EMBED_MODEL", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))  # no operator ~/.vectr/config.yaml
+        s = select_strategy(
+            _fp(dominant_language="python"),
+            self._workspace(tmp_path, "google/gemini-embedding-2"),
+        )
+        assert s.recommended_embed_model == "google/gemini-embedding-2"
+        assert "explicitly set" in s.rationale
+
+    def test_env_var_beats_the_workspace_overlay(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("VECTR_EMBED_MODEL", "operator/forced-model")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        s = select_strategy(
+            _fp(dominant_language="python"),
+            self._workspace(tmp_path, "google/gemini-embedding-2"),
+        )
+        assert s.recommended_embed_model == "operator/forced-model"
+
+    def test_neither_env_nor_overlay_reports_the_bundled_default(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("VECTR_EMBED_MODEL", raising=False)
+        monkeypatch.delenv("VECTR_WORKSPACE", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        s = select_strategy(_fp(dominant_language="c"), self._workspace(tmp_path, None))
+        assert s.recommended_embed_model == EMBEDDING_DEFAULT_MODEL
+
+    def test_global_config_used_when_the_workspace_has_no_overlay(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("VECTR_EMBED_MODEL", raising=False)
+        home_cfg = tmp_path / ".vectr"
+        home_cfg.mkdir(parents=True, exist_ok=True)
+        (home_cfg / "config.yaml").write_text("embedding:\n  model: org/global-model\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        s = select_strategy(_fp(dominant_language="python"), self._workspace(tmp_path, None))
+        assert s.recommended_embed_model == "org/global-model"
+
+    def test_workspace_overlay_wins_over_the_global_config_key_by_key(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("VECTR_EMBED_MODEL", raising=False)
+        home_cfg = tmp_path / ".vectr"
+        home_cfg.mkdir(parents=True, exist_ok=True)
+        (home_cfg / "config.yaml").write_text("embedding:\n  model: org/global-model\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        s = select_strategy(
+            _fp(dominant_language="python"),
+            self._workspace(tmp_path, "org/workspace-model"),
+        )
+        assert s.recommended_embed_model == "org/workspace-model"
+
+
 # ---------------------------------------------------------------------------
 # fingerprint() — filesystem integration
 # ---------------------------------------------------------------------------

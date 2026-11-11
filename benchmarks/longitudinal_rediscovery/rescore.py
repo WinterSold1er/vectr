@@ -49,7 +49,7 @@ import tarfile
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _THIS_DIR = Path(__file__).resolve().parent
 # See report.py / run_leg.py's own comment: benchmarks/injection_utility/ ships a
@@ -89,6 +89,33 @@ def _is_excluded(path: Path) -> bool:
     return any(".superseded-" in part or ".poisoned-" in part for part in path.parts)
 
 
+def _leg_result_path(traj_dir: Path, leg: Mapping[str, Any]) -> Path | None:
+    """Locate a leg's `result.json` from the trajectory directory, not from
+    `state.json`'s recorded `result_path`.
+
+    That recorded value is an ABSOLUTE path from the machine that ran the leg, and
+    `results/longitudinal/` is a documented COPY of that tree, so on a relocated
+    copy it points at a directory that is not this one (or does not exist). Only
+    the reconstructed path can keep every rescored sibling inside `runs_dir`; the
+    recorded value is consulted last, for layouts the reconstruction does not
+    cover (a k=1 leg shared across trajectories lives outside `traj_dir`).
+    """
+    candidates: list[Path] = []
+    k = leg.get("k")
+    if k is not None:
+        candidates.extend((
+            traj_dir / "legs" / str(k) / "artifacts" / "result.json",
+            traj_dir / "legs" / str(k) / "result.json",
+        ))
+    recorded = leg.get("result_path")
+    if recorded:
+        candidates.append(Path(recorded))
+    for candidate in candidates:
+        if not _is_excluded(candidate) and candidate.is_file():
+            return candidate
+    return None
+
+
 def iter_result_paths(runs_dir: Path):
     """Yield every leg's `result.json` path reachable from a live (non-superseded,
     non-poisoned) trajectory's `state.json`, plus every `_shared/leg1/*/result.json`
@@ -105,11 +132,8 @@ def iter_result_paths(runs_dir: Path):
             continue
         state = json.loads(state_path.read_text())
         for leg in state.get("legs", []):
-            rp = leg.get("result_path")
-            if not rp:
-                continue
-            p = Path(rp)
-            if _is_excluded(p) or not p.is_file():
+            p = _leg_result_path(traj_dir, leg)
+            if p is None:
                 continue
             resolved = p.resolve()
             if resolved in seen:
