@@ -51,6 +51,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import tomllib
@@ -94,10 +95,10 @@ MODE_FULL = "full"
 MODE_MEMORY_ONLY = "memory-only"
 MODE_SEARCH_ONLY = "search-only"
 
-# The CLI flag that re-selects each mode explicitly on `restart`, keyed by the
-# mode label above — used both to override an inherited mode and to print a
-# mode-complete restart command in the staleness banner.
-MODE_RESTART_FLAG = {
+# The CLI flag that re-selects each mode explicitly on `start` and `restart`,
+# keyed by the mode label above — used both to override an inherited mode and
+# to print a mode-complete restart command in the staleness banner.
+MODE_CLI_FLAG = {
     MODE_FULL: "--full",
     MODE_MEMORY_ONLY: "--memory-only",
     MODE_SEARCH_ONLY: "--search-only",
@@ -635,7 +636,7 @@ def _restart_command(daemon_status: dict, registry_entry: dict | None = None) ->
     # fill-in-the-blank placeholder, which must stay unquoted to read as one.
     parts = ["vectr", "restart", shlex.quote(workspace) if workspace else "<workspace>"]
     if mode in (MODE_MEMORY_ONLY, MODE_SEARCH_ONLY):
-        parts.append(MODE_RESTART_FLAG[mode])
+        parts.append(MODE_CLI_FLAG[mode])
     return " ".join(parts)
 
 
@@ -1801,6 +1802,98 @@ def _mode_name(memory_only: bool, search_only: bool) -> str:
     return MODE_FULL
 
 
+def _mode_marker_path(workspace: str) -> Path:
+    """`<workspace>/.vectr/mode` — where this workspace's launch mode persists
+    (UPG-MODE-MARKER). Never `.vectr/style`: that holds the instruction *style*
+    (`memory-first` is a UI label and does not control indexing)."""
+    return Path(workspace) / ".vectr" / "mode"
+
+
+def _warn_mode_marker_unusable(path: Path, reason: str) -> None:
+    """Announce a marker that exists but cannot be honoured (UPG-MODE-MARKER).
+
+    Falling back to full mode without saying so is the original incident this
+    marker exists to prevent: a workspace that was running memory-only comes back
+    as a full-mode indexer and nobody notices. "No marker" is silent (that is the
+    documented default); "marker there, marker useless" must not be."""
+    print(
+        f"Warning: {path} exists but could not be used ({reason}). This workspace "
+        "will fall back to full mode; pass --memory-only (or --search-only) to "
+        "record the mode you actually want, or --full to accept full mode knowingly.",
+        file=sys.stderr,
+    )
+
+
+def _read_mode_marker(workspace: str) -> str | None:
+    """The mode persisted for `workspace`, or None when there is nothing usable.
+
+    A missing marker is None in silence: every workspace predating this marker has
+    none and must behave as it always did (full mode, the `register()` default).
+
+    A marker that is PRESENT and unusable is also None — the launch must not die
+    over it — but it is announced on stderr, because the silent full-mode fallback
+    is exactly the failure the marker was added to prevent. Unreadable (permissions,
+    a directory in place of the file), not valid UTF-8, and unrecognised content are
+    the three ways that happens. Garbage is never propagated as a mode.
+    """
+    path = _mode_marker_path(workspace)
+    try:
+        recorded = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        # `UnicodeDecodeError` descends from ValueError, not OSError: a marker
+        # holding raw bytes would otherwise escape this helper and take the whole
+        # `start` down with a traceback.
+        _warn_mode_marker_unusable(path, f"unreadable: {exc}")
+        return None
+    if recorded in (MODE_FULL, MODE_MEMORY_ONLY, MODE_SEARCH_ONLY):
+        return recorded
+    _warn_mode_marker_unusable(path, f"unrecognised content {recorded!r}")
+    return None
+
+
+def _write_mode_marker(workspace: str, mode: str) -> None:
+    """Persist `mode` for `workspace` atomically (tmp file + `os.replace`).
+
+    Written on every launch that really starts a daemon, `full` included: an
+    explicit `--full` has to be able to correct a stale `memory-only` marker.
+    `os.replace` means a concurrent reader sees the old or the new mode, never a
+    truncated file. Best-effort: a read-only workspace must still be able to run
+    a daemon, so a failure is announced and the launch continues without it.
+    """
+    if mode not in (MODE_FULL, MODE_MEMORY_ONLY, MODE_SEARCH_ONLY):
+        mode = MODE_FULL
+    path = _mode_marker_path(workspace)
+    tmp: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique tmp name, same directory as the marker. A fixed name (`mode.tmp`)
+        # is a collision waiting to happen: two launches racing here move the one
+        # tmp file out from under each other and the loser's `os.replace` dies with
+        # `[Errno 2]`, so the mode it was asked to record is never recorded at all.
+        # `mkstemp` in `path.parent` keeps both writers on one filesystem, which is
+        # what makes the following `os.replace` atomic for each of them.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".mode.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(mode + "\n")
+        os.replace(tmp, path)
+        tmp = None
+    except OSError as exc:
+        if tmp is not None:
+            # No half-written tmp left behind for the next reader to trip over.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        print(
+            f"Warning: could not record {mode} mode in {path} ({exc}). If this "
+            "workspace's registry entry is also gone, the next start without a "
+            "mode flag will come back in full mode.",
+            file=sys.stderr,
+        )
+
+
 def _effective_mode_flags(memory_only: bool, search_only: bool) -> tuple[bool, bool]:
     """`(memory_only, search_only)` as `VectrService` will resolve them —
     the given flags OR'd with the VECTR_MEMORY_ONLY / VECTR_SEARCH_ONLY
@@ -1811,6 +1904,43 @@ def _effective_mode_flags(memory_only: bool, search_only: bool) -> tuple[bool, b
     if memory_only and search_only:
         raise ValueError("Cannot start vectr in both --memory-only and --search-only mode simultaneously")
     return memory_only, search_only
+
+
+def _mode_conflict_guard(memory_only: bool, search_only: bool, full: bool) -> None:
+    """Refuse a self-contradicting mode request — counting the environment as a
+    request, not just the flags (`start` and `restart` both call this).
+
+    `VECTR_MEMORY_ONLY=1` / `VECTR_SEARCH_ONLY=1` are honoured by the daemon on
+    their own (app/service.py), so `--full` typed while the environment says
+    memory-only has two answers and no honest tie-break. The old behaviour let the
+    environment win in silence AND write that verdict into the mode marker, i.e. it
+    swallowed the operator's explicit correction and made it sticky. A flag/flag
+    conflict already exits 1; an env/flag conflict is the same conflict, so it gets
+    the same verdict and names the variable that has to be unset.
+    """
+    env_memory = os.getenv("VECTR_MEMORY_ONLY", "") == "1"
+    env_search = os.getenv("VECTR_SEARCH_ONLY", "") == "1"
+    parts = []
+    if env_memory:
+        parts.append("VECTR_MEMORY_ONLY=1 requests memory-only mode")
+    if env_search:
+        parts.append("VECTR_SEARCH_ONLY=1 requests search-only mode")
+    note = (
+        f" ({'; '.join(parts)}; unset the variable(s) to make the request unambiguous)"
+        if parts else ""
+    )
+    if (memory_only or env_memory) and (search_only or env_search):
+        head = ("--memory-only and --search-only are mutually exclusive."
+                if memory_only and search_only
+                else "memory-only and search-only mode cannot both be requested.")
+        print(f"Error: {head}{note}", file=sys.stderr)
+        sys.exit(1)
+    if full and (memory_only or search_only or env_memory or env_search):
+        head = ("--full cannot be combined with --memory-only/--search-only."
+                if memory_only or search_only
+                else "--full cannot be combined with the mode requested by the environment.")
+        print(f"Error: {head}{note}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _do_start(
@@ -1901,6 +2031,18 @@ def _do_start(
         # must reproduce, alongside the port it already reuses.
         mode=_mode_name(memory_only, search_only), host=host,
     )
+    # UPG-MODE-MARKER: the entry above is not durable — `prune_dead()` deletes a
+    # dead entry wholesale (mode included) and sweeps every dead entry at once,
+    # so the mode needs a copy outside the registry. Written here, and only here,
+    # because this is the one point every launch passes through with the mode
+    # already resolved (`_effective_mode_flags`). Unlike the registry entry above,
+    # which describes the process that was just spawned, the marker is written
+    # AFTER the readiness check below: a launch whose daemon never came up rewrites
+    # nothing, and the mode of the last daemon that really ran stays in place — a
+    # failed `start` is not evidence about what this workspace wants.
+    # `full` included: that is what lets `--full` correct a stale marker.
+    # `vectr stop` leaves it alone — it is remembered launch configuration, not
+    # liveness state.
     mode_tag = " [memory-only]" if memory_only else (" [search-only]" if search_only else "")
 
     # UPG-CLI-START-READY-RACE: block until the daemon is actually reachable
@@ -1913,6 +2055,8 @@ def _do_start(
     ready = _wait_for_daemon_ready(port, proc.pid)
     alive = ready or _is_pid_alive(proc.pid)
     status = "ready" if ready else ("not_ready" if alive else "failed")
+    if ready:
+        _write_mode_marker(workspace, _mode_name(memory_only, search_only))
 
     if json_output:
         # UPG-CLI-STOP-NO-PORT-FLAG companion: a single deterministic line on
@@ -2109,9 +2253,11 @@ def cmd_connect(args: argparse.Namespace) -> None:
 def cmd_start(args: argparse.Namespace) -> None:
     memory_only = getattr(args, "memory_only", False)
     search_only = getattr(args, "search_only", False)
-    if memory_only and search_only:
-        print("Error: --memory-only and --search-only are mutually exclusive.", file=sys.stderr)
-        sys.exit(1)
+    # UPG-START-DROPS-RECORDED-MODE: `--full` is the way back out of a recorded
+    # mode on `start` too, exactly as on `restart` — without it a workspace once
+    # started memory-only could never be started into full mode again.
+    full = getattr(args, "full", False)
+    _mode_conflict_guard(memory_only, search_only, full)
 
     host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
     # Refuse a non-loopback bind without a shared key BEFORE doing any work.
@@ -2132,11 +2278,33 @@ def cmd_start(args: argparse.Namespace) -> None:
     json_output = getattr(args, "json_output", False)
 
     registry = InstanceRegistry()
+    # UPG-START-DROPS-RECORDED-MODE: read the recorded entry BEFORE `prune_dead()`
+    # sweeps it. `prune_dead()` deletes a dead entry wholesale — its `mode` field
+    # included — so a `start` that follows a crashed/exitied daemon would
+    # otherwise lose the mode it is resuming, which is what let a memory-only
+    # workspace come back as a full-mode indexer. The sweep itself stays as-is
+    # (see `prune_dead` in agent/instance_registry.py for why it must keep
+    # deleting dead entries).
+    recorded_entry = registry.get(ws_hash)
     registry.prune_dead()
 
     entry = registry.get(ws_hash)
     if entry is not None and _is_pid_alive(entry["pid"]):
         port = entry["port"]
+        # UPG-MODE-MARKER: this launch starts nothing, but it is the only cheap
+        # chance to backfill the marker for a daemon that is already up — one
+        # started by a vectr older than this marker would otherwise have no
+        # durable mode and lose it to `prune_dead()` the moment its host dies.
+        # Only the live record's OWN mode is copied, and only in the vocabulary
+        # this marker understands. A record that has no `mode` key (written by a
+        # vectr from before the mode was recorded at all) leaves the marker
+        # untouched: the flags on this call started no daemon, so deriving a mode
+        # from them would invent one — and would overwrite a deliberately recorded
+        # `memory-only` with `full` on the plain `vectr start` every IDE plugin
+        # sends on reload.
+        recorded_mode = entry.get("mode")
+        if recorded_mode in (MODE_FULL, MODE_MEMORY_ONLY, MODE_SEARCH_ONLY):
+            _write_mode_marker(workspace, recorded_mode)
         for root in roots:
             _maybe_write_workspace_config(root, port, args, search_only=search_only)
         if json_output:
@@ -2158,6 +2326,26 @@ def cmd_start(args: argparse.Namespace) -> None:
         for root in roots:
             _warn_on_stale_mcp_configs(root, port)
         return
+
+    # UPG-START-DROPS-RECORDED-MODE: a `start` for a workspace whose previous
+    # instance is recorded but no longer running is the same event as a
+    # `restart` of it — the mode has to come from the record, not from the CLI's
+    # default. `_resolve_inherited_mode` below carries over the precedence it
+    # already applies on `restart`: an explicit --memory-only / --search-only /
+    # --full always wins, with no mode flag the recorded mode is reproduced, and
+    # with nothing recorded the default stays full. Resolved before the
+    # IDE-config write and `_preflight_grammars` below so both match the mode
+    # actually launched.
+    memory_only, search_only, inherited_mode = _resolve_inherited_mode(
+        recorded_entry, memory_only, search_only, full, workspace,
+    )
+    if inherited_mode:
+        print(
+            f"Starting in {inherited_mode} mode (inherited from this workspace's "
+            f"recorded mode). Pass "
+            f"{MODE_CLI_FLAG[MODE_FULL]} to start in full mode instead.",
+            file=sys.stderr,
+        )
 
     # UPG-CLI-STOP-NO-PORT-FLAG companion: --strict-port asks find_free_port
     # to fail loudly instead of silently walking past a busy --port, for
@@ -3410,24 +3598,37 @@ def _resolve_stop_workspace(args: argparse.Namespace) -> str:
     return str(Path(args.path).resolve())
 
 
-def _resolve_restart_mode(
+def _resolve_inherited_mode(
     entry: dict | None, memory_only: bool, search_only: bool, full: bool,
+    workspace: str | None = None,
 ) -> tuple[bool, bool, str | None]:
-    """`(memory_only, search_only, inherited_mode)` for a `restart`.
+    """`(memory_only, search_only, inherited_mode)` for a launch that has a
+    recorded previous instance to resume — `restart`, and `start` after that
+    instance died (UPG-RESTART-DROPS-MODE / UPG-START-DROPS-RECORDED-MODE).
 
-    UPG-RESTART-DROPS-MODE: `restart` means "the same daemon again", so when
-    the caller names no mode it reproduces the mode recorded for the previous
-    instance instead of silently falling back to full mode. Explicit flags
-    always win — `--memory-only` / `--search-only` select their mode, and
-    `--full` is the way back out of an inherited one (without it a workspace
-    once started memory-only could never be restarted into full mode).
-    `inherited_mode` is the label that was inherited, or None when the caller
-    was explicit / there was nothing to inherit — the caller announces it so
-    the mode change is never invisible.
+    Both commands mean "that daemon again", so when the caller names no mode the
+    launch reproduces the mode recorded for the previous instance instead of
+    silently falling back to full mode. Explicit flags always win — `--memory-only`
+    / `--search-only` select their mode, and `--full` is the way back out of an
+    inherited one (without it a workspace once started memory-only could never be
+    launched in full mode again). `inherited_mode` is the label that was
+    inherited, or None when the caller was explicit / there was nothing to
+    inherit — the caller announces it so the mode change is never invisible.
+
+    When there is no usable registry record the workspace's persisted marker
+    (`<workspace>/.vectr/mode`, UPG-MODE-MARKER) supplies the mode. The registry
+    cannot be the only copy: `prune_dead()` deletes a dead instance wholesale,
+    `mode` field included, and it sweeps *every* dead entry at once — so on a
+    host with several recorded workspaces (the 25-daemon fleet behind the
+    original incident) only the first `start` after the crash still sees a
+    record. The marker is per-workspace on disk, so it survives the sweep with no
+    cross-process locking. Precedence: explicit flag > registry record > marker > full.
     """
     if memory_only or search_only or full:
         return memory_only, search_only, None
     recorded = (entry or {}).get("mode")
+    if recorded not in (MODE_FULL, MODE_MEMORY_ONLY, MODE_SEARCH_ONLY) and workspace:
+        recorded = _read_mode_marker(workspace)
     if recorded == MODE_MEMORY_ONLY:
         return True, False, MODE_MEMORY_ONLY
     if recorded == MODE_SEARCH_ONLY:
@@ -3442,7 +3643,7 @@ def _restart_roots_explicit(args: argparse.Namespace) -> bool:
     VECTR_WORKSPACE/cwd default — those name only the PRIMARY root and leave
     `_resolve_restart_roots` free to reproduce the previous instance's
     `extra_roots` from the registry, the same "no flag named it, so inherit"
-    rule `_resolve_restart_mode` above already applies to mode
+    rule `_resolve_inherited_mode` above already applies to mode
     (UPG-RESTART-DROPS-EXTRA-ROOTS).
     """
     ws = getattr(args, "workspace", None)
@@ -3455,7 +3656,7 @@ def _resolve_restart_roots(
     entry: dict | None, roots: list[str], roots_explicit: bool,
 ) -> tuple[list[str], list[str] | None]:
     """`(roots, inherited_extra_roots)` for a `restart` — the roots
-    counterpart to `_resolve_restart_mode`, with the same precedence: an
+    counterpart to `_resolve_inherited_mode`, with the same precedence: an
     explicit caller-given root list always wins outright, with no merge
     against the registry (silently growing an explicit list back out would
     be its own surprise). An under-specified one (just the primary
@@ -3487,15 +3688,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
     memory_only = getattr(args, "memory_only", False)
     search_only = getattr(args, "search_only", False)
     full = getattr(args, "full", False)
-    if memory_only and search_only:
-        print("Error: --memory-only and --search-only are mutually exclusive.", file=sys.stderr)
-        sys.exit(1)
-    if full and (memory_only or search_only):
-        print(
-            "Error: --full cannot be combined with --memory-only/--search-only.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    _mode_conflict_guard(memory_only, search_only, full)
 
     roots = _resolve_workspace_roots(args)
     workspace = roots[0]
@@ -3514,14 +3707,14 @@ def cmd_restart(args: argparse.Namespace) -> None:
     # the daemon runs breaks whatever was relying on the old configuration.
     # Resolved before `_enforce_bind_auth` so an inherited non-loopback bind
     # is authenticated exactly like an explicitly-passed one.
-    memory_only, search_only, inherited_mode = _resolve_restart_mode(
-        entry, memory_only, search_only, full,
+    memory_only, search_only, inherited_mode = _resolve_inherited_mode(
+        entry, memory_only, search_only, full, workspace,
     )
     if inherited_mode:
         print(
-            f"Restarting in {inherited_mode} mode (inherited from the previous "
-            f"instance for this workspace). Pass "
-            f"{MODE_RESTART_FLAG[MODE_FULL]} to restart in full mode instead.",
+            f"Restarting in {inherited_mode} mode (inherited from this workspace's "
+            f"recorded mode). Pass "
+            f"{MODE_CLI_FLAG[MODE_FULL]} to restart in full mode instead.",
             file=sys.stderr,
         )
     roots, inherited_extra_roots = _resolve_restart_roots(
@@ -4230,6 +4423,16 @@ def main() -> None:
             "server) where nothing should be written to a per-workspace note "
             "store. Mutually exclusive with --memory-only."
         ),
+    )
+    p_start.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        dest="full",
+        help="Start in full mode (indexing + watcher + working memory) even when a "
+             "previous instance for this workspace is recorded in another mode. "
+             "With no mode flag, start reproduces that instance's recorded mode — a "
+             "workspace last started --memory-only comes back memory-only.",
     )
     p_start.add_argument(
         "--no-ide-config",
