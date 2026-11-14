@@ -290,8 +290,6 @@ vectr start                           # index + start daemon for current dir
 vectr start /project/api              # positional workspace: a directory or .code-workspace file
 vectr start --path /project/api       # specific workspace (repeatable, multi-root)
 vectr start --memory-only             # working memory + hooks only, no code index, no watcher
-vectr start --search-only             # code index + search tools only, no working-memory layer
-vectr start --full                    # explicit full mode; also the way out of a remembered mode
 vectr status                          # index health, chunk count, notes count
 vectr status --all                    # all running instances
 vectr stop /project/api               # stop one instance (same positional as start)
@@ -316,10 +314,7 @@ vectr proxy                           # experimental: localhost API proxy (see b
 vectr mcp-stdio                       # foreground stdio MCP transport, no port or daemon (see above)
 ```
 
-### Which mode a workspace starts in
-
-The mode a workspace launches in is remembered in `<workspace>/.vectr/mode`, holding one of `full`, `memory-only` or `search-only`. What it records is the mode of the last launch whose daemon actually became ready — not what anyone intended: `vectr start` and `vectr restart` with no mode flag reproduce it, so a workspace started `--memory-only` once does not quietly come back as a full-mode indexer after a crash or a `prune_dead()`. `vectr start --full` is how you correct a remembered mode, and `vectr stop` deliberately leaves the marker in place — it is launch configuration, not liveness state. A marker that exists but cannot be used (unreadable, not UTF-8, unrecognised content) is reported on stderr and falls back to `full` in the open; a workspace with no marker at all is simply `full`, as it always was.
-
+### Importing existing memory
 
 `vectr memory export` and `vectr memory edit` are the one-way-out and check-out/check-in paths. `vectr memory import` is the one-way-in: it brings existing on-disk memory into the working-memory store without re-entering it by hand. This is the on-ramp for a new user who already has memory written down.
 
