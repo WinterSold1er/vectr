@@ -438,10 +438,19 @@ class TestErrorPaths:
             def json(self):
                 raise ValueError("not json")
 
-        post = _FakePost([_BrokenJsonResponse()])
+        post = _FakePost([_BrokenJsonResponse(text="<html>gateway said OK</html>")])
         monkeypatch.setattr(httpx, "post", post)
-        with pytest.raises(ValueError, match="not json"):
+        with pytest.raises(RuntimeError, match="not JSON") as exc_info:
             _provider().embed(["text"])
+
+        # HTTP 200 claims the call succeeded, so the body is reported instead of the
+        # payload being replayed (D2): the message names the model, quotes what came
+        # back, and keeps the decode failure visible as the cause.
+        message = str(exc_info.value)
+        assert "gemini-embedding-2" in message and "gateway said OK" in message
+        assert FAKE_KEY not in message
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert len(post.calls) == 1, "a body that is not JSON must not be retried"
 
     def test_transport_failure_becomes_a_clear_error(self, monkeypatch, fake_key) -> None:
         def _boom(*_args, **_kwargs):

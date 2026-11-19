@@ -1,10 +1,14 @@
 """AST-aware code chunking and embedding pipeline.
 
 Package layout:
-  _constants.py — LANG_BY_EXT, EXCLUDED_DIRS, batch-size constants
-  _types.py     — CodeChunk dataclass, EmbedProvider protocol, embed provider classes
-  _chunking.py  — tree-sitter parsers, chunk collection, fallback window chunker
-  _core.py      — CodeIndexer orchestration class
+  _constants.py    — LANG_BY_EXT, EXCLUDED_DIRS, batch-size constants
+  _types.py        — CodeChunk dataclass, EmbedProvider protocol, embed provider
+                     classes and the ProviderRegistry that maps an `embedding.model`
+                     spec to one of them
+  _remote_base.py  — RemoteEmbedProvider: the transport every remote embedding
+                     provider shares (batching, pacing, retries, redaction)
+  _chunking.py     — tree-sitter parsers, chunk collection, fallback window chunker
+  _core.py         — CodeIndexer orchestration class
 
 All names that existed on the flat agent/indexer.py module are re-exported here
 so every existing import site keeps working unchanged:
@@ -38,8 +42,12 @@ from agent.indexer._types import (
     OpenAIEmbedProvider,
     GoogleEmbedProvider,
     DashScopeEmbedProvider,
+    OpenAICompatibleProvider,
+    ProviderRegistry,
+    PROVIDER_REGISTRY,
     get_embed_provider,
 )
+from agent.indexer._remote_base import RemoteEmbedProvider
 
 # Config-sourced tunables re-exported so `import agent.indexer as m; m._MAX_CHUNK_LINES`
 # continues to work (test_config_loader asserts these are the same objects as config.py).
@@ -94,6 +102,10 @@ __all__ = [
     "OpenAIEmbedProvider",
     "GoogleEmbedProvider",
     "DashScopeEmbedProvider",
+    "OpenAICompatibleProvider",
+    "RemoteEmbedProvider",
+    "ProviderRegistry",
+    "PROVIDER_REGISTRY",
     "get_embed_provider",
     # Chunking
     "chunk_file",

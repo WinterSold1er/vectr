@@ -1,8 +1,16 @@
-"""Chunk dataclass, EmbedProvider protocol, embed provider implementations."""
+"""Chunk dataclass, EmbedProvider protocol, embed provider implementations.
+
+The HTTP transport every remote provider shares lives in `_remote_base.py`
+(`RemoteEmbedProvider`): batching, pacing, the retry chain, Retry-After clamping,
+key redaction and vector normalization. What is here is each API's wire format
+plus `ProviderRegistry`, which turns an `embedding.model` spec into the provider
+it names.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Protocol
+import logging
+from dataclasses import dataclass
+from typing import Any, Protocol, Sequence
 
 from agent.config import (
     EMBEDDING_DEFAULT_MODEL as _EMBEDDING_DEFAULT_MODEL,
@@ -10,6 +18,25 @@ from agent.config import (
     EMBEDDING_THREAD_CAP as _EMBEDDING_THREAD_CAP,
     vectr_cache_root as _vectr_cache_root,
 )
+
+# The embedding settings helpers used to live in this module; they moved next to
+# the transport that consumes them. The names are re-exported here because
+# `agent/indexer/__init__.py`, `app/service.py` and the tests import them from
+# `agent.indexer._types`.
+from agent.indexer._remote_base import (
+    RemoteEmbedProvider,
+    _embed_chars_per_second,
+    _embed_config_for,
+    _normalize_vector,
+    _output_dimensionality,
+    _resolve_api_key,
+    resolve_embed_model,
+)
+
+# Back-compat alias: the dimension helper was Google-only until DashScope needed
+# the same layering. Existing callers keep working; new code uses
+# `_output_dimensionality`.
+_google_output_dimensionality = _output_dimensionality
 
 
 # ---------------------------------------------------------------------------
@@ -181,380 +208,108 @@ class OpenAIEmbedProvider:
         return self.embed(texts)
 
 
+# ---------------------------------------------------------------------------
+# Google Generative Language embeddings (batchEmbedContents)
+# ---------------------------------------------------------------------------
 
-# --- embedding settings resolved here (installed 1.12.0 has no config overlay) ---
-def _embed_config_for(workspace_root: str | None) -> dict:
-    """`embedding:` settings from <workspace>/.vectr/config.yaml, then the global
-    ~/.vectr/config.yaml; the workspace file wins key by key. An existing file
-    that is unreadable or malformed raises instead of being ignored."""
-    import os
-    from pathlib import Path
-
-    import yaml
-
-    merged: dict = {}
-    ws = workspace_root or os.environ.get("VECTR_WORKSPACE") or os.getcwd()
-    for path in (Path(ws) / ".vectr" / "config.yaml", Path.home() / ".vectr" / "config.yaml"):
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise RuntimeError(f"vectr: {path} could not be read: {exc}") from exc
-        try:
-            data = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            raise RuntimeError(f"vectr: {path} is not valid YAML: {exc}") from exc
-        section = data.get("embedding") if isinstance(data, dict) else None
-        if isinstance(section, dict):
-            merged = {**section, **merged}
-    return merged
-
-
-def resolve_embed_model(explicit_env: str | None, workspace_root: str | None, default: str) -> str:
-    """Embed-model precedence: VECTR_EMBED_MODEL env > workspace .vectr/config.yaml
-    embedding.model > ~/.vectr/config.yaml embedding.model > bundled default."""
-    if explicit_env:
-        return explicit_env
-    model = _embed_config_for(workspace_root).get("model")
-    return str(model) if model else default
-
-
-def _output_dimensionality(cfg: dict) -> int | None:
-    """Output vector size for an API embedding call: VECTR_EMBED_OUTPUT_DIM env,
-    then embedding.output_dimensionality from the config files. Nothing is invented
-    here — unset means "ask the API for its own default". Shared by every provider
-    that takes an explicit dimension (Google's `outputDimensionality`, DashScope's
-    `parameters.dimension`)."""
-    import os
-
-    raw = os.environ.get("VECTR_EMBED_OUTPUT_DIM") or cfg.get("output_dimensionality")
-    if raw is None or raw == "":
-        return None
-    try:
-        dim = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"vectr: invalid embedding output dimension {raw!r}") from exc
-    if dim <= 0:
-        raise RuntimeError(f"vectr: embedding output dimension must be positive, got {dim}")
-    return dim
-
-
-# Back-compat alias: the dimension helper was Google-only until DashScope needed
-# the same layering. Existing callers keep working; new code uses
-# `_output_dimensionality`.
-_google_output_dimensionality = _output_dimensionality
-
-
-def _resolve_api_key(env_name: str, secrets_key: str, provider: str) -> str:
-    """Key for an embeddings API: `env_name` first, then the `secrets_key` entry of
-    ~/.vectr/secrets.json — GEMINI_API_KEY / "gemini_api_key" for Google,
-    DASHSCOPE_API_KEY / "dashscope_api_key" for DashScope.
-
-    Only the channel is ever named — the key value is never logged and never
-    quoted in an error message. A secrets file that exists but is unreadable or
-    malformed raises instead of silently falling back to a keyless request, and
-    a group/other-readable file is warned about (it should be mode 600).
-    """
-    import json
-    import logging
-    import os
-    from pathlib import Path
-
-    key = os.environ.get(env_name)
-    if key:
-        return key
-
-    path = Path.home() / ".vectr" / "secrets.json"
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raw = None
-    except OSError as exc:
-        raise RuntimeError(f"{provider} embeddings: {path} could not be read: {exc}") from exc
-
-    if raw is not None:
-        try:
-            stored_data = json.loads(raw)
-        except ValueError as exc:
-            raise RuntimeError(f"{provider} embeddings: {path} is not valid JSON: {exc}") from exc
-        if not isinstance(stored_data, dict):
-            raise RuntimeError(
-                f"{provider} embeddings: {path} must contain a JSON object of "
-                f'key names, e.g. {{"{secrets_key}": "…"}}'
-            )
-        stored = stored_data.get(secrets_key)
-        if stored:
-            mode = path.stat().st_mode & 0o777
-            if mode & 0o077:
-                logging.getLogger("vectr.embed").warning(
-                    "vectr: %s is readable by group/other (mode %03o) — chmod 600 it", path, mode
-                )
-            return str(stored)
-
-    raise RuntimeError(
-        f"{provider} embeddings need an API key: set {env_name}, or store "
-        f'"{secrets_key}" in {path} (mode 600)'
-    )
-
-
-def _embed_chars_per_second() -> float:
-    """Embedding request budget in characters per second, used to pace
-    batchEmbedContents against the key's tokens-per-minute quota.
-
-    Measured 2026-11-10 against gemini-embedding-2: batches of ~14k tokens sent
-    back to back return HTTP 429, the same batches spaced 40s apart return 200
-    (about 72k chars/min on the free tier). Override with
-    VECTR_EMBED_CHARS_PER_SECOND once the key is on a paid quota tier.
-    """
-    import os
-
-    default = 1200.0
-    raw = os.environ.get("VECTR_EMBED_CHARS_PER_SECOND")
-    try:
-        value = float(raw) if raw else default
-    except ValueError:
-        return default
-    if value <= 0:
-        return default
-    # A misconfigured or absurd rate must not stall indexing nor hammer the quota.
-    return min(10000.0, max(50.0, value))
-
-
-def _normalize_vector(values: list[float], provider: str, model: str) -> list[float]:
-    """Unit-length guarantee for an embedding an API handed back.
-
-    None of the remote providers can be trusted to return a unit vector: Google
-    does at its full 3072-dim output but not for a truncated `outputDimensionality`,
-    and DashScope makes no promise at all. Renormalize whenever the vector is not
-    already unit length, so cosine scoring against vectr's other vectors stays
-    comparable whatever the model or dimension.
-    """
-    import math
-
-    try:
-        norm = math.sqrt(sum(float(v) * float(v) for v in values))
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"{provider} embeddings returned non-numeric vector components from {model}"
-        ) from exc
-    if norm == 0.0:
-        raise RuntimeError(
-            f"{provider} embeddings returned a zero-length vector from {model}"
-        )
-    if abs(norm - 1.0) <= 1e-6:
-        return [float(v) for v in values]
-    return [float(v) / norm for v in values]
-
-
-class GoogleEmbedProvider:
+class GoogleEmbedProvider(RemoteEmbedProvider):
     """Google Generative Language embeddings via the batchEmbedContents REST
     endpoint (no SDK: plain JSON over httpx, the dependency vectr already has).
 
     Nothing about the model is hardcoded here: the model name comes from the
     `google/<model>` spec, the output size from `embedding.output_dimensionality`
-    and the key's env-var name from `embedding.api_key_env`. As with the other
-    API providers there is no local torch thread pool to cap
+    and the key's env-var name from `embedding.api_key_env`. As with the other API
+    providers there is no local torch thread pool to cap
     (UPG-EMBED-THREAD-CONTENTION).
     """
 
-    _BATCH_LIMIT = 100          # batchEmbedContents accepts at most 100 requests
-    _MAX_ATTEMPTS = 8           # 429 windows last about a minute; a short retry chain just fails
-    _TIMEOUT_SECONDS = 30.0
+    _PROVIDER_LABEL = "Google"
+    _ERROR_PREFIX = "Google batchEmbedContents"
+    _SPEC_PREFIX = "google"
+    _SPEC_EXAMPLE = "google/gemini-embedding-2"
+    _DEFAULT_BATCH_LIMIT = 100      # batchEmbedContents accepts at most 100 requests
+    _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+    _DEFAULT_KEY_ENV = "GEMINI_API_KEY"
+    _SECRETS_KEY = "gemini_api_key"
 
-    def __init__(
-        self,
-        model_name: str,
-        output_dimensionality: int | None = None,
-        api_key_env: str | None = None,
-    ) -> None:
-        if not model_name:
-            raise ValueError(
-                "a google/ embedding spec must name a model, e.g. google/gemini-embedding-2"
-            )
-        self._model = model_name
-        self._dim = output_dimensionality
-        self._api_key = _resolve_api_key(
-            api_key_env or _embed_config_for(None).get("api_key_env") or "GEMINI_API_KEY",
-            "gemini_api_key",
-            "Google",
-        )
+    # Google's asymmetric retrieval task types, keyed by the protocol's kinds:
+    # indexed chunks are RETRIEVAL_DOCUMENT, search queries RETRIEVAL_QUERY.
+    _TASK_TYPES = {"document": "RETRIEVAL_DOCUMENT", "query": "RETRIEVAL_QUERY"}
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(texts, "RETRIEVAL_DOCUMENT")
+    def _endpoint(self) -> str:
+        # The key rides in the `x-goog-api-key` header, never in the URL.
+        return f"{self._base_url}/models/{self._model}:batchEmbedContents"
 
-    def embed_query(self, texts: list[str]) -> list[list[float]]:
-        # Google's asymmetric task types: indexed chunks are embedded as
-        # RETRIEVAL_DOCUMENT, search queries as RETRIEVAL_QUERY.
-        return self._embed(texts, "RETRIEVAL_QUERY")
+    def _headers(self) -> dict[str, str]:
+        return {"x-goog-api-key": self._api_key}
 
-    def _embed(self, texts: list[str], task_type: str) -> list[list[float]]:
-        import time
-
-        vectors: list[list[float]] = []
-        budget = _embed_chars_per_second()
-        for start in range(0, len(texts), self._BATCH_LIMIT):
-            batch = texts[start:start + self._BATCH_LIMIT]
-            vectors.extend(self._embed_batch(batch, task_type))
-            # Hold the request rate under the key's tokens-per-minute budget:
-            # pause for as long as this batch's payload would take at that rate.
-            if start + self._BATCH_LIMIT < len(texts):
-                time.sleep(min(60.0, sum(len(t) for t in batch) / budget))
-        return vectors
-
-    def _embed_batch(self, texts: list[str], task_type: str) -> list[list[float]]:
-        import time
-
-        import httpx
-
+    def _build_payload(self, texts: list[str], kind: str) -> dict[str, Any]:
         requests: list[dict] = []
         for text in texts:
             request: dict = {
                 "model": f"models/{self._model}",
                 "content": {"parts": [{"text": text}]},
-                "taskType": task_type,
+                "taskType": self._TASK_TYPES[kind],
             }
             if self._dim is not None:
                 request["outputDimensionality"] = self._dim
             requests.append(request)
+        return {"requests": requests}
 
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._model}:batchEmbedContents"
+    def _parse_embeddings(self, data: dict[str, Any], expected_count: int) -> list[list[float]]:
+        # A gateway can answer 200 with valid JSON that is not an object (a bare
+        # list, a string); the guard routes that case into the shared
+        # "none embeddings for N texts" error instead of a bare AttributeError.
+        return self._parse_vector_list(
+            data.get("embeddings") if isinstance(data, dict) else None,
+            "values",
+            expected_count,
         )
-        for attempt in range(1, self._MAX_ATTEMPTS + 1):
-            try:
-                response = httpx.post(
-                    url,
-                    json={"requests": requests},
-                    headers={"x-goog-api-key": self._api_key},
-                    timeout=self._TIMEOUT_SECONDS,
-                )
-            except httpx.HTTPError as exc:
-                # Connection-level failures (TLS handshake resets, read timeouts)
-                # are transient: retry them with the same capped backoff as a 429
-                # instead of aborting the whole indexing pass.
-                if attempt < self._MAX_ATTEMPTS:
-                    time.sleep(min(60.0, 2.0 ** (attempt - 1)))
-                    continue
-                raise RuntimeError(
-                    f"Google embeddings request for {self._model} failed: {exc}"
-                ) from exc
-
-            if response.status_code == 429 and attempt < self._MAX_ATTEMPTS:
-                # Honour the server's own wait when it sends one; a missing or
-                # unparseable Retry-After falls back to exponential backoff.
-                try:
-                    delay = float(response.headers.get("retry-after"))
-                except (TypeError, ValueError):
-                    delay = min(60.0, 2.0 ** (attempt - 1))
-                time.sleep(max(0.0, delay))
-                continue
-
-            if response.status_code >= 500 and attempt < self._MAX_ATTEMPTS:
-                # Upstream 5xx (500/502/503/504) are server-side and transient
-                # like a 429: retry on the same capped backoff instead of
-                # aborting the whole indexing pass on a single bad response.
-                time.sleep(min(60.0, 2.0 ** (attempt - 1)))
-                continue
-
-            if response.status_code != 200:
-                # The key is never echoed: only the status and the provider's own
-                # (key-free) error body are reported.
-                raise RuntimeError(
-                    f"Google batchEmbedContents failed for {self._model}: "
-                    f"HTTP {response.status_code} {response.reason_phrase} "
-                    f"(attempt {attempt}/{self._MAX_ATTEMPTS}): {response.text[:200]}"
-                )
-
-            embeddings = response.json().get("embeddings")
-            if not isinstance(embeddings, list) or len(embeddings) != len(texts):
-                got = len(embeddings) if isinstance(embeddings, list) else "none"
-                raise RuntimeError(
-                    f"Google batchEmbedContents returned {got} embeddings for "
-                    f"{len(texts)} texts ({self._model})"
-                )
-            vectors: list[list[float]] = []
-            for item in embeddings:
-                values = item.get("values") if isinstance(item, dict) else None
-                if not isinstance(values, list) or not values:
-                    raise RuntimeError(
-                        f"Google batchEmbedContents returned a malformed embedding "
-                        f"entry for {self._model}"
-                    )
-                vectors.append(self._normalize(values))
-            return vectors
-
-    def _normalize(self, values: list[float]) -> list[float]:
-        return _normalize_vector(values, "Google", self._model)
 
 
 # ---------------------------------------------------------------------------
 # DashScope (Alibaba Model Studio / 千问) embeddings
 # ---------------------------------------------------------------------------
 
-_DASHSCOPE_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
-_DASHSCOPE_EMBED_PATH = "/api/v1/services/embeddings/text-embedding/text-embedding"
-
-
-def _dashscope_base_url(configured: object) -> str:
-    """Origin for the DashScope-native call: VECTR_EMBED_BASE_URL env, then
-    embedding.base_url from the config files, then the public endpoint.
-
-    A VPC endpoint or an in-house gateway is a deployment choice, so the origin is
-    configurable rather than assumed; a value that is not an http(s) origin raises
-    here instead of surfacing as an opaque transport error on the first call.
-    """
-    import os
-
-    raw = os.environ.get("VECTR_EMBED_BASE_URL") or configured or _DASHSCOPE_DEFAULT_BASE_URL
-    base = str(raw).strip().rstrip("/")
-    if not base.startswith(("http://", "https://")):
-        raise RuntimeError(
-            f"DashScope embeddings: base_url {base!r} must be an http(s) URL"
-        )
-    return base
-
-
-class DashScopeEmbedProvider:
+class DashScopeEmbedProvider(RemoteEmbedProvider):
     """Alibaba DashScope (Model Studio / 千问) text embeddings through the native
     text-embedding endpoint (no SDK: plain JSON over httpx, the dependency vectr
     already has).
 
     Asymmetric retrieval is what this endpoint is tuned for and what the two
     protocol methods exist for: indexed chunks go out as `text_type: "document"`,
-    search queries as `text_type: "query"`. Nothing about the model is hardcoded —
-    the model name comes from the `dashscope/<model>` spec, the vector size from
+    search queries as `text_type: "query"`. The API only accepts the field on the
+    native endpoint, which is why the native call is used rather than the
+    OpenAI-compatible one. Nothing about the model is hardcoded — the model name
+    comes from the `dashscope/<model>` spec, the vector size from
     `embedding.output_dimensionality` / VECTR_EMBED_OUTPUT_DIM, the key's env-var
     name from `embedding.api_key_env` and the endpoint origin from
-    `embedding.base_url`. As with the other API providers there is no local torch
-    thread pool to cap (UPG-EMBED-THREAD-CONTENTION).
+    `embedding.base_url` (D5).
     """
 
-    _BATCH_LIMIT = 20            # qwen3.7 text embeddings take at most 20 texts per call
-    _LEGACY_BATCH_LIMIT = 10     # text-embedding-v3/v4 are documented at 10 texts per call
-    _MAX_ATTEMPTS = 8            # Throttling.RateQuota windows last about a minute; a shorter chain just fails
-    _TIMEOUT_SECONDS = 30.0
+    _PROVIDER_LABEL = "DashScope"
+    _ERROR_PREFIX = "DashScope text-embedding"
+    _SPEC_PREFIX = "dashscope"
+    _SPEC_EXAMPLE = "dashscope/qwen3.7-text-embedding-flash"
+    _DEFAULT_BATCH_LIMIT = 20       # qwen3.7 text embeddings take at most 20 texts per call
+    _LEGACY_BATCH_LIMIT = 10        # text-embedding-v3/v4 are documented at 10 texts per call
+    _DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
+    _EMBED_PATH = "/api/v1/services/embeddings/text-embedding/text-embedding"
+    _DEFAULT_KEY_ENV = "DASHSCOPE_API_KEY"
+    _SECRETS_KEY = "dashscope_api_key"
 
-    def __init__(
-        self,
-        model_name: str,
-        output_dimensionality: int | None = None,
-        api_key_env: str | None = None,
-        base_url: str | None = None,
-    ) -> None:
-        if not model_name:
-            raise ValueError(
-                "a dashscope/ embedding spec must name a model, "
-                "e.g. dashscope/qwen3.7-text-embedding-flash"
-            )
-        self._model = model_name
-        self._dim = output_dimensionality
-        self._batch_limit = self._batch_limit_for(model_name)
-        cfg = _embed_config_for(None)
-        self._base_url = _dashscope_base_url(base_url or cfg.get("base_url"))
-        self._key_env = str(api_key_env or cfg.get("api_key_env") or "DASHSCOPE_API_KEY")
-        self._api_key = _resolve_api_key(self._key_env, "dashscope_api_key", "DashScope")
+    def _endpoint(self) -> str:
+        return f"{self._base_url}{self._EMBED_PATH}"
+
+    def _build_payload(self, texts: list[str], kind: str) -> dict[str, Any]:
+        parameters: dict[str, Any] = {"text_type": kind}
+        if self._dim is not None:
+            parameters["dimension"] = self._dim
+        return {
+            "model": self._model,
+            "input": {"texts": list(texts)},
+            "parameters": parameters,
+        }
 
     @classmethod
     def _batch_limit_for(cls, model_name: str) -> int:
@@ -567,216 +322,306 @@ class DashScopeEmbedProvider:
         """
         import re
 
-        if re.search(r"v[34](?!\d)", model_name):
-            return cls._LEGACY_BATCH_LIMIT
-        return cls._BATCH_LIMIT
+        cap = cls._LEGACY_BATCH_LIMIT if re.search(r"v[34](?!\d)", model_name) else cls._DEFAULT_BATCH_LIMIT
+        return cls._with_batch_limit_override(cap)
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(texts, "document")
+    def _is_throttled(self, response) -> bool:
+        # HTTP 429 and a body-level Throttling.* code are the same event seen
+        # through two endpoints; both back off.
+        code = str(self._error_fields(response).get("code") or "")
+        return response.status_code == 429 or code.lower().startswith("throttling")
 
-    def embed_query(self, texts: list[str]) -> list[list[float]]:
-        # DashScope's asymmetric text_type: chunks are embedded as "document"
-        # (optimised to be matched against), search queries as "query". The API
-        # only accepts it on the native endpoint, which is why the native call is
-        # used instead of the OpenAI-compatible one.
-        return self._embed(texts, "query")
-
-    def _embed(self, texts: list[str], text_type: str) -> list[list[float]]:
-        import time
-
-        vectors: list[list[float]] = []
-        budget = _embed_chars_per_second()
-        for start in range(0, len(texts), self._batch_limit):
-            batch = texts[start:start + self._batch_limit]
-            vectors.extend(self._embed_batch(batch, text_type))
-            if start + self._batch_limit < len(texts):
-                # Pace the batches against the key's quota the same way the Google
-                # provider does: chars/sec, not a fixed sleep.
-                time.sleep(min(60.0, sum(len(t) for t in batch) / budget))
-        return vectors
-
-    def _embed_batch(self, texts: list[str], text_type: str) -> list[list[float]]:
-        import time
-
-        import httpx
-
-        parameters: dict = {"text_type": text_type}
-        if self._dim is not None:
-            parameters["dimension"] = self._dim
-        payload = {
-            "model": self._model,
-            "input": {"texts": list(texts)},
-            "parameters": parameters,
-        }
-        url = f"{self._base_url}{_DASHSCOPE_EMBED_PATH}"
-        headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
-
-        for attempt in range(1, self._MAX_ATTEMPTS + 1):
-            try:
-                response = httpx.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=self._TIMEOUT_SECONDS,
-                )
-            except httpx.HTTPError as exc:
-                # Connection-level failures (TLS handshake resets, read timeouts)
-                # are transient: retry them with the same capped backoff as a 429
-                # instead of aborting the whole indexing pass.
-                if attempt < self._MAX_ATTEMPTS:
-                    time.sleep(min(60.0, 2.0 ** (attempt - 1)))
-                    continue
-                raise RuntimeError(
-                    f"DashScope embeddings request for {self._model} failed: "
-                    f"{self._redact(str(exc))}"
-                ) from exc
-
-            if response.status_code != 200:
-                error = self._error_fields(response)
-                code = str(error.get("code") or "")
-                throttled = response.status_code == 429 or code.lower().startswith("throttling")
-                if throttled and attempt < self._MAX_ATTEMPTS:
-                    # HTTP 429 and a body-level Throttling.* code are the same
-                    # event seen through two endpoints; both back off.
-                    time.sleep(self._retry_delay(response, attempt))
-                    continue
-                if response.status_code >= 500 and attempt < self._MAX_ATTEMPTS:
-                    time.sleep(self._retry_delay(response, attempt))
-                    continue
-                raise RuntimeError(self._error_message(response, error, attempt))
-
-            try:
-                body = response.json()
-            except ValueError as exc:
-                # HTTP 200 claims the call succeeded, so replaying the same payload
-                # would only hide a broken endpoint: report what actually came back.
-                raise RuntimeError(
-                    f"DashScope text-embedding for {self._model} returned a response "
-                    f"body that is not JSON: {self._redact(response.text)[:200]}"
-                ) from exc
-
-            output = body.get("output") if isinstance(body, dict) else None
-            embeddings = output.get("embeddings") if isinstance(output, dict) else None
-            if not isinstance(embeddings, list) or len(embeddings) != len(texts):
-                got = len(embeddings) if isinstance(embeddings, list) else "none"
-                raise RuntimeError(
-                    f"DashScope text-embedding returned {got} embeddings for "
-                    f"{len(texts)} texts ({self._model})"
-                )
-
-            # text_index names the request position each vector belongs to. The
-            # array is normally in order, but the API does not promise it, so the
-            # reply is re-keyed onto the input order rather than trusted.
-            placed: list[list[float] | None] = [None] * len(texts)
-            for position, item in enumerate(embeddings):
-                values = item.get("embedding") if isinstance(item, dict) else None
-                if not isinstance(values, list) or not values:
-                    raise RuntimeError(
-                        f"DashScope text-embedding returned a malformed embedding "
-                        f"entry for {self._model}"
-                    )
-                try:
-                    slot = int(item.get("text_index", position))
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        f"DashScope text-embedding returned a malformed text_index "
-                        f"for {self._model}"
-                    ) from exc
-                if not 0 <= slot < len(placed) or placed[slot] is not None:
-                    raise RuntimeError(
-                        f"DashScope text-embedding returned text_index {slot} outside "
-                        f"the {len(texts)} texts it was given ({self._model})"
-                    )
-                placed[slot] = self._normalize(values)
-            missing = sum(1 for vector in placed if vector is None)
-            if missing:
-                raise RuntimeError(
-                    f"DashScope text-embedding left {missing} of {len(texts)} texts "
-                    f"without a vector ({self._model})"
-                )
-            return [vector for vector in placed if vector is not None]
-
-    @staticmethod
-    def _error_fields(response) -> dict:
-        """DashScope's error envelope: code / message / request_id at the top level
-        on the native endpoint, the same fields nested under "error" on the
-        OpenAI-compatible one. A body that is not JSON — an in-house gateway's
-        error page — yields no fields instead of a second exception stacked on top
-        of the first."""
-        try:
-            body = response.json()
-        except ValueError:
-            return {}
-        if not isinstance(body, dict):
-            return {}
-        nested = body.get("error")
-        if isinstance(nested, dict):
-            return {**body, **nested}
-        return body
-
-    def _error_message(self, response, error: dict, attempt: int) -> str:
-        """Status plus whatever DashScope named, with the key redacted from the
-        free-form body fallback: an upstream that echoes the request it was given
-        would otherwise put the credential into a log."""
-        parts = [
-            f"{name}={error[name]}"
-            for name in ("code", "message", "request_id")
-            if error.get(name)
-        ]
-        detail = ", ".join(parts) or self._redact(response.text)[:200] or response.reason_phrase
-        hint = ""
-        if response.status_code in (401, 403):
-            hint = (
-                f" — the key resolved from {self._key_env} or "
-                f'~/.vectr/secrets.json "dashscope_api_key" was rejected'
-            )
-        return (
-            f"DashScope text-embedding failed for {self._model}: "
-            f"HTTP {response.status_code} {response.reason_phrase} "
-            f"(attempt {attempt}/{self._MAX_ATTEMPTS}): {self._redact(detail)[:300]}{hint}"
+    def _parse_embeddings(self, data: dict[str, Any], expected_count: int) -> list[list[float]]:
+        output = data.get("output") if isinstance(data, dict) else None
+        # text_index names the request position each vector belongs to. The array is
+        # normally in order, but the API does not promise it, so the reply is
+        # re-keyed onto the input order rather than trusted.
+        return self._place_by_index(
+            output.get("embeddings") if isinstance(output, dict) else None,
+            values_key="embedding",
+            index_key="text_index",
+            expected_count=expected_count,
         )
 
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible /v1/embeddings: one adapter for every gateway
+# ---------------------------------------------------------------------------
+
+class OpenAICompatibleProvider(RemoteEmbedProvider):
+    """`POST {base_url}/embeddings` — the request and reply shape every
+    OpenAI-compatible server speaks: OpenAI, SiliconFlow, Jina, Ollama, vLLM,
+    LiteLLM, an in-house gateway.
+
+    Onboarding a new server is a config change, not a code change (D3, D5):
+    `embedding.model: openai-compatible/<model>`, `embedding.base_url` pointing at
+    it, `embedding.api_key_env` naming the key's channel, and — for a server that
+    caps the input array below OpenAI's 2048 — `embedding.batch_limit: 256`. The
+    batching, pacing, retry chain, redaction and normalization all come from
+    `RemoteEmbedProvider`; the only thing written here is the JSON shape.
+
+    `OpenAIEmbedProvider` (the official SDK client) stays behind the `openai/`
+    prefix for callers that already use it; this class is the dependency-free path
+    that also reaches servers no SDK knows about.
+    """
+
+    _PROVIDER_LABEL = "OpenAI-compatible"
+    _ERROR_PREFIX = "OpenAI-compatible embeddings"
+    _SPEC_PREFIX = "openai-compatible"
+    _SPEC_EXAMPLE = "openai-compatible/BAAI/bge-m3"
+    _DEFAULT_BATCH_LIMIT = 2048     # OpenAI's own per-request input cap
+    _DEFAULT_BASE_URL = "https://api.openai.com/v1"
+    _DEFAULT_KEY_ENV = "OPENAI_API_KEY"
+    _SECRETS_KEY = "openai_api_key"
+
+    def _endpoint(self) -> str:
+        return f"{self._base_url}/embeddings"
+
+    def _parse_embeddings(self, data: dict[str, Any], expected_count: int) -> list[list[float]]:
+        # `data[i].index` names the request position each vector belongs to; a
+        # server is free to answer out of order, so the reply is re-keyed.
+        return self._place_by_index(
+            data.get("data") if isinstance(data, dict) else None,
+            values_key="embedding",
+            index_key="index",
+            expected_count=expected_count,
+        )
+
+
+class SiliconFlowEmbedProvider(OpenAICompatibleProvider):
+    """SiliconFlow (硅基流动): its origin and key channel, same wire format."""
+
+    _PROVIDER_LABEL = "SiliconFlow"
+    _ERROR_PREFIX = "SiliconFlow embeddings"
+    _SPEC_PREFIX = "siliconflow"
+    _SPEC_EXAMPLE = "siliconflow/BAAI/bge-m3"
+    _DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+    _DEFAULT_KEY_ENV = "SILICONFLOW_API_KEY"
+    _SECRETS_KEY = "siliconflow_api_key"
+
+
+class JinaEmbedProvider(OpenAICompatibleProvider):
+    """Jina Embeddings through its OpenAI-compatible endpoint.
+
+    `jina/` is the hosted API. The HuggingFace repos of the same models live under
+    the `jinaai/` namespace, which is a model id and still loads locally.
+    """
+
+    _PROVIDER_LABEL = "Jina"
+    _ERROR_PREFIX = "Jina embeddings"
+    _SPEC_PREFIX = "jina"
+    _SPEC_EXAMPLE = "jina/jina-embeddings-v3"
+    _DEFAULT_BASE_URL = "https://api.jina.ai/v1"
+    _DEFAULT_KEY_ENV = "JINA_API_KEY"
+    _SECRETS_KEY = "jina_api_key"
+
+
+class OllamaEmbedProvider(OpenAICompatibleProvider):
+    """A local Ollama server: OpenAI-compatible endpoint, no key required."""
+
+    _PROVIDER_LABEL = "Ollama"
+    _ERROR_PREFIX = "Ollama embeddings"
+    _SPEC_PREFIX = "ollama"
+    _SPEC_EXAMPLE = "ollama/bge-m3"
+    _DEFAULT_BASE_URL = "http://localhost:11434/v1"
+    _DEFAULT_KEY_ENV = "OLLAMA_API_KEY"
+    _SECRETS_KEY = "ollama_api_key"
+    _API_KEY_OPTIONAL = True
+
+
+class VllmEmbedProvider(OpenAICompatibleProvider):
+    """A local vLLM server: OpenAI-compatible endpoint, keyless by default."""
+
+    _PROVIDER_LABEL = "vLLM"
+    _ERROR_PREFIX = "vLLM embeddings"
+    _SPEC_PREFIX = "vllm"
+    _SPEC_EXAMPLE = "vllm/BAAI/bge-m3"
+    _DEFAULT_BASE_URL = "http://localhost:8000/v1"
+    _DEFAULT_KEY_ENV = "VLLM_API_KEY"
+    _SECRETS_KEY = "vllm_api_key"
+    _API_KEY_OPTIONAL = True
+
+
+# ---------------------------------------------------------------------------
+# provider registry: an `embedding.model` spec -> the provider it names
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ProviderEntry:
+    """One spec prefix and how to build the provider it names.
+
+    `factory` is a class *name* resolved in this module when a spec is used, not a
+    class object captured here: callers and tests replace
+    `agent.indexer._types.<Provider>` and expect the routing to honour that, which
+    the if-elif chain this replaces did implicitly.
+    """
+
+    prefix: str
+    factory: str
+    model_name_only: bool = False   # the SDK-backed providers take a model name, nothing else
+    default_api_key_env: str = ""
+    example: str = ""
+
+
+# Vendor names that are provider intent without being a provider vectr implements.
+# Deliberately small: the HuggingFace namespace is full of vendor-named repos
+# (`Qwen/Qwen3-Embedding-8B`, `nvidia/nv-embedqa-e5-v5`) that are model ids, so
+# only names that are not HF namespaces qualify.
+_UNIMPLEMENTED_VENDORS = frozenset(
+    {
+        "aliyun",
+        "azureopenai",
+        "bedrock",
+        "chatgpt",
+        "gemini",
+        "generativelanguage",
+        "openaicompat",
+        "openaicompatible",
+    }
+)
+
+# Namespaces that really do host model weights *and* share a provider's name, so
+# they are model ids rather than a mistyped prefix: `jinaai/jina-embeddings-v3` is
+# the local HuggingFace repo of the model `jina/jina-embeddings-v3` embeds through
+# the hosted API. A spec that stays local is never rejected.
+_MODEL_NAMESPACES = frozenset({"jinaai"})
+
+
+class ProviderRegistry:
+    """`embedding.model` spec -> provider, replacing the old if-elif chain.
+
+    The grammar is `[prefix/]model`, and a prefix names a provider only when this
+    registry knows it. The chain had two failure modes this closes:
+
+    * D4 — anything unrecognized fell through to `LocalEmbedProvider`, so a typo
+      (`googel/gemini-embedding-2`, `dashscpe/qwen…`) or an unimplemented vendor
+      quietly started a HuggingFace download for what was meant to be an API call.
+      A prefix that is near a registered one, or a known vendor name, now raises
+      and lists the known prefixes.
+    * A HuggingFace model id *contains* a slash (`ibm-granite/granite-embedding-
+      english-r2`, `BAAI/bge-m3`), so a slash alone cannot mean "provider". An
+      unknown prefix that is not a vendor name still selects the local model, as
+      before, and `local/<model>` states that choice explicitly.
+    """
+
+    def __init__(self, entries: Sequence[ProviderEntry] | None = None) -> None:
+        self._entries = {
+            entry.prefix: entry for entry in (_default_entries() if entries is None else entries)
+        }
+
+    @property
+    def prefixes(self) -> tuple[str, ...]:
+        return tuple(sorted(self._entries))
+
+    def entry_for(self, prefix: str) -> ProviderEntry | None:
+        return self._entries.get(str(prefix).lower())
+
+    def create(self, model_spec: str) -> EmbedProvider:
+        spec = str(model_spec).strip()
+        prefix, slash, remainder = spec.partition("/")
+
+        entry = self.entry_for(prefix)
+        if entry is not None and slash:
+            if not remainder:
+                raise ValueError(
+                    f"a {entry.prefix}/ embedding spec must name a model, e.g. {entry.example}"
+                )
+            return self._build(entry, remainder)
+
+        if not slash:
+            # No prefix: the legacy `voyage-code-2` form still means Voyage, and a
+            # bare model name still means the local model.
+            if prefix.lower().startswith("voyage"):
+                return VoyageEmbedProvider(spec)
+            return LocalEmbedProvider(spec)
+
+        meant = self._vendor_meant(prefix)
+        if meant is not None:
+            suggestion = "" if meant == prefix.lower() else f" — did you mean {meant}/?"
+            raise ValueError(
+                f"unknown embedding provider prefix {prefix}/ in embedding.model "
+                f"{model_spec!r}{suggestion}. Known prefixes: "
+                f"{', '.join(f'{name}/' for name in self.prefixes)}. A HuggingFace "
+                f'model id such as "BAAI/bge-m3" — or an explicit "local/BAAI/bge-m3" '
+                f"— is the local model; a prefix that names a provider is rejected "
+                f"rather than quietly downloaded."
+            )
+
+        # The leading segment is a HuggingFace namespace, not a provider.
+        logging.getLogger("vectr.embed").info(
+            "vectr: embedding.model %r matches no provider prefix; treating %r as a "
+            "local model id (prefixes: %s)", spec, spec, ", ".join(self.prefixes)
+        )
+        return LocalEmbedProvider(spec)
+
+    def _vendor_meant(self, prefix: str) -> str | None:
+        """The provider this spec looks like it was reaching for: a vendor vectr
+        does not implement, or a near-miss of a registered prefix. A namespace that
+        really does host model weights is never treated as a near-miss."""
+        import difflib
+
+        lowered = prefix.lower()
+        if lowered in _MODEL_NAMESPACES:
+            return None
+        if lowered in _UNIMPLEMENTED_VENDORS:
+            return lowered
+        near = difflib.get_close_matches(
+            lowered, (*self.prefixes, *_UNIMPLEMENTED_VENDORS), n=1, cutoff=0.8
+        )
+        return near[0] if near else None
+
     @staticmethod
-    def _retry_delay(response, attempt: int) -> float:
-        """Retry-After when the endpoint sends one (its 429s do), otherwise
-        exponential backoff 1s, 2s, 4s … capped at 60s — the shape DashScope's own
-        throttling guidance recommends. A header is clamped to the same cap so one
-        malformed response cannot park indexing for an hour."""
-        try:
-            delay = float(response.headers.get("retry-after"))
-        except (TypeError, ValueError):
-            return min(60.0, 2.0 ** (attempt - 1))
-        return max(0.0, min(60.0, delay))
+    def _build(entry: ProviderEntry, model_name: str) -> EmbedProvider:
+        # Late binding: `entry.factory` is a name, so a provider class replaced in
+        # this module (a test, or a downstream patch) is the one that gets built.
+        provider_class = globals()[entry.factory]
+        if entry.model_name_only:
+            return provider_class(model_name)
+        cfg = _embed_config_for(None)
+        return provider_class(
+            model_name,
+            output_dimensionality=_output_dimensionality(cfg),
+            api_key_env=str(cfg.get("api_key_env") or entry.default_api_key_env),
+        )
 
-    def _redact(self, text: str) -> str:
-        """The API key never reaches an error message or a log line, whatever the
-        upstream put in its own body."""
-        if not text:
-            return text
-        return text.replace(self._api_key, "[redacted]")
 
-    def _normalize(self, values: list[float]) -> list[float]:
-        return _normalize_vector(values, "DashScope", self._model)
+def _default_entries() -> tuple[ProviderEntry, ...]:
+    """The shipped registry. Each entry reads its defaults off the class it names
+    — the same constants that class uses when built directly — so a prefix and its
+    provider cannot drift apart.
+    """
+
+    def entry(prefix: str, provider_class: type, *, model_name_only: bool = False) -> ProviderEntry:
+        return ProviderEntry(
+            prefix=prefix,
+            factory=provider_class.__name__,
+            model_name_only=model_name_only,
+            default_api_key_env=str(getattr(provider_class, "_DEFAULT_KEY_ENV", "")),
+            example=str(getattr(provider_class, "_SPEC_EXAMPLE", "")) or f"{prefix}/<model>",
+        )
+
+    return (
+        entry("dashscope", DashScopeEmbedProvider),
+        entry("google", GoogleEmbedProvider),
+        entry("jina", JinaEmbedProvider),
+        entry("local", LocalEmbedProvider, model_name_only=True),
+        entry("ollama", OllamaEmbedProvider),
+        entry("openai", OpenAIEmbedProvider, model_name_only=True),
+        entry("openai-compatible", OpenAICompatibleProvider),
+        entry("siliconflow", SiliconFlowEmbedProvider),
+        entry("vllm", VllmEmbedProvider),
+        entry("voyage", VoyageEmbedProvider, model_name_only=True),
+    )
+
+
+PROVIDER_REGISTRY = ProviderRegistry()
 
 
 def get_embed_provider(model_spec: str) -> EmbedProvider:
-    """Factory: parse VECTR_EMBED_MODEL and return the right provider."""
-    if model_spec.startswith("voyage"):
-        return VoyageEmbedProvider(model_spec)
-    if model_spec.startswith("openai/"):
-        return OpenAIEmbedProvider(model_spec.split("/", 1)[1])
-    if model_spec.startswith("google/"):
-        cfg = _embed_config_for(None)
-        return GoogleEmbedProvider(
-            model_spec.split("/", 1)[1],
-            output_dimensionality=_output_dimensionality(cfg),
-            api_key_env=str(cfg.get("api_key_env") or "GEMINI_API_KEY"),
-        )
-    if model_spec.startswith("dashscope/"):
-        cfg = _embed_config_for(None)
-        return DashScopeEmbedProvider(
-            model_spec.split("/", 1)[1],
-            output_dimensionality=_output_dimensionality(cfg),
-            api_key_env=str(cfg.get("api_key_env") or "DASHSCOPE_API_KEY"),
-        )
-    return LocalEmbedProvider(model_spec)
+    """Factory: parse an `embedding.model` spec and return the provider it names.
+
+    The routing itself lives in `ProviderRegistry`; this stays the import site
+    `agent/indexer/_core.py` reaches through the package namespace so test-time
+    patching of `agent.indexer.get_embed_provider` keeps working.
+    """
+    return PROVIDER_REGISTRY.create(model_spec)
