@@ -220,10 +220,12 @@ def resolve_embed_model(explicit_env: str | None, workspace_root: str | None, de
     return str(model) if model else default
 
 
-def _google_output_dimensionality(cfg: dict) -> int | None:
-    """outputDimensionality for the Google call: VECTR_EMBED_OUTPUT_DIM env, then
-    embedding.output_dimensionality from the config files. Nothing is invented
-    here — unset means "ask the API for its own default"."""
+def _output_dimensionality(cfg: dict) -> int | None:
+    """Output vector size for an API embedding call: VECTR_EMBED_OUTPUT_DIM env,
+    then embedding.output_dimensionality from the config files. Nothing is invented
+    here — unset means "ask the API for its own default". Shared by every provider
+    that takes an explicit dimension (Google's `outputDimensionality`, DashScope's
+    `parameters.dimension`)."""
     import os
 
     raw = os.environ.get("VECTR_EMBED_OUTPUT_DIM") or cfg.get("output_dimensionality")
@@ -238,9 +240,16 @@ def _google_output_dimensionality(cfg: dict) -> int | None:
     return dim
 
 
-def _resolve_google_api_key(env_name: str) -> str:
-    """Key for the Google embeddings API: `env_name` first, then the
-    "gemini_api_key" entry of ~/.vectr/secrets.json.
+# Back-compat alias: the dimension helper was Google-only until DashScope needed
+# the same layering. Existing callers keep working; new code uses
+# `_output_dimensionality`.
+_google_output_dimensionality = _output_dimensionality
+
+
+def _resolve_api_key(env_name: str, secrets_key: str, provider: str) -> str:
+    """Key for an embeddings API: `env_name` first, then the `secrets_key` entry of
+    ~/.vectr/secrets.json — GEMINI_API_KEY / "gemini_api_key" for Google,
+    DASHSCOPE_API_KEY / "dashscope_api_key" for DashScope.
 
     Only the channel is ever named — the key value is never logged and never
     quoted in an error message. A secrets file that exists but is unreadable or
@@ -262,13 +271,19 @@ def _resolve_google_api_key(env_name: str) -> str:
     except FileNotFoundError:
         raw = None
     except OSError as exc:
-        raise RuntimeError(f"Google embeddings: {path} could not be read: {exc}") from exc
+        raise RuntimeError(f"{provider} embeddings: {path} could not be read: {exc}") from exc
 
     if raw is not None:
         try:
-            stored = json.loads(raw).get("gemini_api_key")
+            stored_data = json.loads(raw)
         except ValueError as exc:
-            raise RuntimeError(f"Google embeddings: {path} is not valid JSON: {exc}") from exc
+            raise RuntimeError(f"{provider} embeddings: {path} is not valid JSON: {exc}") from exc
+        if not isinstance(stored_data, dict):
+            raise RuntimeError(
+                f"{provider} embeddings: {path} must contain a JSON object of "
+                f'key names, e.g. {{"{secrets_key}": "…"}}'
+            )
+        stored = stored_data.get(secrets_key)
         if stored:
             mode = path.stat().st_mode & 0o777
             if mode & 0o077:
@@ -278,8 +293,8 @@ def _resolve_google_api_key(env_name: str) -> str:
             return str(stored)
 
     raise RuntimeError(
-        f"Google embeddings need an API key: set {env_name}, or store "
-        f'"gemini_api_key" in {path} (mode 600)'
+        f"{provider} embeddings need an API key: set {env_name}, or store "
+        f'"{secrets_key}" in {path} (mode 600)'
     )
 
 
@@ -304,6 +319,32 @@ def _embed_chars_per_second() -> float:
         return default
     # A misconfigured or absurd rate must not stall indexing nor hammer the quota.
     return min(10000.0, max(50.0, value))
+
+
+def _normalize_vector(values: list[float], provider: str, model: str) -> list[float]:
+    """Unit-length guarantee for an embedding an API handed back.
+
+    None of the remote providers can be trusted to return a unit vector: Google
+    does at its full 3072-dim output but not for a truncated `outputDimensionality`,
+    and DashScope makes no promise at all. Renormalize whenever the vector is not
+    already unit length, so cosine scoring against vectr's other vectors stays
+    comparable whatever the model or dimension.
+    """
+    import math
+
+    try:
+        norm = math.sqrt(sum(float(v) * float(v) for v in values))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{provider} embeddings returned non-numeric vector components from {model}"
+        ) from exc
+    if norm == 0.0:
+        raise RuntimeError(
+            f"{provider} embeddings returned a zero-length vector from {model}"
+        )
+    if abs(norm - 1.0) <= 1e-6:
+        return [float(v) for v in values]
+    return [float(v) / norm for v in values]
 
 
 class GoogleEmbedProvider:
@@ -333,8 +374,10 @@ class GoogleEmbedProvider:
             )
         self._model = model_name
         self._dim = output_dimensionality
-        self._api_key = _resolve_google_api_key(
-            api_key_env or _embed_config_for(None).get("api_key_env") or "GEMINI_API_KEY"
+        self._api_key = _resolve_api_key(
+            api_key_env or _embed_config_for(None).get("api_key_env") or "GEMINI_API_KEY",
+            "gemini_api_key",
+            "Google",
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -443,19 +486,277 @@ class GoogleEmbedProvider:
             return vectors
 
     def _normalize(self, values: list[float]) -> list[float]:
-        """Google returns an already unit-length vector only at its full 3072-dim
-        output; a truncated `outputDimensionality` comes back unnormalized.
-        Renormalize whenever the vector is not already unit length, so cosine
-        scoring against vectr's other vectors stays comparable whatever the
-        model or dimension."""
-        import math
+        return _normalize_vector(values, "Google", self._model)
 
-        norm = math.sqrt(sum(float(v) * float(v) for v in values))
-        if norm == 0.0:
-            raise RuntimeError(f"Google embeddings returned a zero-length vector from {self._model}")
-        if abs(norm - 1.0) <= 1e-6:
-            return [float(v) for v in values]
-        return [float(v) / norm for v in values]
+
+# ---------------------------------------------------------------------------
+# DashScope (Alibaba Model Studio / 千问) embeddings
+# ---------------------------------------------------------------------------
+
+_DASHSCOPE_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
+_DASHSCOPE_EMBED_PATH = "/api/v1/services/embeddings/text-embedding/text-embedding"
+
+
+def _dashscope_base_url(configured: object) -> str:
+    """Origin for the DashScope-native call: VECTR_EMBED_BASE_URL env, then
+    embedding.base_url from the config files, then the public endpoint.
+
+    A VPC endpoint or an in-house gateway is a deployment choice, so the origin is
+    configurable rather than assumed; a value that is not an http(s) origin raises
+    here instead of surfacing as an opaque transport error on the first call.
+    """
+    import os
+
+    raw = os.environ.get("VECTR_EMBED_BASE_URL") or configured or _DASHSCOPE_DEFAULT_BASE_URL
+    base = str(raw).strip().rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        raise RuntimeError(
+            f"DashScope embeddings: base_url {base!r} must be an http(s) URL"
+        )
+    return base
+
+
+class DashScopeEmbedProvider:
+    """Alibaba DashScope (Model Studio / 千问) text embeddings through the native
+    text-embedding endpoint (no SDK: plain JSON over httpx, the dependency vectr
+    already has).
+
+    Asymmetric retrieval is what this endpoint is tuned for and what the two
+    protocol methods exist for: indexed chunks go out as `text_type: "document"`,
+    search queries as `text_type: "query"`. Nothing about the model is hardcoded —
+    the model name comes from the `dashscope/<model>` spec, the vector size from
+    `embedding.output_dimensionality` / VECTR_EMBED_OUTPUT_DIM, the key's env-var
+    name from `embedding.api_key_env` and the endpoint origin from
+    `embedding.base_url`. As with the other API providers there is no local torch
+    thread pool to cap (UPG-EMBED-THREAD-CONTENTION).
+    """
+
+    _BATCH_LIMIT = 20            # qwen3.7 text embeddings take at most 20 texts per call
+    _LEGACY_BATCH_LIMIT = 10     # text-embedding-v3/v4 are documented at 10 texts per call
+    _MAX_ATTEMPTS = 8            # Throttling.RateQuota windows last about a minute; a shorter chain just fails
+    _TIMEOUT_SECONDS = 30.0
+
+    def __init__(
+        self,
+        model_name: str,
+        output_dimensionality: int | None = None,
+        api_key_env: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        if not model_name:
+            raise ValueError(
+                "a dashscope/ embedding spec must name a model, "
+                "e.g. dashscope/qwen3.7-text-embedding-flash"
+            )
+        self._model = model_name
+        self._dim = output_dimensionality
+        self._batch_limit = self._batch_limit_for(model_name)
+        cfg = _embed_config_for(None)
+        self._base_url = _dashscope_base_url(base_url or cfg.get("base_url"))
+        self._key_env = str(api_key_env or cfg.get("api_key_env") or "DASHSCOPE_API_KEY")
+        self._api_key = _resolve_api_key(self._key_env, "dashscope_api_key", "DashScope")
+
+    @classmethod
+    def _batch_limit_for(cls, model_name: str) -> int:
+        """Per-request text cap for the model the spec names.
+
+        DashScope caps texts per call per model: text-embedding-v3/v4 are
+        documented at 10, the qwen3.7 text-embedding models take 20. An oversized
+        batch is rejected outright, so the cap is read off the model name rather
+        than assumed for every model.
+        """
+        import re
+
+        if re.search(r"v[34](?!\d)", model_name):
+            return cls._LEGACY_BATCH_LIMIT
+        return cls._BATCH_LIMIT
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts, "document")
+
+    def embed_query(self, texts: list[str]) -> list[list[float]]:
+        # DashScope's asymmetric text_type: chunks are embedded as "document"
+        # (optimised to be matched against), search queries as "query". The API
+        # only accepts it on the native endpoint, which is why the native call is
+        # used instead of the OpenAI-compatible one.
+        return self._embed(texts, "query")
+
+    def _embed(self, texts: list[str], text_type: str) -> list[list[float]]:
+        import time
+
+        vectors: list[list[float]] = []
+        budget = _embed_chars_per_second()
+        for start in range(0, len(texts), self._batch_limit):
+            batch = texts[start:start + self._batch_limit]
+            vectors.extend(self._embed_batch(batch, text_type))
+            if start + self._batch_limit < len(texts):
+                # Pace the batches against the key's quota the same way the Google
+                # provider does: chars/sec, not a fixed sleep.
+                time.sleep(min(60.0, sum(len(t) for t in batch) / budget))
+        return vectors
+
+    def _embed_batch(self, texts: list[str], text_type: str) -> list[list[float]]:
+        import time
+
+        import httpx
+
+        parameters: dict = {"text_type": text_type}
+        if self._dim is not None:
+            parameters["dimension"] = self._dim
+        payload = {
+            "model": self._model,
+            "input": {"texts": list(texts)},
+            "parameters": parameters,
+        }
+        url = f"{self._base_url}{_DASHSCOPE_EMBED_PATH}"
+        headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+
+        for attempt in range(1, self._MAX_ATTEMPTS + 1):
+            try:
+                response = httpx.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self._TIMEOUT_SECONDS,
+                )
+            except httpx.HTTPError as exc:
+                # Connection-level failures (TLS handshake resets, read timeouts)
+                # are transient: retry them with the same capped backoff as a 429
+                # instead of aborting the whole indexing pass.
+                if attempt < self._MAX_ATTEMPTS:
+                    time.sleep(min(60.0, 2.0 ** (attempt - 1)))
+                    continue
+                raise RuntimeError(
+                    f"DashScope embeddings request for {self._model} failed: "
+                    f"{self._redact(str(exc))}"
+                ) from exc
+
+            if response.status_code != 200:
+                error = self._error_fields(response)
+                code = str(error.get("code") or "")
+                throttled = response.status_code == 429 or code.lower().startswith("throttling")
+                if throttled and attempt < self._MAX_ATTEMPTS:
+                    # HTTP 429 and a body-level Throttling.* code are the same
+                    # event seen through two endpoints; both back off.
+                    time.sleep(self._retry_delay(response, attempt))
+                    continue
+                if response.status_code >= 500 and attempt < self._MAX_ATTEMPTS:
+                    time.sleep(self._retry_delay(response, attempt))
+                    continue
+                raise RuntimeError(self._error_message(response, error, attempt))
+
+            try:
+                body = response.json()
+            except ValueError as exc:
+                # HTTP 200 claims the call succeeded, so replaying the same payload
+                # would only hide a broken endpoint: report what actually came back.
+                raise RuntimeError(
+                    f"DashScope text-embedding for {self._model} returned a response "
+                    f"body that is not JSON: {self._redact(response.text)[:200]}"
+                ) from exc
+
+            output = body.get("output") if isinstance(body, dict) else None
+            embeddings = output.get("embeddings") if isinstance(output, dict) else None
+            if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+                got = len(embeddings) if isinstance(embeddings, list) else "none"
+                raise RuntimeError(
+                    f"DashScope text-embedding returned {got} embeddings for "
+                    f"{len(texts)} texts ({self._model})"
+                )
+
+            # text_index names the request position each vector belongs to. The
+            # array is normally in order, but the API does not promise it, so the
+            # reply is re-keyed onto the input order rather than trusted.
+            placed: list[list[float] | None] = [None] * len(texts)
+            for position, item in enumerate(embeddings):
+                values = item.get("embedding") if isinstance(item, dict) else None
+                if not isinstance(values, list) or not values:
+                    raise RuntimeError(
+                        f"DashScope text-embedding returned a malformed embedding "
+                        f"entry for {self._model}"
+                    )
+                try:
+                    slot = int(item.get("text_index", position))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"DashScope text-embedding returned a malformed text_index "
+                        f"for {self._model}"
+                    ) from exc
+                if not 0 <= slot < len(placed) or placed[slot] is not None:
+                    raise RuntimeError(
+                        f"DashScope text-embedding returned text_index {slot} outside "
+                        f"the {len(texts)} texts it was given ({self._model})"
+                    )
+                placed[slot] = self._normalize(values)
+            missing = sum(1 for vector in placed if vector is None)
+            if missing:
+                raise RuntimeError(
+                    f"DashScope text-embedding left {missing} of {len(texts)} texts "
+                    f"without a vector ({self._model})"
+                )
+            return [vector for vector in placed if vector is not None]
+
+    @staticmethod
+    def _error_fields(response) -> dict:
+        """DashScope's error envelope: code / message / request_id at the top level
+        on the native endpoint, the same fields nested under "error" on the
+        OpenAI-compatible one. A body that is not JSON — an in-house gateway's
+        error page — yields no fields instead of a second exception stacked on top
+        of the first."""
+        try:
+            body = response.json()
+        except ValueError:
+            return {}
+        if not isinstance(body, dict):
+            return {}
+        nested = body.get("error")
+        if isinstance(nested, dict):
+            return {**body, **nested}
+        return body
+
+    def _error_message(self, response, error: dict, attempt: int) -> str:
+        """Status plus whatever DashScope named, with the key redacted from the
+        free-form body fallback: an upstream that echoes the request it was given
+        would otherwise put the credential into a log."""
+        parts = [
+            f"{name}={error[name]}"
+            for name in ("code", "message", "request_id")
+            if error.get(name)
+        ]
+        detail = ", ".join(parts) or self._redact(response.text)[:200] or response.reason_phrase
+        hint = ""
+        if response.status_code in (401, 403):
+            hint = (
+                f" — the key resolved from {self._key_env} or "
+                f'~/.vectr/secrets.json "dashscope_api_key" was rejected'
+            )
+        return (
+            f"DashScope text-embedding failed for {self._model}: "
+            f"HTTP {response.status_code} {response.reason_phrase} "
+            f"(attempt {attempt}/{self._MAX_ATTEMPTS}): {self._redact(detail)[:300]}{hint}"
+        )
+
+    @staticmethod
+    def _retry_delay(response, attempt: int) -> float:
+        """Retry-After when the endpoint sends one (its 429s do), otherwise
+        exponential backoff 1s, 2s, 4s … capped at 60s — the shape DashScope's own
+        throttling guidance recommends. A header is clamped to the same cap so one
+        malformed response cannot park indexing for an hour."""
+        try:
+            delay = float(response.headers.get("retry-after"))
+        except (TypeError, ValueError):
+            return min(60.0, 2.0 ** (attempt - 1))
+        return max(0.0, min(60.0, delay))
+
+    def _redact(self, text: str) -> str:
+        """The API key never reaches an error message or a log line, whatever the
+        upstream put in its own body."""
+        if not text:
+            return text
+        return text.replace(self._api_key, "[redacted]")
+
+    def _normalize(self, values: list[float]) -> list[float]:
+        return _normalize_vector(values, "DashScope", self._model)
 
 
 def get_embed_provider(model_spec: str) -> EmbedProvider:
@@ -468,7 +769,14 @@ def get_embed_provider(model_spec: str) -> EmbedProvider:
         cfg = _embed_config_for(None)
         return GoogleEmbedProvider(
             model_spec.split("/", 1)[1],
-            output_dimensionality=_google_output_dimensionality(cfg),
+            output_dimensionality=_output_dimensionality(cfg),
             api_key_env=str(cfg.get("api_key_env") or "GEMINI_API_KEY"),
+        )
+    if model_spec.startswith("dashscope/"):
+        cfg = _embed_config_for(None)
+        return DashScopeEmbedProvider(
+            model_spec.split("/", 1)[1],
+            output_dimensionality=_output_dimensionality(cfg),
+            api_key_env=str(cfg.get("api_key_env") or "DASHSCOPE_API_KEY"),
         )
     return LocalEmbedProvider(model_spec)

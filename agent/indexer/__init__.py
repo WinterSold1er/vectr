@@ -36,6 +36,8 @@ from agent.indexer._types import (
     LocalEmbedProvider,
     VoyageEmbedProvider,
     OpenAIEmbedProvider,
+    GoogleEmbedProvider,
+    DashScopeEmbedProvider,
     get_embed_provider,
 )
 
@@ -90,6 +92,8 @@ __all__ = [
     "LocalEmbedProvider",
     "VoyageEmbedProvider",
     "OpenAIEmbedProvider",
+    "GoogleEmbedProvider",
+    "DashScopeEmbedProvider",
     "get_embed_provider",
     # Chunking
     "chunk_file",
